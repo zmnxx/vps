@@ -306,7 +306,7 @@ recommended_install() {
 
     command -v fail2ban-client >/dev/null 2>&1 || pkg_install fail2ban
     write_fail2ban_config
-    restart_fail2ban_safe
+    restart_fail2ban_safe || return
 
     install_self_alias
 
@@ -544,6 +544,17 @@ write_fail2ban_config() {
 
     mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
 
+    # 禁用系统默认 sshd jail
+    # 部分 Debian/Ubuntu 会自带 defaults-debian.conf 启用 sshd
+    # 没有 /var/log/auth.log 时会导致 Fail2Ban 测试失败
+    cat >/etc/fail2ban/jail.d/99-disable-sshd.local <<'EOF'
+[sshd]
+enabled = false
+EOF
+
+    # 清理旧扫描器配置，避免旧规则干扰
+    rm -f /etc/fail2ban/jail.d/ufw-scanner.local /etc/fail2ban/jail.d/ufw-scanner.local.disabled 2>/dev/null || true
+
     cat >/etc/fail2ban/filter.d/ufw-scan-lite.conf <<'EOF'
 # UFW扫描降噪规则
 # 匹配UFW拦截日志里的来源IP
@@ -578,6 +589,12 @@ banaction = ufw
 action = %(action_)s
 
 
+[sshd]
+
+# 已改密钥登录，这里关闭 sshd jail
+enabled = false
+
+
 [ufw-scan-lite]
 
 # UFW扫描降噪
@@ -609,7 +626,8 @@ restart_fail2ban_safe() {
     fail2ban-client -t >/tmp/f2b-test.log 2>&1
     if [ $? -ne 0 ]; then
         bad "Fail2Ban配置测试失败"
-        grep -i "ERROR" /tmp/f2b-test.log | tail -n 5 || cat /tmp/f2b-test.log
+        grep -i "ERROR" /tmp/f2b-test.log | tail -n 8 || cat /tmp/f2b-test.log
+        warn "已停止安装流程，请先处理上面的错误。"
         return 1
     fi
 
