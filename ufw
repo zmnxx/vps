@@ -959,11 +959,25 @@ gcp_need_tools() {
     command -v curl >/dev/null 2>&1 || apt install -y curl
 }
 
+gcp_count_file() {
+    file="$1"
+    [ -s "$file" ] || { echo 0; return; }
+    grep -v '^[[:space:]]*$' "$file" | grep -v '^[[:space:]]*#' | wc -l | xargs
+}
+
+gcp_set_count() {
+    setname="$1"
+    ipset list "$setname" >/dev/null 2>&1 || { echo 0; return; }
+    ipset list "$setname" 2>/dev/null | awk '/Number of entries/ {print $4}'
+}
+
 gcp_download_if_missing() {
     gcp_prepare_dirs
 
     if [ -s "$GCP_LIST_FILE" ]; then
         ok "本地IP段已存在，不重复下载"
+        echo "文件：$GCP_LIST_FILE"
+        echo "条数：$(gcp_count_file "$GCP_LIST_FILE")"
         return 0
     fi
 
@@ -972,12 +986,20 @@ gcp_download_if_missing() {
     title "首次下载IP段"
     echo "来源：$GCP_URL"
 
-    if curl -fsSL "$GCP_URL" -o "$GCP_LIST_FILE"; then
+    tmp="$(mktemp)"
+    if curl -fsSL "$GCP_URL" -o "$tmp"; then
+        if [ ! -s "$tmp" ]; then
+            bad "下载到的文件为空，已取消"
+            rm -f "$tmp"
+            return 1
+        fi
+        mv "$tmp" "$GCP_LIST_FILE"
         ok "已下载到：$GCP_LIST_FILE"
+        echo "条数：$(gcp_count_file "$GCP_LIST_FILE")"
         return 0
     else
         bad "下载失败"
-        rm -f "$GCP_LIST_FILE"
+        rm -f "$tmp"
         return 1
     fi
 }
@@ -989,12 +1011,21 @@ gcp_force_download() {
     title "重新下载IP段"
     echo "来源：$GCP_URL"
 
-    if curl -fsSL "$GCP_URL" -o "$GCP_LIST_FILE"; then
+    tmp="$(mktemp)"
+    if curl -fsSL "$GCP_URL" -o "$tmp"; then
+        if [ ! -s "$tmp" ]; then
+            bad "下载到的文件为空，保留旧文件"
+            rm -f "$tmp"
+            return 1
+        fi
+        mv "$tmp" "$GCP_LIST_FILE"
         ok "已重新下载"
+        echo "条数：$(gcp_count_file "$GCP_LIST_FILE")"
         gcp_parse_local_file
         return 0
     else
-        bad "下载失败"
+        bad "下载失败，保留旧文件"
+        rm -f "$tmp"
         return 1
     fi
 }
@@ -1025,8 +1056,8 @@ gcp_parse_local_file() {
     sort -u "$GCP_V6_FILE" -o "$GCP_V6_FILE"
 
     ok "IP段已解析"
-    echo "IPv4段：$(grep -cv '^#\|^$' "$GCP_V4_FILE" 2>/dev/null || echo 0)"
-    echo "IPv6段：$(grep -cv '^#\|^$' "$GCP_V6_FILE" 2>/dev/null || echo 0)"
+    echo "IPv4段：$(gcp_count_file "$GCP_V4_FILE")"
+    echo "IPv6段：$(gcp_count_file "$GCP_V6_FILE")"
 }
 
 gcp_create_sets() {
@@ -1042,13 +1073,11 @@ gcp_load_sets() {
 
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
-        echo "$ip" | grep -q '^#' && continue
         ipset add ufwf_gcp_v4 "$ip" -exist 2>/dev/null || true
     done < "$GCP_V4_FILE"
 
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
-        echo "$ip" | grep -q '^#' && continue
         ipset add ufwf_gcp_v6 "$ip" -exist 2>/dev/null || true
     done < "$GCP_V6_FILE"
 }
@@ -1107,16 +1136,18 @@ gcp_status() {
     [ -s "$GCP_LIST_FILE" ] && ok "本地IP段：存在" || warn "本地IP段：不存在"
     echo "文件：$GCP_LIST_FILE"
 
-    echo "本地IPv4段：$(grep -cv '^#\|^$' "$GCP_V4_FILE" 2>/dev/null || echo 0)"
-    echo "本地IPv6段：$(grep -cv '^#\|^$' "$GCP_V6_FILE" 2>/dev/null || echo 0)"
+    local_v4="$(gcp_count_file "$GCP_V4_FILE")"
+    local_v6="$(gcp_count_file "$GCP_V6_FILE")"
+    set_v4="$(gcp_set_count ufwf_gcp_v4)"
+    set_v6="$(gcp_set_count ufwf_gcp_v6)"
 
-    v4_set=0
-    v6_set=0
-    ipset list ufwf_gcp_v4 >/dev/null 2>&1 && v4_set="$(ipset list ufwf_gcp_v4 2>/dev/null | awk '/Number of entries/ {print $4}')"
-    ipset list ufwf_gcp_v6 >/dev/null 2>&1 && v6_set="$(ipset list ufwf_gcp_v6 2>/dev/null | awk '/Number of entries/ {print $4}')"
+    echo "本地IPv4段：$local_v4"
+    echo "本地IPv6段：$local_v6"
+    echo "已加载IPv4段：$set_v4"
+    echo "已加载IPv6段：$set_v6"
 
-    echo "已加载IPv4段：${v4_set:-0}"
-    echo "已加载IPv6段：${v6_set:-0}"
+    [ "$local_v4" = "$set_v4" ] && ok "IPv4加载：一致" || warn "IPv4加载：不一致"
+    [ "$local_v6" = "$set_v6" ] && ok "IPv6加载：一致" || warn "IPv6加载：不一致"
 
     iptables -C OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null \
         && ok "IPv4拦截：已启用" || warn "IPv4拦截：未启用"
@@ -1153,23 +1184,40 @@ gcp_test_egress() {
 gcp_show_block_stats() {
     title "拦截命中统计"
 
+    echo "只显示规则计数，不展开大量内容。"
+    echo
+
     echo "IPv4："
-    iptables -L OUTPUT -v -n 2>/dev/null | grep 'ufwf_gcp_v4' || warn "未看到IPv4拦截规则"
+    iptables -L OUTPUT -v -n -x 2>/dev/null | awk '/ufwf_gcp_v4/ {print "- 包数：" $1 "，字节：" $2 "，规则：" $0}' | head -n 3
+    iptables -L OUTPUT -v -n -x 2>/dev/null | grep -q 'ufwf_gcp_v4' || warn "未看到IPv4拦截规则"
 
     echo
     echo "IPv6："
-    ip6tables -L OUTPUT -v -n 2>/dev/null | grep 'ufwf_gcp_v6' || warn "未看到IPv6拦截规则"
+    ip6tables -L OUTPUT -v -n -x 2>/dev/null | awk '/ufwf_gcp_v6/ {print "- 包数：" $1 "，字节：" $2 "，规则：" $0}' | head -n 3
+    ip6tables -L OUTPUT -v -n -x 2>/dev/null | grep -q 'ufwf_gcp_v6' || warn "未看到IPv6拦截规则"
 }
 
 gcp_show_ipsets() {
-    title "已加载IP段"
+    title "加载校验"
 
-    echo "IPv4前20条："
-    ipset list ufwf_gcp_v4 2>/dev/null | grep -E '^[0-9]' | head -n 20 || warn "暂无IPv4集合"
+    local_v4="$(gcp_count_file "$GCP_V4_FILE")"
+    local_v6="$(gcp_count_file "$GCP_V6_FILE")"
+    set_v4="$(gcp_set_count ufwf_gcp_v4)"
+    set_v6="$(gcp_set_count ufwf_gcp_v6)"
+
+    echo "IPv4：本地 $local_v4 / 已加载 $set_v4"
+    [ "$local_v4" = "$set_v4" ] && ok "IPv4加载一致" || warn "IPv4加载不一致，请重新启用拦截"
+
+    echo "IPv6：本地 $local_v6 / 已加载 $set_v6"
+    [ "$local_v6" = "$set_v6" ] && ok "IPv6加载一致" || warn "IPv6加载不一致，请重新启用拦截"
 
     echo
-    echo "IPv6前20条："
-    ipset list ufwf_gcp_v6 2>/dev/null | grep ':' | head -n 20 || warn "暂无IPv6集合"
+    echo "IPv4抽样前10条："
+    ipset list ufwf_gcp_v4 2>/dev/null | grep -E '^[0-9]' | head -n 10 || warn "暂无IPv4集合"
+
+    echo
+    echo "IPv6抽样前10条："
+    ipset list ufwf_gcp_v6 2>/dev/null | grep ':' | head -n 10 || warn "暂无IPv6集合"
 }
 
 gcp_delete_local_file() {
@@ -1210,7 +1258,7 @@ gcp_menu() {
         echo "5. 重新下载IP段"
         echo "6. 删除本地IP段"
         echo "7. 出站拦截测试"
-        echo "8. 查看已加载IP段"
+        echo "8. 加载校验/抽样"
         echo "9. 查看命中统计"
         echo "0. 返回"
         echo
