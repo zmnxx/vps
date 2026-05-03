@@ -938,59 +938,60 @@ view_menu() {
 
 
 # ==================================================
-# GCP CDN 出站拦截
+# 谷歌云 GCP 出站管理
 # ==================================================
 
-CDN_DIR="/etc/ufw-f-cdn-block"
-CDN_LIST_FILE="$CDN_DIR/no-ip-cdn"
-CDN_V4_FILE="$CDN_DIR/cdn-v4.txt"
-CDN_V6_FILE="$CDN_DIR/cdn-v6.txt"
-CDN_URL="https://raw.githubusercontent.com/zmnxx/vps/main/no-ip-cdn"
-CDN_SERVICE="/etc/systemd/system/ufw-f-cdn-block.service"
+GCP_DIR="/etc/ufw-f-gcp"
+GCP_LIST_FILE="$GCP_DIR/no-ip-cdn"
+GCP_V4_FILE="$GCP_DIR/cdn-v4.txt"
+GCP_V6_FILE="$GCP_DIR/cdn-v6.txt"
+GCP_URL="https://raw.githubusercontent.com/zmnxx/vps/main/no-ip-cdn"
+GCP_SERVICE="/etc/systemd/system/ufw-f-gcp-egress.service"
 
-cdn_prepare_dirs() {
-    mkdir -p "$CDN_DIR"
-    touch "$CDN_V4_FILE" "$CDN_V6_FILE"
+gcp_prepare_dirs() {
+    mkdir -p "$GCP_DIR"
+    touch "$GCP_V4_FILE" "$GCP_V6_FILE"
 }
 
-cdn_need_tools() {
+gcp_need_tools() {
     command -v ipset >/dev/null 2>&1 || apt install -y ipset
     command -v iptables >/dev/null 2>&1 || apt install -y iptables
+    command -v curl >/dev/null 2>&1 || apt install -y curl
 }
 
-cdn_download_if_missing() {
-    cdn_prepare_dirs
+gcp_download_if_missing() {
+    gcp_prepare_dirs
 
-    if [ -s "$CDN_LIST_FILE" ]; then
+    if [ -s "$GCP_LIST_FILE" ]; then
         ok "本地IP段已存在，不重复下载"
         return 0
     fi
 
-    command -v curl >/dev/null 2>&1 || apt install -y curl
+    gcp_need_tools
 
-    title "下载IP段"
-    echo "来源：$CDN_URL"
+    title "首次下载IP段"
+    echo "来源：$GCP_URL"
 
-    if curl -fsSL "$CDN_URL" -o "$CDN_LIST_FILE"; then
-        ok "已下载到：$CDN_LIST_FILE"
+    if curl -fsSL "$GCP_URL" -o "$GCP_LIST_FILE"; then
+        ok "已下载到：$GCP_LIST_FILE"
         return 0
     else
         bad "下载失败"
-        rm -f "$CDN_LIST_FILE"
+        rm -f "$GCP_LIST_FILE"
         return 1
     fi
 }
 
-cdn_force_download() {
-    cdn_prepare_dirs
-    command -v curl >/dev/null 2>&1 || apt install -y curl
+gcp_force_download() {
+    gcp_prepare_dirs
+    gcp_need_tools
 
     title "重新下载IP段"
-    echo "来源：$CDN_URL"
+    echo "来源：$GCP_URL"
 
-    if curl -fsSL "$CDN_URL" -o "$CDN_LIST_FILE"; then
+    if curl -fsSL "$GCP_URL" -o "$GCP_LIST_FILE"; then
         ok "已重新下载"
-        cdn_parse_local_file
+        gcp_parse_local_file
         return 0
     else
         bad "下载失败"
@@ -998,84 +999,85 @@ cdn_force_download() {
     fi
 }
 
-cdn_parse_local_file() {
-    cdn_prepare_dirs
+gcp_parse_local_file() {
+    gcp_prepare_dirs
 
-    if [ ! -s "$CDN_LIST_FILE" ]; then
+    if [ ! -s "$GCP_LIST_FILE" ]; then
         warn "本地IP段文件不存在或为空"
         return 1
     fi
 
-    : > "$CDN_V4_FILE"
-    : > "$CDN_V6_FILE"
+    : > "$GCP_V4_FILE"
+    : > "$GCP_V6_FILE"
 
-    while read -r line; do
+    while IFS= read -r line; do
         ip="$(echo "$line" | sed 's/#.*//' | xargs)"
         [ -z "$ip" ] && continue
 
         if echo "$ip" | grep -q ":"; then
-            echo "$ip" >> "$CDN_V6_FILE"
+            echo "$ip" >> "$GCP_V6_FILE"
         else
-            echo "$ip" >> "$CDN_V4_FILE"
+            echo "$ip" >> "$GCP_V4_FILE"
         fi
-    done < "$CDN_LIST_FILE"
+    done < "$GCP_LIST_FILE"
 
-    sort -u "$CDN_V4_FILE" -o "$CDN_V4_FILE"
-    sort -u "$CDN_V6_FILE" -o "$CDN_V6_FILE"
+    sort -u "$GCP_V4_FILE" -o "$GCP_V4_FILE"
+    sort -u "$GCP_V6_FILE" -o "$GCP_V6_FILE"
 
     ok "IP段已解析"
-    echo "IPv4段：$(grep -cv '^#\|^$' "$CDN_V4_FILE" 2>/dev/null || echo 0)"
-    echo "IPv6段：$(grep -cv '^#\|^$' "$CDN_V6_FILE" 2>/dev/null || echo 0)"
+    echo "IPv4段：$(grep -cv '^#\|^$' "$GCP_V4_FILE" 2>/dev/null || echo 0)"
+    echo "IPv6段：$(grep -cv '^#\|^$' "$GCP_V6_FILE" 2>/dev/null || echo 0)"
 }
 
-cdn_create_sets() {
-    ipset create ufwf_cdn_v4 hash:net family inet -exist
-    ipset create ufwf_cdn_v6 hash:net family inet6 -exist
+gcp_create_sets() {
+    ipset create ufwf_gcp_v4 hash:net family inet -exist
+    ipset create ufwf_gcp_v6 hash:net family inet6 -exist
 }
 
-cdn_load_sets_from_files() {
-    cdn_create_sets
-    ipset flush ufwf_cdn_v4 2>/dev/null || true
-    ipset flush ufwf_cdn_v6 2>/dev/null || true
+gcp_load_sets() {
+    gcp_create_sets
 
-    while read -r ip; do
+    ipset flush ufwf_gcp_v4 2>/dev/null || true
+    ipset flush ufwf_gcp_v6 2>/dev/null || true
+
+    while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         echo "$ip" | grep -q '^#' && continue
-        ipset add ufwf_cdn_v4 "$ip" -exist 2>/dev/null || true
-    done < "$CDN_V4_FILE"
+        ipset add ufwf_gcp_v4 "$ip" -exist 2>/dev/null || true
+    done < "$GCP_V4_FILE"
 
-    while read -r ip; do
+    while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         echo "$ip" | grep -q '^#' && continue
-        ipset add ufwf_cdn_v6 "$ip" -exist 2>/dev/null || true
-    done < "$CDN_V6_FILE"
+        ipset add ufwf_gcp_v6 "$ip" -exist 2>/dev/null || true
+    done < "$GCP_V6_FILE"
 }
 
-cdn_enable_rules() {
-    cdn_prepare_dirs
-    cdn_need_tools
+gcp_enable_egress_block() {
+    gcp_prepare_dirs
+    gcp_need_tools
 
-    cdn_download_if_missing || return 1
-    cdn_parse_local_file || return 1
-    cdn_load_sets_from_files
+    gcp_download_if_missing || return 1
+    gcp_parse_local_file || return 1
+    gcp_load_sets
 
-    iptables -C OUTPUT -m set --match-set ufwf_cdn_v4 dst -j REJECT 2>/dev/null \
-        || iptables -I OUTPUT 1 -m set --match-set ufwf_cdn_v4 dst -j REJECT
+    iptables -C OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null \
+        || iptables -I OUTPUT 1 -m set --match-set ufwf_gcp_v4 dst -j REJECT
 
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -C OUTPUT -m set --match-set ufwf_cdn_v6 dst -j REJECT 2>/dev/null \
-            || ip6tables -I OUTPUT 1 -m set --match-set ufwf_cdn_v6 dst -j REJECT
+        ip6tables -C OUTPUT -m set --match-set ufwf_gcp_v6 dst -j REJECT 2>/dev/null \
+            || ip6tables -I OUTPUT 1 -m set --match-set ufwf_gcp_v6 dst -j REJECT
     fi
 
-    cat >"$CDN_SERVICE" <<EOF
+    cat >"$GCP_SERVICE" <<EOF
 [Unit]
-Description=UFW-F CDN outbound block
+Description=UFW-F GCP egress block
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/ufw-f-menu --cdn-restore
+ExecStart=/usr/local/sbin/ufw-f-menu --gcp-restore
 RemainAfterExit=yes
 
 [Install]
@@ -1083,97 +1085,147 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable ufw-f-cdn-block.service >/dev/null 2>&1 || true
+    systemctl enable ufw-f-gcp-egress.service >/dev/null 2>&1 || true
 
     ok "GCP出站拦截已启用"
 }
 
-cdn_disable_rules() {
-    iptables -D OUTPUT -m set --match-set ufwf_cdn_v4 dst -j REJECT 2>/dev/null || true
-    ip6tables -D OUTPUT -m set --match-set ufwf_cdn_v6 dst -j REJECT 2>/dev/null || true
+gcp_disable_egress_block() {
+    iptables -D OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null || true
+    ip6tables -D OUTPUT -m set --match-set ufwf_gcp_v6 dst -j REJECT 2>/dev/null || true
 
-    systemctl disable ufw-f-cdn-block.service >/dev/null 2>&1 || true
-    rm -f "$CDN_SERVICE"
+    systemctl disable ufw-f-gcp-egress.service >/dev/null 2>&1 || true
+    rm -f "$GCP_SERVICE"
     systemctl daemon-reload >/dev/null 2>&1 || true
 
     ok "GCP出站拦截已关闭"
 }
 
-cdn_delete_local_file() {
+gcp_status() {
+    title "谷歌云出站状态"
+
+    [ -s "$GCP_LIST_FILE" ] && ok "本地IP段：存在" || warn "本地IP段：不存在"
+    echo "文件：$GCP_LIST_FILE"
+
+    echo "本地IPv4段：$(grep -cv '^#\|^$' "$GCP_V4_FILE" 2>/dev/null || echo 0)"
+    echo "本地IPv6段：$(grep -cv '^#\|^$' "$GCP_V6_FILE" 2>/dev/null || echo 0)"
+
+    v4_set=0
+    v6_set=0
+    ipset list ufwf_gcp_v4 >/dev/null 2>&1 && v4_set="$(ipset list ufwf_gcp_v4 2>/dev/null | awk '/Number of entries/ {print $4}')"
+    ipset list ufwf_gcp_v6 >/dev/null 2>&1 && v6_set="$(ipset list ufwf_gcp_v6 2>/dev/null | awk '/Number of entries/ {print $4}')"
+
+    echo "已加载IPv4段：${v4_set:-0}"
+    echo "已加载IPv6段：${v6_set:-0}"
+
+    iptables -C OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null \
+        && ok "IPv4拦截：已启用" || warn "IPv4拦截：未启用"
+
+    ip6tables -C OUTPUT -m set --match-set ufwf_gcp_v6 dst -j REJECT 2>/dev/null \
+        && ok "IPv6拦截：已启用" || warn "IPv6拦截：未启用"
+
+    [ -f "$GCP_SERVICE" ] && ok "开机恢复：已配置" || warn "开机恢复：未配置"
+}
+
+gcp_test_egress() {
+    title "出站拦截测试"
+
+    command -v curl >/dev/null 2>&1 || apt install -y curl
+
+    echo "Cloudflare 1.1.1.1："
+    timeout 5 curl -I --connect-timeout 3 http://1.1.1.1 >/tmp/ufwf-gcp-test.log 2>&1
+    if [ $? -ne 0 ]; then
+        ok "已拦截或无法连接"
+    else
+        warn "未拦截，仍可访问"
+    fi
+
+    echo
+    echo "Fastly 151.101.1.69："
+    timeout 5 curl -I --connect-timeout 3 http://151.101.1.69 >/tmp/ufwf-gcp-test.log 2>&1
+    if [ $? -ne 0 ]; then
+        ok "已拦截或无法连接"
+    else
+        warn "未拦截，仍可访问"
+    fi
+}
+
+gcp_show_block_stats() {
+    title "拦截命中统计"
+
+    echo "IPv4："
+    iptables -L OUTPUT -v -n 2>/dev/null | grep 'ufwf_gcp_v4' || warn "未看到IPv4拦截规则"
+
+    echo
+    echo "IPv6："
+    ip6tables -L OUTPUT -v -n 2>/dev/null | grep 'ufwf_gcp_v6' || warn "未看到IPv6拦截规则"
+}
+
+gcp_show_ipsets() {
+    title "已加载IP段"
+
+    echo "IPv4前20条："
+    ipset list ufwf_gcp_v4 2>/dev/null | grep -E '^[0-9]' | head -n 20 || warn "暂无IPv4集合"
+
+    echo
+    echo "IPv6前20条："
+    ipset list ufwf_gcp_v6 2>/dev/null | grep ':' | head -n 20 || warn "暂无IPv6集合"
+}
+
+gcp_delete_local_file() {
     title "删除本地IP段"
     echo "会删除："
-    echo "- $CDN_LIST_FILE"
-    echo "- $CDN_V4_FILE"
-    echo "- $CDN_V6_FILE"
+    echo "- $GCP_LIST_FILE"
+    echo "- $GCP_V4_FILE"
+    echo "- $GCP_V6_FILE"
     echo
     confirm_yes "确认删除本地IP段？" || return
 
-    cdn_disable_rules >/dev/null 2>&1 || true
-    rm -f "$CDN_LIST_FILE" "$CDN_V4_FILE" "$CDN_V6_FILE"
-    ipset flush ufwf_cdn_v4 2>/dev/null || true
-    ipset flush ufwf_cdn_v6 2>/dev/null || true
+    gcp_disable_egress_block >/dev/null 2>&1 || true
+    rm -f "$GCP_LIST_FILE" "$GCP_V4_FILE" "$GCP_V6_FILE"
+    ipset flush ufwf_gcp_v4 2>/dev/null || true
+    ipset flush ufwf_gcp_v6 2>/dev/null || true
 
     ok "本地IP段已删除，拦截已关闭"
 }
 
-cdn_status() {
-    title "GCP出站拦截状态"
-
-    [ -s "$CDN_LIST_FILE" ] && ok "本地IP段：存在" || warn "本地IP段：不存在"
-    echo "文件：$CDN_LIST_FILE"
-
-    v4_file_count="$(grep -cv '^#\|^$' "$CDN_V4_FILE" 2>/dev/null || echo 0)"
-    v6_file_count="$(grep -cv '^#\|^$' "$CDN_V6_FILE" 2>/dev/null || echo 0)"
-    echo "本地IPv4段：${v4_file_count:-0}"
-    echo "本地IPv6段：${v6_file_count:-0}"
-
-    v4_set=0
-    v6_set=0
-    ipset list ufwf_cdn_v4 >/dev/null 2>&1 && v4_set="$(ipset list ufwf_cdn_v4 2>/dev/null | awk '/Number of entries/ {print $4}')"
-    ipset list ufwf_cdn_v6 >/dev/null 2>&1 && v6_set="$(ipset list ufwf_cdn_v6 2>/dev/null | awk '/Number of entries/ {print $4}')"
-    echo "已加载IPv4段：${v4_set:-0}"
-    echo "已加载IPv6段：${v6_set:-0}"
-
-    iptables -C OUTPUT -m set --match-set ufwf_cdn_v4 dst -j REJECT 2>/dev/null \
-        && ok "IPv4拦截：已启用" || warn "IPv4拦截：未启用"
-
-    ip6tables -C OUTPUT -m set --match-set ufwf_cdn_v6 dst -j REJECT 2>/dev/null \
-        && ok "IPv6拦截：已启用" || warn "IPv6拦截：未启用"
-
-    [ -f "$CDN_SERVICE" ] && ok "开机恢复：已配置" || warn "开机恢复：未配置"
-}
-
-cdn_restore_entry() {
-    cdn_prepare_dirs
-    cdn_need_tools
-    if [ -s "$CDN_LIST_FILE" ]; then
-        cdn_parse_local_file >/dev/null 2>&1 || true
-        cdn_enable_rules >/dev/null 2>&1 || true
+gcp_restore_entry() {
+    gcp_prepare_dirs
+    gcp_need_tools
+    if [ -s "$GCP_LIST_FILE" ]; then
+        gcp_parse_local_file >/dev/null 2>&1 || true
+        gcp_enable_egress_block >/dev/null 2>&1 || true
     fi
     exit 0
 }
 
-cdn_menu() {
+gcp_menu() {
     while true; do
         clear
-        echo "===== GCP出站拦截 ====="
+        echo "===== 谷歌云管理 ====="
         echo "1. 状态"
-        echo "2. 启用拦截"
-        echo "3. 关闭拦截"
-        echo "4. 检测/首次下载"
+        echo "2. 启用出站拦截"
+        echo "3. 关闭出站拦截"
+        echo "4. 检测/首次下载IP段"
         echo "5. 重新下载IP段"
         echo "6. 删除本地IP段"
+        echo "7. 出站拦截测试"
+        echo "8. 查看已加载IP段"
+        echo "9. 查看命中统计"
         echo "0. 返回"
         echo
 
         read -rp "选择：" c
         case "$c" in
-            1) cdn_status; pause ;;
-            2) cdn_enable_rules; pause ;;
-            3) cdn_disable_rules; pause ;;
-            4) cdn_download_if_missing; cdn_parse_local_file; pause ;;
-            5) cdn_force_download; pause ;;
-            6) cdn_delete_local_file; pause ;;
+            1) gcp_status; pause ;;
+            2) gcp_enable_egress_block; pause ;;
+            3) gcp_disable_egress_block; pause ;;
+            4) gcp_download_if_missing; gcp_parse_local_file; pause ;;
+            5) gcp_force_download; pause ;;
+            6) gcp_delete_local_file; pause ;;
+            7) gcp_test_egress; pause ;;
+            8) gcp_show_ipsets; pause ;;
+            9) gcp_show_block_stats; pause ;;
             0) return ;;
             *) warn "无效选择"; pause ;;
         esac
@@ -1207,7 +1259,7 @@ uninstall_script_only() {
     echo "不会卸载UFW/Fail2Ban。"
     confirm_yes "确认卸载本脚本？" || return
 
-    cdn_disable_rules >/dev/null 2>&1 || true
+    gcp_disable_egress_block >/dev/null 2>&1 || true
     rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
 
     if [ -f "$CURRENT_SCRIPT" ] && echo "$CURRENT_SCRIPT" | grep -q "^/"; then
@@ -1251,8 +1303,8 @@ full_cleanup() {
     apt autoremove -y
 
     rm -rf /etc/fail2ban /etc/ufw
-    cdn_disable_rules >/dev/null 2>&1 || true
-    rm -rf "$CDN_DIR"
+    gcp_disable_egress_block >/dev/null 2>&1 || true
+    rm -rf "$GCP_DIR"
     rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
     [ -f "$CURRENT_SCRIPT" ] && rm -f "$CURRENT_SCRIPT" 2>/dev/null || true
 
@@ -1307,7 +1359,7 @@ main_menu() {
         echo "3. 防火墙"
         echo "4. 防骚扰"
         echo "5. 查看分析"
-        echo "6. GCP出站拦截"
+        echo "6. 谷歌云管理"
         echo "7. 清理/卸载"
         echo "0. 退出"
         echo
@@ -1320,7 +1372,7 @@ main_menu() {
             3) ufw_menu ;;
             4) fail2ban_menu ;;
             5) view_menu ;;
-            6) cdn_menu ;;
+            6) gcp_menu ;;
             7) clean_menu ;;
             0) exit 0 ;;
             *) warn "无效选择"; pause ;;
@@ -1328,6 +1380,8 @@ main_menu() {
     done
 }
 
-[ "${1:-}" = "--cdn-restore" ] && cdn_restore_entry
+[ "${1:-}" = "--gcp-restore" ] && cdn_restore_entry
+
+[ "${1:-}" = "--gcp-restore" ] && gcp_restore_entry
 
 main_menu
