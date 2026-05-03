@@ -936,350 +936,6 @@ view_menu() {
     done
 }
 
-
-# ==================================================
-# 谷歌云 GCP 出站管理
-# ==================================================
-
-GCP_DIR="/etc/ufw-f-gcp"
-GCP_LIST_FILE="$GCP_DIR/no-ip-cdn"
-GCP_V4_FILE="$GCP_DIR/cdn-v4.txt"
-GCP_V6_FILE="$GCP_DIR/cdn-v6.txt"
-GCP_URL="https://raw.githubusercontent.com/zmnxx/vps/main/no-ip-cdn"
-GCP_SERVICE="/etc/systemd/system/ufw-f-gcp-egress.service"
-
-gcp_prepare_dirs() {
-    mkdir -p "$GCP_DIR"
-    touch "$GCP_V4_FILE" "$GCP_V6_FILE"
-}
-
-gcp_need_tools() {
-    command -v ipset >/dev/null 2>&1 || apt install -y ipset
-    command -v iptables >/dev/null 2>&1 || apt install -y iptables
-    command -v curl >/dev/null 2>&1 || apt install -y curl
-}
-
-gcp_count_file() {
-    file="$1"
-    [ -s "$file" ] || { echo 0; return; }
-    grep -v '^[[:space:]]*$' "$file" | grep -v '^[[:space:]]*#' | wc -l | xargs
-}
-
-gcp_set_count() {
-    setname="$1"
-    ipset list "$setname" >/dev/null 2>&1 || { echo 0; return; }
-    ipset list "$setname" 2>/dev/null | awk '/Number of entries/ {print $4}'
-}
-
-gcp_download_if_missing() {
-    gcp_prepare_dirs
-
-    if [ -s "$GCP_LIST_FILE" ]; then
-        ok "本地IP段已存在，不重复下载"
-        echo "文件：$GCP_LIST_FILE"
-        echo "条数：$(gcp_count_file "$GCP_LIST_FILE")"
-        return 0
-    fi
-
-    gcp_need_tools
-
-    title "首次下载IP段"
-    echo "来源：$GCP_URL"
-
-    tmp="$(mktemp)"
-    if curl -fsSL "$GCP_URL" -o "$tmp"; then
-        if [ ! -s "$tmp" ]; then
-            bad "下载到的文件为空，已取消"
-            rm -f "$tmp"
-            return 1
-        fi
-        mv "$tmp" "$GCP_LIST_FILE"
-        ok "已下载到：$GCP_LIST_FILE"
-        echo "条数：$(gcp_count_file "$GCP_LIST_FILE")"
-        return 0
-    else
-        bad "下载失败"
-        rm -f "$tmp"
-        return 1
-    fi
-}
-
-gcp_force_download() {
-    gcp_prepare_dirs
-    gcp_need_tools
-
-    title "重新下载IP段"
-    echo "来源：$GCP_URL"
-
-    tmp="$(mktemp)"
-    if curl -fsSL "$GCP_URL" -o "$tmp"; then
-        if [ ! -s "$tmp" ]; then
-            bad "下载到的文件为空，保留旧文件"
-            rm -f "$tmp"
-            return 1
-        fi
-        mv "$tmp" "$GCP_LIST_FILE"
-        ok "已重新下载"
-        echo "条数：$(gcp_count_file "$GCP_LIST_FILE")"
-        gcp_parse_local_file
-        return 0
-    else
-        bad "下载失败，保留旧文件"
-        rm -f "$tmp"
-        return 1
-    fi
-}
-
-gcp_parse_local_file() {
-    gcp_prepare_dirs
-
-    if [ ! -s "$GCP_LIST_FILE" ]; then
-        warn "本地IP段文件不存在或为空"
-        return 1
-    fi
-
-    : > "$GCP_V4_FILE"
-    : > "$GCP_V6_FILE"
-
-    while IFS= read -r line; do
-        ip="$(echo "$line" | sed 's/#.*//' | xargs)"
-        [ -z "$ip" ] && continue
-
-        if echo "$ip" | grep -q ":"; then
-            echo "$ip" >> "$GCP_V6_FILE"
-        else
-            echo "$ip" >> "$GCP_V4_FILE"
-        fi
-    done < "$GCP_LIST_FILE"
-
-    sort -u "$GCP_V4_FILE" -o "$GCP_V4_FILE"
-    sort -u "$GCP_V6_FILE" -o "$GCP_V6_FILE"
-
-    ok "IP段已解析"
-    echo "IPv4段：$(gcp_count_file "$GCP_V4_FILE")"
-    echo "IPv6段：$(gcp_count_file "$GCP_V6_FILE")"
-}
-
-gcp_create_sets() {
-    ipset create ufwf_gcp_v4 hash:net family inet -exist
-    ipset create ufwf_gcp_v6 hash:net family inet6 -exist
-}
-
-gcp_load_sets() {
-    gcp_create_sets
-
-    ipset flush ufwf_gcp_v4 2>/dev/null || true
-    ipset flush ufwf_gcp_v6 2>/dev/null || true
-
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
-        ipset add ufwf_gcp_v4 "$ip" -exist 2>/dev/null || true
-    done < "$GCP_V4_FILE"
-
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
-        ipset add ufwf_gcp_v6 "$ip" -exist 2>/dev/null || true
-    done < "$GCP_V6_FILE"
-}
-
-gcp_enable_egress_block() {
-    gcp_prepare_dirs
-    gcp_need_tools
-
-    gcp_download_if_missing || return 1
-    gcp_parse_local_file || return 1
-    gcp_load_sets
-
-    iptables -C OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null \
-        || iptables -I OUTPUT 1 -m set --match-set ufwf_gcp_v4 dst -j REJECT
-
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -C OUTPUT -m set --match-set ufwf_gcp_v6 dst -j REJECT 2>/dev/null \
-            || ip6tables -I OUTPUT 1 -m set --match-set ufwf_gcp_v6 dst -j REJECT
-    fi
-
-    cat >"$GCP_SERVICE" <<EOF
-[Unit]
-Description=UFW-F GCP egress block
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/ufw-f-menu --gcp-restore
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable ufw-f-gcp-egress.service >/dev/null 2>&1 || true
-
-    ok "GCP出站拦截已启用"
-}
-
-gcp_disable_egress_block() {
-    iptables -D OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null || true
-    ip6tables -D OUTPUT -m set --match-set ufwf_gcp_v6 dst -j REJECT 2>/dev/null || true
-
-    systemctl disable ufw-f-gcp-egress.service >/dev/null 2>&1 || true
-    rm -f "$GCP_SERVICE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-
-    ok "GCP出站拦截已关闭"
-}
-
-gcp_status() {
-    title "谷歌云出站状态"
-
-    [ -s "$GCP_LIST_FILE" ] && ok "本地IP段：存在" || warn "本地IP段：不存在"
-    echo "文件：$GCP_LIST_FILE"
-
-    local_v4="$(gcp_count_file "$GCP_V4_FILE")"
-    local_v6="$(gcp_count_file "$GCP_V6_FILE")"
-    set_v4="$(gcp_set_count ufwf_gcp_v4)"
-    set_v6="$(gcp_set_count ufwf_gcp_v6)"
-
-    echo "本地IPv4段：$local_v4"
-    echo "本地IPv6段：$local_v6"
-    echo "已加载IPv4段：$set_v4"
-    echo "已加载IPv6段：$set_v6"
-
-    [ "$local_v4" = "$set_v4" ] && ok "IPv4加载：一致" || warn "IPv4加载：不一致"
-    [ "$local_v6" = "$set_v6" ] && ok "IPv6加载：一致" || warn "IPv6加载：不一致"
-
-    iptables -C OUTPUT -m set --match-set ufwf_gcp_v4 dst -j REJECT 2>/dev/null \
-        && ok "IPv4拦截：已启用" || warn "IPv4拦截：未启用"
-
-    ip6tables -C OUTPUT -m set --match-set ufwf_gcp_v6 dst -j REJECT 2>/dev/null \
-        && ok "IPv6拦截：已启用" || warn "IPv6拦截：未启用"
-
-    [ -f "$GCP_SERVICE" ] && ok "开机恢复：已配置" || warn "开机恢复：未配置"
-}
-
-gcp_test_egress() {
-    title "出站拦截测试"
-
-    command -v curl >/dev/null 2>&1 || apt install -y curl
-
-    echo "Cloudflare 1.1.1.1："
-    timeout 5 curl -I --connect-timeout 3 http://1.1.1.1 >/tmp/ufwf-gcp-test.log 2>&1
-    if [ $? -ne 0 ]; then
-        ok "已拦截或无法连接"
-    else
-        warn "未拦截，仍可访问"
-    fi
-
-    echo
-    echo "Fastly 151.101.1.69："
-    timeout 5 curl -I --connect-timeout 3 http://151.101.1.69 >/tmp/ufwf-gcp-test.log 2>&1
-    if [ $? -ne 0 ]; then
-        ok "已拦截或无法连接"
-    else
-        warn "未拦截，仍可访问"
-    fi
-}
-
-gcp_show_block_stats() {
-    title "拦截命中统计"
-
-    echo "只显示规则计数，不展开大量内容。"
-    echo
-
-    echo "IPv4："
-    iptables -L OUTPUT -v -n -x 2>/dev/null | awk '/ufwf_gcp_v4/ {print "- 包数：" $1 "，字节：" $2 "，规则：" $0}' | head -n 3
-    iptables -L OUTPUT -v -n -x 2>/dev/null | grep -q 'ufwf_gcp_v4' || warn "未看到IPv4拦截规则"
-
-    echo
-    echo "IPv6："
-    ip6tables -L OUTPUT -v -n -x 2>/dev/null | awk '/ufwf_gcp_v6/ {print "- 包数：" $1 "，字节：" $2 "，规则：" $0}' | head -n 3
-    ip6tables -L OUTPUT -v -n -x 2>/dev/null | grep -q 'ufwf_gcp_v6' || warn "未看到IPv6拦截规则"
-}
-
-gcp_show_ipsets() {
-    title "加载校验"
-
-    local_v4="$(gcp_count_file "$GCP_V4_FILE")"
-    local_v6="$(gcp_count_file "$GCP_V6_FILE")"
-    set_v4="$(gcp_set_count ufwf_gcp_v4)"
-    set_v6="$(gcp_set_count ufwf_gcp_v6)"
-
-    echo "IPv4：本地 $local_v4 / 已加载 $set_v4"
-    [ "$local_v4" = "$set_v4" ] && ok "IPv4加载一致" || warn "IPv4加载不一致，请重新启用拦截"
-
-    echo "IPv6：本地 $local_v6 / 已加载 $set_v6"
-    [ "$local_v6" = "$set_v6" ] && ok "IPv6加载一致" || warn "IPv6加载不一致，请重新启用拦截"
-
-    echo
-    echo "IPv4抽样前10条："
-    ipset list ufwf_gcp_v4 2>/dev/null | grep -E '^[0-9]' | head -n 10 || warn "暂无IPv4集合"
-
-    echo
-    echo "IPv6抽样前10条："
-    ipset list ufwf_gcp_v6 2>/dev/null | grep ':' | head -n 10 || warn "暂无IPv6集合"
-}
-
-gcp_delete_local_file() {
-    title "删除本地IP段"
-    echo "会删除："
-    echo "- $GCP_LIST_FILE"
-    echo "- $GCP_V4_FILE"
-    echo "- $GCP_V6_FILE"
-    echo
-    confirm_yes "确认删除本地IP段？" || return
-
-    gcp_disable_egress_block >/dev/null 2>&1 || true
-    rm -f "$GCP_LIST_FILE" "$GCP_V4_FILE" "$GCP_V6_FILE"
-    ipset flush ufwf_gcp_v4 2>/dev/null || true
-    ipset flush ufwf_gcp_v6 2>/dev/null || true
-
-    ok "本地IP段已删除，拦截已关闭"
-}
-
-gcp_restore_entry() {
-    gcp_prepare_dirs
-    gcp_need_tools
-    if [ -s "$GCP_LIST_FILE" ]; then
-        gcp_parse_local_file >/dev/null 2>&1 || true
-        gcp_enable_egress_block >/dev/null 2>&1 || true
-    fi
-    exit 0
-}
-
-gcp_menu() {
-    while true; do
-        clear
-        echo "===== 谷歌云管理 ====="
-        echo "1. 状态"
-        echo "2. 启用出站拦截"
-        echo "3. 关闭出站拦截"
-        echo "4. 检测/首次下载IP段"
-        echo "5. 重新下载IP段"
-        echo "6. 删除本地IP段"
-        echo "7. 出站拦截测试"
-        echo "8. 加载校验/抽样"
-        echo "9. 查看命中统计"
-        echo "0. 返回"
-        echo
-
-        read -rp "选择：" c
-        case "$c" in
-            1) gcp_status; pause ;;
-            2) gcp_enable_egress_block; pause ;;
-            3) gcp_disable_egress_block; pause ;;
-            4) gcp_download_if_missing; gcp_parse_local_file; pause ;;
-            5) gcp_force_download; pause ;;
-            6) gcp_delete_local_file; pause ;;
-            7) gcp_test_egress; pause ;;
-            8) gcp_show_ipsets; pause ;;
-            9) gcp_show_block_stats; pause ;;
-            0) return ;;
-            *) warn "无效选择"; pause ;;
-        esac
-    done
-}
-
 # ==================================================
 # 清理/卸载
 # ==================================================
@@ -1307,7 +963,6 @@ uninstall_script_only() {
     echo "不会卸载UFW/Fail2Ban。"
     confirm_yes "确认卸载本脚本？" || return
 
-    gcp_disable_egress_block >/dev/null 2>&1 || true
     rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
 
     if [ -f "$CURRENT_SCRIPT" ] && echo "$CURRENT_SCRIPT" | grep -q "^/"; then
@@ -1351,8 +1006,6 @@ full_cleanup() {
     apt autoremove -y
 
     rm -rf /etc/fail2ban /etc/ufw
-    gcp_disable_egress_block >/dev/null 2>&1 || true
-    rm -rf "$GCP_DIR"
     rm -f "$SELF_MENU" "$WRAPPER_UFW" "$LOGROTATE_FILE"
     [ -f "$CURRENT_SCRIPT" ] && rm -f "$CURRENT_SCRIPT" 2>/dev/null || true
 
@@ -1407,8 +1060,7 @@ main_menu() {
         echo "3. 防火墙"
         echo "4. 防骚扰"
         echo "5. 查看分析"
-        echo "6. 谷歌云管理"
-        echo "7. 清理/卸载"
+        echo "6. 清理/卸载"
         echo "0. 退出"
         echo
 
@@ -1420,16 +1072,11 @@ main_menu() {
             3) ufw_menu ;;
             4) fail2ban_menu ;;
             5) view_menu ;;
-            6) gcp_menu ;;
-            7) clean_menu ;;
+            6) clean_menu ;;
             0) exit 0 ;;
             *) warn "无效选择"; pause ;;
         esac
     done
 }
-
-[ "${1:-}" = "--gcp-restore" ] && cdn_restore_entry
-
-[ "${1:-}" = "--gcp-restore" ] && gcp_restore_entry
 
 main_menu
