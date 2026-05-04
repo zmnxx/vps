@@ -18,6 +18,9 @@
 
 set -u
 
+SCRIPT_VERSION="3.0.0"
+SCRIPT_NAME="UFW-F"
+
 REAL_UFW="/usr/sbin/ufw"
 SELF_MENU="/usr/local/sbin/ufw-f-menu"
 WRAPPER_UFW="/usr/local/sbin/ufw"
@@ -76,11 +79,49 @@ check_tools() {
     command -v fail2ban-client >/dev/null 2>&1 && F2B_OK=1 || F2B_OK=0
 }
 
+version_gt() {
+    # 返回0表示 $1 > $2
+    [ "$1" = "$2" ] && return 1
+    high="$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)"
+    [ "$high" = "$1" ]
+}
+
+get_script_version() {
+    file="$1"
+    [ -r "$file" ] || { echo ""; return; }
+    grep -m1 '^SCRIPT_VERSION=' "$file" 2>/dev/null \
+        | cut -d= -f2- \
+        | tr -d "\"'"
+}
+
 install_self_alias() {
-    cp "$0" "$SELF_MENU"
-    chmod +x "$SELF_MENU"
+    src_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    dst_path="$SELF_MENU"
+
+    if [ -f "$dst_path" ] && [ "$src_path" != "$dst_path" ]; then
+        installed_ver="$(get_script_version "$dst_path")"
+        if [ -n "$installed_ver" ] && version_gt "$installed_ver" "$SCRIPT_VERSION"; then
+            warn "系统中已安装更新版本：$installed_ver，当前脚本版本：$SCRIPT_VERSION"
+            read -rp "仍要用当前脚本覆盖已安装版本？输入 yes/y：" yes
+            case "$yes" in
+                y|Y|yes|YES|Yes) ;;
+                *) warn "已跳过覆盖已安装脚本"; return ;;
+            esac
+        fi
+    fi
+
+    if [ "$src_path" != "$dst_path" ]; then
+        cp "$0" "$SELF_MENU"
+        chmod +x "$SELF_MENU"
+    fi
 
     if [ -x "$REAL_UFW" ]; then
+        if [ -e "$WRAPPER_UFW" ] && ! grep -q "ufw-f-menu" "$WRAPPER_UFW" 2>/dev/null; then
+            warn "$WRAPPER_UFW 已存在且不是本脚本创建的包装器，已跳过，避免覆盖"
+            warn "你仍可使用：sudo $SELF_MENU"
+            return
+        fi
+
         cat >"$WRAPPER_UFW" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = "-f" ]; then
@@ -523,20 +564,104 @@ ufw_menu() {
 # Fail2Ban
 # ==================================================
 
+cleanup_old_fail2ban_configs_interactive() {
+    title "旧版Fail2Ban配置检测"
+
+    old_files=""
+    for f in \
+        /etc/fail2ban/jail.d/ufw-scanner.local \
+        /etc/fail2ban/jail.d/ufw-scanner.local.disabled \
+        /etc/fail2ban/jail.d/ufw-scan-lite.local \
+        /etc/fail2ban/jail.d/ufw-scan-lite.conf \
+        /etc/fail2ban/jail.d/99-disable-sshd.local \
+        /etc/fail2ban/filter.d/ufw-scanner.conf \
+        /etc/fail2ban/filter.d/ufw-scanner-lite.conf; do
+        [ -e "$f" ] && old_files="$old_files $f"
+    done
+
+    # 额外检测名称里带 ufw/scan 的旧 jail 文件，但不包含当前要写入的 jail.local
+    for f in /etc/fail2ban/jail.d/*ufw* /etc/fail2ban/jail.d/*scan*; do
+        [ -e "$f" ] || continue
+        case "$f" in
+            /etc/fail2ban/jail.d/ufw-scan-lite.local|/etc/fail2ban/jail.d/ufw-scan-lite.conf) ;;
+            *) echo "$old_files" | grep -qw "$f" || old_files="$old_files $f" ;;
+        esac
+    done
+
+    old_files="$(echo "$old_files" | xargs 2>/dev/null || true)"
+
+    if [ -z "$old_files" ]; then
+        ok "未发现旧版残留配置"
+        return
+    fi
+
+    warn "发现可能造成冲突的旧版配置："
+    i=1
+    for f in $old_files; do
+        echo "$i. $f"
+        i=$((i + 1))
+    done
+    echo
+    read -rp "是否清理这些旧版配置？默认Y：[Y/n] " yn
+    yn="${yn:-Y}"
+    case "$yn" in
+        y|Y|yes|YES|Yes)
+            for f in $old_files; do
+                rm -f "$f" 2>/dev/null || true
+            done
+            ok "旧版配置已清理"
+            ;;
+        *)
+            warn "已保留旧版配置。如 Fail2Ban 启动失败，请回到这里清理。"
+            ;;
+    esac
+}
+
 write_fail2ban_config() {
-    title "Fail2Ban 扫描降噪配置"
-    echo "作用：同一IP频繁触发UFW拦截日志后，自动封禁。"
-    echo "适合：SSH已改密钥登录，只想减少扫端口骚扰。"
-    echo "不输入则使用默认值。"
+    title "Fail2Ban 基础防护配置"
+    echo "本脚本采用托管模式：会覆盖 /etc/fail2ban/jail.local。"
+    echo "适合小白统一用本脚本管理，减少多个配置文件互相冲突。"
     echo
 
-    read -rp "检测时间，默认10m：" findtime
+    cleanup_old_fail2ban_configs_interactive
+    echo
+
+    read -rp "SSH端口，默认22：" ssh_port
+    ssh_port="${ssh_port:-22}"
+
+    echo
+    echo "SSH防爆破保护："
+    echo "1. 开启，推荐基础防护"
+    echo "2. 关闭，适合纯密钥登录且明确知道风险"
+    read -rp "选择，默认1：" ssh_enable_choice
+    ssh_enable_choice="${ssh_enable_choice:-1}"
+    case "$ssh_enable_choice" in
+        2) ssh_enabled="false" ;;
+        *) ssh_enabled="true" ;;
+    esac
+
+    if [ "$ssh_enabled" = "true" ]; then
+        read -rp "SSH触发次数，默认5：" ssh_maxretry
+        ssh_maxretry="${ssh_maxretry:-5}"
+        read -rp "SSH检测时间，默认10m：" ssh_findtime
+        ssh_findtime="${ssh_findtime:-10m}"
+        read -rp "SSH封禁时间，默认1h：" ssh_bantime
+        ssh_bantime="${ssh_bantime:-1h}"
+    else
+        ssh_maxretry="5"
+        ssh_findtime="10m"
+        ssh_bantime="1h"
+    fi
+
+    echo
+    echo "UFW扫描降噪：同一IP频繁触发UFW拦截后自动封禁。"
+    read -rp "扫描检测时间，默认10m：" findtime
     findtime="${findtime:-10m}"
 
-    read -rp "触发次数，默认40：" maxretry
+    read -rp "扫描触发次数，默认40：" maxretry
     maxretry="${maxretry:-40}"
 
-    read -rp "封禁时间，默认1h：" bantime
+    read -rp "扫描封禁时间，默认1h：" bantime
     bantime="${bantime:-1h}"
 
     read -rp "忽略IP，多个用空格，可留空：" ignore_extra
@@ -544,16 +669,15 @@ write_fail2ban_config() {
 
     mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
 
-    # 禁用系统默认 sshd jail
-    # 部分 Debian/Ubuntu 会自带 defaults-debian.conf 启用 sshd
-    # 没有 /var/log/auth.log 时会导致 Fail2Ban 测试失败
-    cat >/etc/fail2ban/jail.d/99-disable-sshd.local <<'EOF'
-[sshd]
-enabled = false
-EOF
-
-    # 清理旧扫描器配置，避免旧规则干扰
-    rm -f /etc/fail2ban/jail.d/ufw-scanner.local /etc/fail2ban/jail.d/ufw-scanner.local.disabled 2>/dev/null || true
+    # 清理旧扫描器配置，避免旧规则干扰。当前版本统一接管 jail.local。
+    rm -f \
+        /etc/fail2ban/jail.d/ufw-scanner.local \
+        /etc/fail2ban/jail.d/ufw-scanner.local.disabled \
+        /etc/fail2ban/jail.d/ufw-scan-lite.local \
+        /etc/fail2ban/jail.d/ufw-scan-lite.conf \
+        /etc/fail2ban/jail.d/99-disable-sshd.local \
+        /etc/fail2ban/filter.d/ufw-scanner.conf \
+        /etc/fail2ban/filter.d/ufw-scanner-lite.conf 2>/dev/null || true
 
     cat >/etc/fail2ban/filter.d/ufw-scan-lite.conf <<'EOF'
 # UFW扫描降噪规则
@@ -565,21 +689,22 @@ ignoreregex =
 EOF
 
     cat >/etc/fail2ban/jail.local <<EOF
-# Fail2Ban 扫描降噪配置
-# 说明：读取UFW拦截日志，同一IP频繁扫端口才封禁
+# Managed by UFW-F ${SCRIPT_VERSION}
+# 本文件由 UFW-F 脚本托管。再次运行脚本重建防护时会覆盖本文件。
+# 适合小白统一管理，避免多个 Fail2Ban 配置文件互相冲突。
 
 [DEFAULT]
 
 # 忽略IP：这些IP不会被封
 ignoreip = 127.0.0.1/8 ::1 ${ignore_extra}
 
-# 封禁时间
+# 默认封禁时间
 bantime = ${bantime}
 
-# 检测时间窗口
+# 默认检测时间窗口
 findtime = ${findtime}
 
-# 触发次数：同一IP在findtime内触发这么多次UFW BLOCK才封
+# 默认触发次数
 maxretry = ${maxretry}
 
 # 使用UFW封禁IP
@@ -591,8 +716,13 @@ action = %(action_)s
 
 [sshd]
 
-# 已改密钥登录，这里关闭 sshd jail
-enabled = false
+# SSH防爆破基础防护
+enabled = ${ssh_enabled}
+port = ${ssh_port}
+backend = systemd
+findtime = ${ssh_findtime}
+maxretry = ${ssh_maxretry}
+bantime = ${ssh_bantime}
 
 
 [ufw-scan-lite]
@@ -618,7 +748,12 @@ EOF
     ensure_log_files
     ufw logging low >/dev/null 2>&1 || true
 
-    ok "扫描降噪配置已写入。"
+    if [ "$ssh_enabled" = "true" ]; then
+        ok "SSH防爆破已开启：端口 ${ssh_port}，${ssh_findtime} 内 ${ssh_maxretry} 次触发，封禁 ${ssh_bantime}。"
+    else
+        warn "SSH防爆破已关闭。请确认SSH已使用密钥登录或你明确知道风险。"
+    fi
+    ok "UFW扫描降噪已开启：${findtime} 内 ${maxretry} 次触发，封禁 ${bantime}。"
 }
 restart_fail2ban_safe() {
     ensure_log_files
@@ -1051,7 +1186,7 @@ main_menu() {
         clear
         check_tools
 
-        echo "===== UFW-F 最终极简版 ====="
+        echo "===== UFW-F 最终极简版 v${SCRIPT_VERSION} ====="
         [ "$UFW_OK" = 1 ] && echo "防火墙：已安装" || echo "防火墙：未安装"
         [ "$F2B_OK" = 1 ] && echo "防骚扰：已安装" || echo "防骚扰：未安装"
         echo
