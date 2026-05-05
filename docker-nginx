@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v10
+# Docker + Nginx + HTTPS 工具箱 v11
 # 适合：Debian / Ubuntu
 #
 # 本版重点：
+# - 修复 Docker 完全空模板创建后仍提示启动的问题
+# - Docker 完全空模板改为真正空文件
+# - 优化 Nginx 错误中文翻译，提示更准确
 # - 证书列表显示完整路径
-# - Nginx 错误信息中文翻译，小白更友好
-# - Docker 空模板完全为空
 # - 统一术语，减少中英混用
-# - 代码结构优化，消除重复
+# - 代码结构适度优化，避免过度复杂
 #
 # 默认 Docker 项目目录：/docker
 # 配置记忆文件：/root/.docker-nginx-tool/config
@@ -22,7 +23,7 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 NC="\033[0m"
 
-VERSION="2026.05.05-v10"
+VERSION="2026.05.05-v11"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -71,8 +72,7 @@ detect_os(){
 load_conf(){
   mkdir -p "$CONF_DIR"
   if [ -f "$CONF_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$CONF_FILE" 2>/dev/null || true
+    LAST_BASE="$(grep '^LAST_BASE=' "$CONF_FILE" 2>/dev/null | head -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')"
   fi
   LAST_BASE="${LAST_BASE:-$DEFAULT_BASE}"
 }
@@ -194,22 +194,37 @@ nginx_config_test_quiet(){
 translate_nginx_error(){
   local msg="$1"
   local translated=""
-  
+
   case "$msg" in
-    *"No such file"*|*"cannot load certificate"*)
-      translated="证书文件找不到，可能是证书路径不对或证书已被删除"
+    *"cannot load certificate key"*|*"/etc/letsencrypt/"*"No such file"*|*"cannot load certificate"*)
+      translated="证书文件找不到，可能是证书路径不对、证书已被删除，或私钥文件不存在"
+      ;;
+    *"open()"*"failed"*"No such file"*)
+      translated="配置里引用的文件不存在，请检查上面提示的路径"
       ;;
     *"address already in use"*)
       translated="端口被其他程序占用了，请检查是否有其他服务在运行"
       ;;
     *"unknown directive"*)
-      translated="配置里有不认识的指令，可能是拼写错误或 Nginx 版本不支持"
+      translated="配置里有 Nginx 不认识的指令，可能是拼写错误或当前 Nginx 版本不支持"
       ;;
     *"unexpected end of file"*)
-      translated="配置文件没写完，可能少了括号或分号"
+      translated="配置文件可能没写完整，通常是少了 } 或 ;"
+      ;;
+    *"directive"*"is not terminated by"*)
+      translated="某一行配置可能少了分号 ;"
+      ;;
+    *"host not found in upstream"*)
+      translated="反向代理目标地址无法解析，请检查 proxy_pass 后面的地址"
+      ;;
+    *"duplicate"*"server name"*)
+      translated="发现重复域名配置，同一个域名可能配置了多次"
+      ;;
+    *"permission denied"*)
+      translated="权限不足，可能是文件权限或目录权限不正确"
       ;;
     *"emerg"*)
-      translated="配置有严重错误，请检查上面的具体提示"
+      translated="配置有严重错误，请优先查看上面提示的文件路径和行号"
       ;;
     *"the configuration file"*"syntax is ok"*)
       translated="配置语法检查通过"
@@ -221,7 +236,7 @@ translate_nginx_error(){
       translated=""
       ;;
   esac
-  
+
   if [ -n "$translated" ]; then
     echo "  💡 $translated"
   fi
@@ -660,8 +675,8 @@ create_docker_template(){
       return 0
       ;;
     2)
-      # 完全空模板，没有任何内容
-      echo "" > "$file"
+      # 完全空模板，真正创建 0 字节空文件
+      : > "$file"
       ;;
     *)
 cat > "$file" <<EOF
@@ -688,6 +703,12 @@ EOF
   if ask_yn "是否现在编辑 docker-compose.yml？" "y"; then
     open_editor "$file"
   fi
+
+  if [ "$t" = "2" ]; then
+    warn "你创建的是完全空模板，需要先写入配置内容，暂时不建议直接启动。"
+    return 0
+  fi
+
   if ask_yn "是否现在启动/应用配置 docker compose up -d？" "n"; then
     cd "$dir" || return 0
     docker compose up -d
@@ -1012,7 +1033,7 @@ nginx_sites_all(){
 }
 
 create_nginx_proxy(){
-  local name domain port file enabled issue_https
+  local name domain port file enabled
   command -v nginx >/dev/null 2>&1 || { err "未安装 Nginx，请先安装"; return 0; }
 
   precheck_nginx_or_continue || return 0
@@ -1368,11 +1389,8 @@ certbot_issue(){
 
   install_certbot
 
-  domain="${1:-}"
-  if [ -z "$domain" ]; then
-    read -rp "请输入申请证书的域名（回车取消）: " domain
-    [ -z "$domain" ] && return 0
-  fi
+  read -rp "请输入申请证书的域名（回车取消）: " domain
+  [ -z "$domain" ] && return 0
 
   while ! valid_domain "$domain"; do
     warn "域名格式看起来不正确，请只输入域名，不要带 http:// 或路径"
@@ -1432,7 +1450,7 @@ certbot_force_renew(){
     return 0
   fi
 
-  warn "强制续期一般不需要频繁执行。普通检查请用"测试续期"。"
+  warn "强制续期一般不需要频繁执行。普通检查请用：测试续期。"
   ask_yn "确认强制续期？" "n" || return 0
 
   precheck_nginx_or_continue || return 0
