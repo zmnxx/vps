@@ -74,7 +74,9 @@ load_conf(){
   if [ -f "$CONF_FILE" ]; then
     LAST_BASE="$(grep '^LAST_BASE=' "$CONF_FILE" 2>/dev/null | head -n 1 | cut -d= -f2- | sed 's/^"//;s/"$//')"
   fi
-  LAST_BASE="${LAST_BASE:-$DEFAULT_BASE}"
+  if [ -z "$LAST_BASE" ]; then
+    LAST_BASE="$DEFAULT_BASE"
+  fi
 }
 
 save_conf(){
@@ -112,7 +114,7 @@ ask_yn(){
 }
 
 safe_name(){
-  echo "$1" | grep -Eq '^[a-zA-Z0-9._-]+$'
+  echo "$1" | grep -Eq '^[a-zA-Z][a-zA-Z0-9._-]*$'
 }
 
 valid_port(){
@@ -120,7 +122,7 @@ valid_port(){
 }
 
 valid_domain(){
-  echo "$1" | grep -Eq '^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'
+  echo "$1" | grep -Eq '^([a-zA-Z][a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$'
 }
 
 compose_file_in_dir(){
@@ -149,10 +151,13 @@ check_docker_service(){
 warn_if_port_not_listening(){
   local port="$1"
   command -v ss >/dev/null 2>&1 || return 0
-  if ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then
+  if ! ss -lnt 2>/dev/null | awk -F: '{print $NF}' | grep -Eq "^${port}$"; then
     warn "当前没有检测到本机端口 $port 正在监听。"
-    ask_yn "仍继续创建反向代理配置？" "y"
-    return $?
+    if ask_yn "仍继续创建反向代理配置？" "y"; then
+      return 0  # 用户确认，继续
+    else
+      return 1  # 用户拒绝，退出
+    fi
   fi
   return 0
 }
@@ -364,8 +369,11 @@ repair_missing_cert_refs(){
   esac
 
   if nginx_config_test_quiet; then
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-    log "修复后 Nginx 配置检查通过并已重新加载"
+    if systemctl reload nginx 2>/dev/null; then
+      log "修复后 Nginx 配置检查通过并已重新加载"
+    else
+      systemctl restart nginx 2>/dev/null && log "Nginx 已重启" || err "Nginx 重启失败"
+    fi
   else
     err "修复后仍有 Nginx 配置错误："
     show_nginx_test_error
@@ -374,8 +382,11 @@ repair_missing_cert_refs(){
 
 test_reload_nginx(){
   if nginx_config_test_quiet; then
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-    log "Nginx 配置检查通过并已重新加载"
+    if systemctl reload nginx 2>/dev/null; then
+      log "Nginx 配置检查通过并已重新加载"
+    else
+      systemctl restart nginx 2>/dev/null && log "Nginx 已重启" || err "Nginx 重启失败"
+    fi
     return 0
   fi
 
@@ -565,6 +576,7 @@ find_compose_files(){
 }
 
 show_compose_projects(){
+  local -a files
   mapfile -t files < <(find_compose_files)
 
   if [ "${#files[@]}" -eq 0 ]; then
@@ -581,6 +593,7 @@ show_compose_projects(){
 
 select_compose_dir(){
   SELECTED_DIR=""
+  local -a files
   mapfile -t files < <(find_compose_files)
 
   if [ "${#files[@]}" -eq 0 ]; then
@@ -627,7 +640,7 @@ select_compose_dir(){
     return 1
   fi
 
-  idx=$((n-1))
+  local idx=$((n-1))
   if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#files[@]}" ]; then
     err "选择无效"
     return 1
@@ -723,6 +736,8 @@ compose_edit(){
   if ask_yn "是否立即应用配置 docker compose up -d？" "y"; then
     cd "$SELECTED_DIR" || return 0
     docker compose up -d
+  else
+    info "可在菜单中选择「启动/应用」来生效"
   fi
 }
 
@@ -753,6 +768,8 @@ compose_apply(){
   select_compose_dir || return 0
   cd "$SELECTED_DIR" || return 0
 
+  info "拉取最新镜像..."
+  docker compose pull || warn "拉取镜像失败，继续使用本地镜像"
   info "执行 docker compose up -d"
   docker compose up -d
   log "已启动/应用配置：$SELECTED_DIR"
@@ -787,6 +804,7 @@ compose_restart(){
       ;;
     2)
       docker compose restart
+      sleep 1
       log "已重启容器：$SELECTED_DIR"
       ;;
     *)
@@ -813,8 +831,12 @@ update_one_service(){
   ask_yn "确认更新？" "y" || return 0
 
   cd "$SELECTED_DIR" || return 0
-  docker compose pull
-  docker compose up -d
+  if docker compose pull; then
+    docker compose up -d
+  else
+    warn "拉取镜像失败，继续使用本地镜像启动"
+    docker compose up -d
+  fi
 
   ask_yn "是否清理旧镜像？" "n" && docker image prune -f
 
@@ -825,6 +847,7 @@ update_all_services(){
   info "一键升级所有 Compose 项目"
   warn "会执行 docker compose pull && docker compose up -d"
 
+  local -a files
   mapfile -t files < <(find_compose_files)
 
   if [ "${#files[@]}" -eq 0 ]; then
@@ -843,9 +866,16 @@ update_all_services(){
     dir="$(dirname "$f")"
     echo
     info "更新：$dir"
-    cd "$dir" || continue
-    docker compose pull
-    docker compose up -d
+    if ! cd "$dir" 2>/dev/null; then
+      warn "无法进入目录：$dir，跳过"
+      continue
+    fi
+    if docker compose pull; then
+      docker compose up -d
+    else
+      warn "拉取镜像失败，继续使用本地镜像启动"
+      docker compose up -d
+    fi
   done
 
   ask_yn "是否清理所有旧镜像？" "n" && docker image prune -f
@@ -867,7 +897,7 @@ docker_prune(){
       ;;
     2)
       ask_yn "确认执行 docker system prune？" "n" || return 0
-      docker system prune -f
+      docker system prune
       ;;
     *)
       warn "已取消"
@@ -895,7 +925,8 @@ docker_uninstall(){
     2)
       ask_yn "确认完全卸载 Docker？这会删除容器/镜像/卷数据" "n" || return 0
       apt remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
-      rm -rf /var/lib/docker /var/lib/containerd
+      rm -rf /var/lib/docker
+      [ -d /var/lib/containerd ] && rm -rf /var/lib/containerd
       log "Docker 已完全卸载，系统 Docker 数据已删除"
       ;;
     *)
@@ -942,6 +973,7 @@ select_item_from_list(){
 
 select_container(){
   SELECTED_CONTAINER=""
+  local -a containers
   mapfile -t containers < <(docker ps -a --format '{{.Names}}' 2>/dev/null | sort)
   if [ "${#containers[@]}" -eq 0 ]; then
     warn "没有容器"
@@ -953,7 +985,11 @@ select_container(){
 container_shell(){
   select_container || return 0
   echo "进入容器：$SELECTED_CONTAINER，退出请输入 exit"
-  docker exec -it "$SELECTED_CONTAINER" sh || docker exec -it "$SELECTED_CONTAINER" bash
+  if ! docker exec -it "$SELECTED_CONTAINER" sh 2>/dev/null; then
+    if ! docker exec -it "$SELECTED_CONTAINER" bash 2>/dev/null; then
+      err "无法进入容器：sh 和 bash 均不可用，请手动检查容器镜像"
+    fi
+  fi
 }
 
 container_logs(){
@@ -1064,7 +1100,9 @@ create_nginx_proxy(){
     [ -z "$port" ] && return 0
   done
 
-  warn_if_port_not_listening "$port" || return 0
+  if ! warn_if_port_not_listening "$port"; then
+    return 0
+  fi
 
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
@@ -1163,6 +1201,7 @@ list_nginx_sites(){
 
 select_nginx_enabled_site(){
   SELECTED_SITE=""
+  local -a sites
   mapfile -t sites < <(nginx_sites_enabled)
 
   if [ "${#sites[@]}" -eq 0 ]; then
@@ -1175,6 +1214,7 @@ select_nginx_enabled_site(){
 
 select_nginx_available_site(){
   SELECTED_SITE=""
+  local -a sites
   mapfile -t sites < <(nginx_sites_available)
 
   if [ "${#sites[@]}" -eq 0 ]; then
@@ -1187,6 +1227,7 @@ select_nginx_available_site(){
 
 select_nginx_any_site(){
   SELECTED_SITE=""
+  local -a sites
   mapfile -t sites < <(nginx_sites_all)
 
   if [ "${#sites[@]}" -eq 0 ]; then
@@ -1214,7 +1255,7 @@ select_nginx_any_site(){
     return 1
   fi
 
-  idx=$((n-1))
+  local idx=$((n-1))
   if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#sites[@]}" ]; then
     err "选择无效"
     return 1
@@ -1239,8 +1280,11 @@ enable_nginx_site(){
   ln -s "$file" "$enabled"
 
   if nginx_config_test_quiet; then
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-    log "已启用站点：$SELECTED_SITE"
+    if systemctl reload nginx 2>/dev/null; then
+      log "已启用站点：$SELECTED_SITE"
+    else
+      systemctl restart nginx 2>/dev/null && log "已启用站点（已重启 Nginx）：$SELECTED_SITE" || err "Nginx 重启失败"
+    fi
   else
     err "启用后 Nginx 检查失败，已自动撤销启用："
     show_nginx_test_error
@@ -1291,7 +1335,13 @@ edit_nginx_site_config(){
   open_editor "$file"
   if nginx_config_test_quiet; then
     log "Nginx 配置检查通过"
-    ask_yn "是否重新加载 Nginx？" "y" && (systemctl reload nginx 2>/dev/null || systemctl restart nginx)
+    if ask_yn "是否重新加载 Nginx？" "y"; then
+      if systemctl reload nginx 2>/dev/null; then
+        log "Nginx 已重新加载"
+      else
+        systemctl restart nginx 2>/dev/null && log "Nginx 已重启" || err "Nginx 重启失败"
+      fi
+    fi
   else
     err "Nginx 配置检查失败："
     show_nginx_test_error
@@ -1473,7 +1523,7 @@ certbot_delete(){
   warn "删除证书可能导致 Nginx 配置引用不存在的证书，从而 nginx -t 失败。"
   echo "删除前建议先禁用或删除对应 Nginx 站点。"
   echo
-  grep -R "/etc/letsencrypt/live/$name/" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null || true
+  grep -R "/etc/letsencrypt/live/${name}/" "/etc/nginx/sites-available" "/etc/nginx/sites-enabled" 2>/dev/null || true
   echo
 
   ask_yn "确认删除该证书？" "n" || return 0
@@ -1494,7 +1544,7 @@ certbot_force_renew_domain(){
   [ -z "$domain" ] && return 0
   ask_yn "确认强制续期 $domain？" "n" || return 0
   precheck_nginx_or_continue || return 0
-  certbot certonly --nginx -d "$domain" --force-renewal
+  certbot renew --cert-name "$domain" --force-renewal
   test_reload_nginx
 }
 
