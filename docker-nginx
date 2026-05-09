@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v11
+# Docker + Nginx + HTTPS 工具箱 v12
 # 适合：Debian / Ubuntu
 #
 # 本版重点：
-# - 修复 Docker 完全空模板创建后仍提示启动的问题
-# - Docker 完全空模板改为真正空文件
-# - 优化 Nginx 错误中文翻译，提示更准确
-# - 证书列表显示完整路径
-# - 统一术语，减少中英混用
-# - 代码结构适度优化，避免过度复杂
+# - 状态/分析输出改成更简短的中文摘要
+# - Docker 项目日志、容器日志、Nginx 日志默认只显示最近 100 条
+# - 实时日志改为单独选项，避免默认跟随导致终端卡住
+# - 容器列表、资源占用、空间统计增加中文化显示
+# - 增加运行状态分析和问题提示，查看状态更直接
+# - 保留 v11 的证书引用修复和 Nginx 错误中文翻译
 #
 # 默认 Docker 项目目录：/docker
 # 配置记忆文件：/root/.docker-nginx-tool/config
@@ -23,7 +23,9 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 NC="\033[0m"
 
-VERSION="2026.05.05-v11"
+TOOL_VERSION="2026.05.09-v12"
+LOG_TAIL_DEFAULT=100
+LIST_LIMIT_DEFAULT=20
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -146,6 +148,190 @@ check_docker_service(){
   systemctl enable docker >/dev/null 2>&1 || true
   systemctl start docker >/dev/null 2>&1 || true
   docker info >/dev/null 2>&1
+}
+
+# ----------------------------
+# 中文化显示 / 简短摘要
+# ----------------------------
+
+service_state_zh(){
+  local state="${1:-unknown}"
+  case "$state" in
+    active) echo "运行中" ;;
+    inactive) echo "未运行" ;;
+    failed) echo "异常" ;;
+    activating) echo "启动中" ;;
+    deactivating) echo "停止中" ;;
+    not-found) echo "未安装" ;;
+    unknown|"") echo "未知" ;;
+    *) echo "$state" ;;
+  esac
+}
+
+docker_status_zh(){
+  local status="$1"
+  case "$status" in
+    Up*|running) echo "运行中" ;;
+    Exited*|exited) echo "已停止" ;;
+    Created*|created) echo "未启动" ;;
+    Restarting*|restarting) echo "重启中" ;;
+    Paused*|paused) echo "已暂停" ;;
+    Dead*|dead) echo "异常" ;;
+    Removing*|removing) echo "删除中" ;;
+    *) echo "${status:-未知}" ;;
+  esac
+}
+
+bool_zh(){
+  case "${1:-}" in
+    true|yes|1) echo "是" ;;
+    false|no|0) echo "否" ;;
+    *) echo "未知" ;;
+  esac
+}
+
+docker_action_zh(){
+  case "${1:-}" in
+    start) echo "启动" ;;
+    stop) echo "停止" ;;
+    restart) echo "重启" ;;
+    *) echo "${1:-操作}" ;;
+  esac
+}
+
+short_text(){
+  local text="$1"
+  local max="${2:-90}"
+  if [ "${#text}" -gt "$max" ]; then
+    echo "${text:0:max}..."
+  else
+    echo "$text"
+  fi
+}
+
+docker_running_ok(){
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+require_docker_running(){
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker 未安装，请先进入 Docker 环境安装/检测"
+    return 1
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker 服务不可用，请先检查或启动 Docker"
+    return 1
+  fi
+
+  return 0
+}
+
+docker_container_counts(){
+  local running=0 total=0
+  if docker_running_ok; then
+    running="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+    total="$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  echo "$running/$total"
+}
+
+docker_list_containers(){
+  local mode="${1:-all}"
+  local limit="${2:-$LIST_LIMIT_DEFAULT}"
+  local tmp total shown=0 name status ports title
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker 未安装"
+    return 0
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker 服务不可用，无法读取容器列表"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  if [ "$mode" = "running" ]; then
+    title="运行中容器"
+    docker ps --format '{{.Names}}	{{.Status}}	{{.Ports}}' > "$tmp" 2>/dev/null || {
+      rm -f "$tmp"
+      warn "读取 Docker 容器失败"
+      return 0
+    }
+  else
+    title="全部容器"
+    docker ps -a --format '{{.Names}}	{{.Status}}	{{.Ports}}' > "$tmp" 2>/dev/null || {
+      rm -f "$tmp"
+      warn "读取 Docker 容器失败"
+      return 0
+    }
+  fi
+
+  total="$(wc -l < "$tmp" | tr -d ' ')"
+  if [ "$total" -eq 0 ]; then
+    echo "$title：没有容器"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  echo "$title：共 $total 个，显示前 $limit 个"
+  printf '%-28s %-10s %s\n' "容器名" "状态" "端口/映射"
+  printf '%-28s %-10s %s\n' "----------------------------" "----------" "------------------------------"
+  while IFS=$'\t' read -r name status ports; do
+    [ "$shown" -ge "$limit" ] && break
+    [ -z "$ports" ] && ports="未公开"
+    printf '%-28s %-10s %s\n' "$(short_text "$name" 28)" "$(docker_status_zh "$status")" "$(short_text "$ports" 90)"
+    shown=$((shown + 1))
+  done < "$tmp"
+
+  if [ "$total" -gt "$limit" ]; then
+    echo "... 还有 $((total - limit)) 个未显示，可用 docker ps -a 查看完整列表"
+  fi
+
+  rm -f "$tmp"
+}
+
+docker_stats_summary(){
+  local tmp total shown=0 name cpu mem memp netio blockio
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker 未安装"
+    return 0
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker 服务不可用，无法读取资源占用"
+    return 0
+  fi
+
+  if [ "$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]; then
+    echo "资源占用：没有运行中的容器"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  docker stats --no-stream --format '{{.Name}}	{{.CPUPerc}}	{{.MemUsage}}	{{.MemPerc}}	{{.NetIO}}	{{.BlockIO}}' > "$tmp" 2>/dev/null || {
+    rm -f "$tmp"
+    warn "读取 Docker 资源占用失败"
+    return 0
+  }
+
+  total="$(wc -l < "$tmp" | tr -d ' ')"
+  echo "资源占用：共 $total 个运行中容器，显示前 $LIST_LIMIT_DEFAULT 个"
+  printf '%-28s %-10s %-24s %-10s %-22s %s\n' "容器名" "CPU" "内存" "内存占比" "网络" "磁盘"
+  printf '%-28s %-10s %-24s %-10s %-22s %s\n' "----------------------------" "----------" "------------------------" "----------" "----------------------" "----------------------"
+  while IFS=$'\t' read -r name cpu mem memp netio blockio; do
+    [ "$shown" -ge "$LIST_LIMIT_DEFAULT" ] && break
+    printf '%-28s %-10s %-24s %-10s %-22s %s\n' "$(short_text "$name" 28)" "$cpu" "$mem" "$memp" "$(short_text "$netio" 22)" "$(short_text "$blockio" 22)"
+    shown=$((shown + 1))
+  done < "$tmp"
+
+  if [ "$total" -gt "$LIST_LIMIT_DEFAULT" ]; then
+    echo "... 还有 $((total - LIST_LIMIT_DEFAULT)) 个未显示"
+  fi
+
+  rm -f "$tmp"
 }
 
 warn_if_port_not_listening(){
@@ -752,6 +938,7 @@ EOF
   fi
 
   if ask_yn "是否现在启动/应用配置 docker compose up -d？" "n"; then
+    require_docker_running || return 0
     cd "$dir" || return 0
     docker compose up -d
   fi
@@ -763,6 +950,7 @@ compose_edit(){
   file="$(compose_file_in_dir "$SELECTED_DIR")" || { err "未找到 Compose 文件"; return 0; }
   open_editor "$file"
   if ask_yn "是否立即应用配置 docker compose up -d？" "y"; then
+    require_docker_running || return 0
     cd "$SELECTED_DIR" || return 0
     docker compose up -d
   else
@@ -795,6 +983,7 @@ compose_update_menu(){
 
 compose_apply(){
   select_compose_dir || return 0
+  require_docker_running || return 0
   cd "$SELECTED_DIR" || return 0
 
   info "拉取最新镜像..."
@@ -806,6 +995,7 @@ compose_apply(){
 
 compose_stop(){
   select_compose_dir || return 0
+  require_docker_running || return 0
   cd "$SELECTED_DIR" || return 0
 
   echo "将停止项目：$SELECTED_DIR"
@@ -817,6 +1007,7 @@ compose_stop(){
 
 compose_restart(){
   select_compose_dir || return 0
+  require_docker_running || return 0
   cd "$SELECTED_DIR" || return 0
 
   warn "docker compose restart 只重启容器，不会应用 docker-compose.yml 里的端口/挂载改动"
@@ -844,17 +1035,28 @@ compose_restart(){
 
 compose_logs(){
   select_compose_dir || return 0
+  require_docker_running || return 0
   cd "$SELECTED_DIR" || return 0
 
-  echo "查看日志：$SELECTED_DIR"
-  echo "按 Ctrl+C 退出日志"
-  docker compose logs -f
+  echo "查看项目日志：$SELECTED_DIR"
+  echo "1) 最近 ${LOG_TAIL_DEFAULT} 条（推荐，不会一直刷屏）"
+  echo "2) 实时跟随（先显示最近 ${LOG_TAIL_DEFAULT} 条，按 Ctrl+C 退出）"
+  echo "0) 取消"
+  read -rp "请选择（默认 1）: " c
+  c="${c:-1}"
+
+  case "$c" in
+    2) docker compose logs --tail="$LOG_TAIL_DEFAULT" -f ;;
+    0) warn "已取消" ;;
+    *) docker compose logs --tail="$LOG_TAIL_DEFAULT" ;;
+  esac
 }
 
 update_one_service(){
   info "更新某个 Compose 项目"
 
   select_compose_dir || return 0
+  require_docker_running || return 0
 
   echo "即将更新：$SELECTED_DIR"
   ask_yn "确认更新？" "y" || return 0
@@ -890,6 +1092,7 @@ update_all_services(){
   done
 
   ask_yn "确认全部更新？" "n" || return 0
+  require_docker_running || return 0
 
   for f in "${files[@]}"; do
     dir="$(dirname "$f")"
@@ -985,8 +1188,8 @@ docker_container_menu(){
     read -rp "请选择: " c
 
     case "$c" in
-      1) docker ps; pause ;;
-      2) docker ps -a; pause ;;
+      1) docker_list_containers running; pause ;;
+      2) docker_list_containers all; pause ;;
       3)
         echo "1) 启动容器"
         echo "2) 停止容器"
@@ -1001,7 +1204,7 @@ docker_container_menu(){
       4) container_shell; pause ;;
       5) container_logs; pause ;;
       6) container_detail; pause ;;
-      7) docker stats --no-stream; pause ;;
+      7) docker_stats_summary; pause ;;
       8) ask_yn "确认删除所有已停止容器？" "n" && docker container prune -f; pause ;;
       0) return ;;
       "") continue ;;
@@ -1025,8 +1228,10 @@ docker_log_menu(){
       1) container_clean_logs; pause ;;
       2) docker_clean_all_logs; pause ;;
       3)
-        echo "容器日志占用："
-        du -sh /var/lib/docker/containers/*/*.log 2>/dev/null | sort -h | tail -20
+        echo "容器日志占用（最大的 20 个）："
+        if ! du -sh /var/lib/docker/containers/*/*.log 2>/dev/null | sort -h | tail -20; then
+          warn "没有找到 Docker 容器日志文件"
+        fi
         pause
         ;;
       0) return ;;
@@ -1052,22 +1257,24 @@ docker_cleanup_menu(){
     case "$c" in
       1) docker_system_df; pause ;;
       2)
-        if ask_yn "确认清理无用镜像？" "y"; then
+        if require_docker_running && ask_yn "确认清理无用镜像？" "y"; then
           docker image prune -a
         fi
         pause
         ;;
       3) docker_volume_manage ;;
       4)
-        if ask_yn "确认清理构建缓存？" "y"; then
+        if require_docker_running && ask_yn "确认清理构建缓存？" "y"; then
           docker builder prune
         fi
         pause
         ;;
       5)
-        warn "这会清理：无用镜像、停止容器、无用网络、构建缓存、无用卷"
-        if ask_yn "确认一键清理全部？" "n"; then
-          docker system prune -a --volumes
+        if require_docker_running; then
+          warn "这会清理：无用镜像、停止容器、无用网络、构建缓存、无用卷"
+          if ask_yn "确认一键清理全部？" "n"; then
+            docker system prune -a --volumes
+          fi
         fi
         pause
         ;;
@@ -1079,16 +1286,35 @@ docker_cleanup_menu(){
 }
 
 docker_system_df(){
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker 未安装"
+    return 0
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker 服务不可用，无法读取空间占用"
+    return 0
+  fi
+
   info "Docker 空间占用统计"
+  echo "中文摘要："
+  echo "  镜像：$(docker images -q 2>/dev/null | sort -u | wc -l | tr -d ' ') 个"
+  echo "  容器：$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ') 个（运行中 $(docker ps -q 2>/dev/null | wc -l | tr -d ' ') 个）"
+  echo "  卷：$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' ') 个"
+  echo "  项目：$(find_compose_files 2>/dev/null | wc -l | tr -d ' ') 个 Compose 文件"
   echo
+  echo "Docker 原生统计："
   docker system df
   echo
-  echo "详细信息："
-  docker system df -v | head -50
+
+  if ask_yn "是否查看详细占用列表？（最多显示 ${LOG_TAIL_DEFAULT} 行）" "n"; then
+    docker system df -v | head -n "$LOG_TAIL_DEFAULT"
+  fi
 }
 
 docker_config_log_rotation(){
   local daemon_json="/etc/docker/daemon.json"
+  local max_size max_file
   
   info "配置 Docker 全局日志轮转（限制所有容器日志大小）"
   echo "说明："
@@ -1110,7 +1336,7 @@ docker_config_log_rotation(){
   echo "将配置："
   echo "  max-size: $max_size （单个文件最大 $max_size）"
   echo "  max-file: $max_file （最多保留 $max_file 个文件）"
-  echo "  总日志上限: 约 $(echo "$max_size" | sed 's/m/*'"$max_file"'/') MB/容器"
+  echo "  单容器日志上限：最多 $max_file 个文件，每个文件最大 $max_size"
   echo
   
   if ! ask_yn "确认修改 $daemon_json ？" "y"; then
@@ -1118,6 +1344,8 @@ docker_config_log_rotation(){
     return 0
   fi
   
+  mkdir -p /etc/docker
+
   # 备份原文件
   if [ -f "$daemon_json" ]; then
     cp "$daemon_json" "${daemon_json}.bak.$(date +%Y%m%d_%H%M%S)"
@@ -1126,9 +1354,15 @@ docker_config_log_rotation(){
   
   # 使用 jq 合并配置（如果有 jq）
   if command -v jq >/dev/null 2>&1 && [ -f "$daemon_json" ]; then
-    jq --arg ms "$max_size" --arg mf "$max_file" \
+    if jq --arg ms "$max_size" --arg mf "$max_file" \
       '.["log-driver"] = "json-file" | .["log-opts"] = {"max-size": $ms, "max-file": $mf}' \
-      "$daemon_json" > "${daemon_json}.tmp" && mv "${daemon_json}.tmp" "$daemon_json"
+      "$daemon_json" > "${daemon_json}.tmp"; then
+      mv "${daemon_json}.tmp" "$daemon_json"
+    else
+      rm -f "${daemon_json}.tmp"
+      err "daemon.json 不是合法 JSON，已保留原文件。请手动检查：$daemon_json"
+      return 0
+    fi
   else
     # 没有 jq 或文件不存在，直接写入
     cat > "$daemon_json" << EOF
@@ -1145,8 +1379,11 @@ EOF
   log "已配置 Docker 全局日志轮转"
   echo
   if ask_yn "是否立即重启 Docker 服务？（会短暂中断容器）" "y"; then
-    systemctl restart docker
-    log "Docker 已重启，新配置已生效"
+    if systemctl restart docker; then
+      log "Docker 已重启，新配置已生效"
+    else
+      err "Docker 重启失败，请手动执行：systemctl restart docker"
+    fi
   else
     warn "请手动执行：systemctl restart docker"
   fi
@@ -1154,6 +1391,12 @@ EOF
 
 docker_clean_all_logs(){
   info "批量清理所有容器日志"
+
+  if ! docker_running_ok; then
+    warn "Docker 未安装或服务不可用，无法清理日志"
+    return 0
+  fi
+
   warn "这会清空所有容器的日志文件"
   echo
   
@@ -1191,6 +1434,8 @@ docker_clean_all_logs(){
 }
 
 docker_volume_manage(){
+  require_docker_running || { pause; return 0; }
+
   while true; do
     clear
     echo "========== Docker 卷管理 =========="
@@ -1311,6 +1556,17 @@ select_item_from_list(){
 
 select_container(){
   SELECTED_CONTAINER=""
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker 未安装"
+    return 1
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker 服务不可用，无法读取容器"
+    return 1
+  fi
+
   local -a containers
   mapfile -t containers < <(docker ps -a --format '{{.Names}}' 2>/dev/null | sort)
   if [ "${#containers[@]}" -eq 0 ]; then
@@ -1332,32 +1588,68 @@ container_shell(){
 
 container_logs(){
   select_container || return 0
-  echo "按 Ctrl+C 退出日志"
-  docker logs -f --tail=200 "$SELECTED_CONTAINER"
+  echo "查看容器日志：$SELECTED_CONTAINER"
+  echo "1) 最近 ${LOG_TAIL_DEFAULT} 条（推荐，不会一直刷屏）"
+  echo "2) 实时跟随（先显示最近 ${LOG_TAIL_DEFAULT} 条，按 Ctrl+C 退出）"
+  echo "0) 取消"
+  read -rp "请选择（默认 1）: " c
+  c="${c:-1}"
+
+  case "$c" in
+    2) docker logs --tail="$LOG_TAIL_DEFAULT" -f "$SELECTED_CONTAINER" ;;
+    0) warn "已取消" ;;
+    *) docker logs --tail="$LOG_TAIL_DEFAULT" "$SELECTED_CONTAINER" ;;
+  esac
 }
 
 container_action(){
   local act="$1"
   select_container || return 0
-  ask_yn "确认对 $SELECTED_CONTAINER 执行 $act？" "n" || return 0
+  ask_yn "确认对 $SELECTED_CONTAINER 执行$(docker_action_zh "$act")？" "n" || return 0
   docker "$act" "$SELECTED_CONTAINER"
 }
 
 container_detail(){
   select_container || return 0
+
+  local image state running started restart ports mounts networks
+  image="$(docker inspect "$SELECTED_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null)"
+  state="$(docker inspect "$SELECTED_CONTAINER" --format '{{.State.Status}}' 2>/dev/null)"
+  running="$(docker inspect "$SELECTED_CONTAINER" --format '{{.State.Running}}' 2>/dev/null)"
+  started="$(docker inspect "$SELECTED_CONTAINER" --format '{{.State.StartedAt}}' 2>/dev/null)"
+  restart="$(docker inspect "$SELECTED_CONTAINER" --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null)"
+  ports="$(docker port "$SELECTED_CONTAINER" 2>/dev/null || true)"
+  mounts="$(docker inspect "$SELECTED_CONTAINER" --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}' 2>/dev/null)"
+  networks="$(docker inspect "$SELECTED_CONTAINER" --format '{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} {{$conf.IPAddress}}{{println}}{{end}}' 2>/dev/null)"
+
   echo "容器详情：$SELECTED_CONTAINER"
   echo "----------------------------------------"
-  docker inspect "$SELECTED_CONTAINER" --format '
-镜像：{{.Config.Image}}
-状态：{{.State.Status}}
-运行中：{{.State.Running}}
-启动时间：{{.State.StartedAt}}
-重启策略：{{.HostConfig.RestartPolicy.Name}}
-端口映射：{{range $p, $conf := .NetworkSettings.Ports}}{{$p}} -> {{(index $conf 0).HostPort}} {{end}}
-挂载卷：{{range .Mounts}}
-  {{.Source}} -> {{.Destination}}{{end}}
-网络：{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} ({{$conf.IPAddress}}){{end}}
-' 2>/dev/null || echo "无法获取容器详情"
+  echo "镜像：${image:-未知}"
+  echo "状态：$(docker_status_zh "$state")"
+  echo "运行中：$(bool_zh "$running")"
+  echo "启动时间：${started:-未知}"
+  echo "重启策略：${restart:-未知}"
+  echo
+  echo "端口映射："
+  if [ -n "$ports" ]; then
+    echo "$ports" | sed 's/^/  /'
+  else
+    echo "  未公开端口"
+  fi
+  echo
+  echo "挂载卷："
+  if [ -n "$mounts" ]; then
+    echo "$mounts" | sed 's/^/  /'
+  else
+    echo "  无"
+  fi
+  echo
+  echo "网络："
+  if [ -n "$networks" ]; then
+    echo "$networks" | sed 's/^/  /'
+  else
+    echo "  无"
+  fi
 }
 
 container_clean_logs(){
@@ -1730,16 +2022,16 @@ nginx_site_manage_menu(){
 }
 
 nginx_log_menu(){
-  echo "1) 最近访问日志"
-  echo "2) 最近错误日志"
-  echo "3) 实时错误日志"
+  echo "1) 最近访问日志（最近 ${LOG_TAIL_DEFAULT} 条）"
+  echo "2) 最近错误日志（最近 ${LOG_TAIL_DEFAULT} 条）"
+  echo "3) 实时错误日志（先显示最近 ${LOG_TAIL_DEFAULT} 条，按 Ctrl+C 退出）"
   echo "0) 取消"
   read -rp "请选择（默认 2）: " c
   c="${c:-2}"
   case "$c" in
-    1) tail -n 120 /var/log/nginx/access.log 2>/dev/null || warn "没有访问日志" ;;
-    2) tail -n 120 /var/log/nginx/error.log 2>/dev/null || warn "没有错误日志" ;;
-    3) tail -f /var/log/nginx/error.log ;;
+    1) tail -n "$LOG_TAIL_DEFAULT" /var/log/nginx/access.log 2>/dev/null || warn "没有访问日志" ;;
+    2) tail -n "$LOG_TAIL_DEFAULT" /var/log/nginx/error.log 2>/dev/null || warn "没有错误日志" ;;
+    3) tail -n "$LOG_TAIL_DEFAULT" -f /var/log/nginx/error.log ;;
     *) warn "已取消" ;;
   esac
 }
@@ -1915,76 +2207,118 @@ certbot_renew_status(){
 # ----------------------------
 
 show_status(){
+  local -a issues=()
+  local docker_state nginx_state cert_count enabled_count nginx_state_zh
+
   echo "============================================================"
-  echo "当前状态"
+  echo "状态摘要"
   echo "============================================================"
   echo "系统：$OS_NAME"
+  echo "默认 Docker 目录：$LAST_BASE"
+  echo "日志默认显示：最近 $LOG_TAIL_DEFAULT 条"
   echo
 
   echo "【Docker】"
   if command -v docker >/dev/null 2>&1; then
-    echo "版本：$(docker --version)"
-    echo "Compose：$(docker compose version 2>/dev/null || echo 未安装)"
-    echo "容器："
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    docker_state="$(systemctl is-active docker 2>/dev/null || echo unknown)"
+    echo "状态：$(service_state_zh "$docker_state")"
+    echo "版本：$(docker --version 2>/dev/null | sed 's/, build.*//')"
+    echo "Compose：$(docker compose version 2>/dev/null | sed 's/Docker Compose version //;s/^v//;s/^/v/' || echo 未安装)"
+
+    if docker info >/dev/null 2>&1; then
+      echo "容器：$(docker_container_counts)（运行中/全部）"
+      echo
+      docker_list_containers running 10
+    else
+      echo "引擎：不可用"
+      issues+=("Docker 已安装但服务不可用，建议检查 systemctl status docker")
+    fi
   else
-    echo "未安装"
+    echo "状态：未安装"
+    issues+=("Docker 未安装，Docker 项目相关功能不可用")
   fi
 
   echo
   echo "【Nginx】"
   if command -v nginx >/dev/null 2>&1; then
-    echo "版本：$(nginx -v 2>&1)"
-    echo "服务：$(systemctl is-active nginx 2>/dev/null || echo 未知)"
+    nginx_state="$(systemctl is-active nginx 2>/dev/null || echo unknown)"
+    if [ "$nginx_state" = "unknown" ]; then
+      nginx_state_zh="已安装（服务状态未知）"
+    else
+      nginx_state_zh="$(service_state_zh "$nginx_state")"
+    fi
+    echo "状态：$nginx_state_zh"
+    echo "版本：$(nginx -v 2>&1 | sed 's#nginx version: ##')"
     if nginx_config_test_quiet; then
       echo "配置：通过"
     else
       echo "配置：失败"
+      issues+=("Nginx 配置检查失败，建议进入 Nginx 管理 -> 检查/重新加载")
       show_nginx_test_error
     fi
-    echo "启用站点："
-    nginx_sites_enabled || true
+
+    enabled_count="$(nginx_sites_enabled 2>/dev/null | wc -l | tr -d ' ')"
+    echo "启用站点：$enabled_count 个"
+    if [ "${enabled_count:-0}" -gt 0 ]; then
+      nginx_sites_enabled | sed 's/^/  - /'
+    fi
   else
-    echo "未安装"
+    echo "状态：未安装"
+    issues+=("Nginx 未安装，反向代理和 HTTPS 自动配置不可用")
   fi
 
   echo
   echo "【HTTPS】"
   if command -v certbot >/dev/null 2>&1; then
-    certbot --version || true
+    echo "Certbot：$(certbot --version 2>/dev/null | sed 's/certbot //')"
+    cert_count="$(certbot certificates 2>/dev/null | grep -c 'Certificate Name:' || true)"
+    echo "证书数量：${cert_count:-0} 个"
   else
-    echo "Certbot 未安装"
+    echo "Certbot：未安装"
+    issues+=("Certbot 未安装，无法一键申请或续期 HTTPS 证书")
   fi
 
   echo
-  echo "默认 Docker 目录：$LAST_BASE"
+  echo "【分析建议】"
+  if [ "${#issues[@]}" -eq 0 ]; then
+    echo "整体看起来正常。"
+  else
+    local item
+    for item in "${issues[@]}"; do
+      echo "- $item"
+    done
+  fi
 }
 
 show_commands(){
-cat <<'EOF'
-Docker:
-  docker ps
-  docker logs -f 容器名
-  docker restart 容器名
-  docker exec -it 容器名 sh
+cat <<EOF
+Docker 常用命令：
+  docker ps                         # 查看运行中容器
+  docker ps -a                      # 查看全部容器
+  docker logs --tail $LOG_TAIL_DEFAULT 容器名       # 只看最近 $LOG_TAIL_DEFAULT 条日志
+  docker logs --tail $LOG_TAIL_DEFAULT -f 容器名    # 实时跟随日志
+  docker restart 容器名             # 重启容器
+  docker exec -it 容器名 sh         # 进入容器
 
-Compose:
+Compose 常用命令：
   cd 项目目录
-  docker compose up -d          # 启动/应用 docker-compose.yml 改动
-  docker compose restart        # 只重启容器，不应用端口/挂载改动
-  docker compose pull           # 拉取新镜像
-  docker compose logs -f        # 查看日志
-  docker compose down           # 停止并删除容器，不删挂载数据
+  docker compose up -d              # 启动/应用 docker-compose.yml 改动
+  docker compose restart            # 只重启容器，不应用端口/挂载改动
+  docker compose pull               # 拉取新镜像
+  docker compose logs --tail $LOG_TAIL_DEFAULT      # 只看最近 $LOG_TAIL_DEFAULT 条项目日志
+  docker compose logs --tail $LOG_TAIL_DEFAULT -f   # 实时跟随项目日志
+  docker compose down               # 停止并删除容器，不删挂载数据
 
-Nginx:
-  nginx -t
-  systemctl reload nginx
-  systemctl status nginx
+Nginx 常用命令：
+  nginx -t                          # 检查配置
+  systemctl reload nginx            # 平滑重载
+  systemctl status nginx            # 查看服务状态
+  tail -n $LOG_TAIL_DEFAULT /var/log/nginx/error.log # 查看最近错误日志
 
-HTTPS:
-  certbot --nginx -d 域名
-  certbot certificates
-  certbot renew --dry-run
+HTTPS 常用命令：
+  certbot --nginx -d 域名           # 申请证书
+  certbot certificates              # 查看证书
+  certbot renew --dry-run           # 测试自动续期
 EOF
 }
 
@@ -2087,39 +2421,40 @@ https_menu(){
 # ============ 系统状态显示 ============
 
 show_system_status(){
-  local docker_status nginx_status disk_usage container_count project_count
-  
-  # Docker 状态
-  if systemctl is-active --quiet docker 2>/dev/null; then
-    docker_status="✓ 运行中"
+  local docker_status nginx_status disk_usage container_count project_count nginx_raw
+
+  if ! command -v docker >/dev/null 2>&1; then
+    docker_status="未安装"
+    container_count="0"
+  elif docker info >/dev/null 2>&1; then
+    docker_status="正常"
+    container_count="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
   else
-    docker_status="✗ 未运行"
+    docker_status="不可用"
+    container_count="0"
   fi
-  
-  # Nginx 状态
-  if systemctl is-active --quiet nginx 2>/dev/null; then
-    nginx_status="✓ 运行中"
-  elif command -v nginx >/dev/null 2>&1; then
-    nginx_status="○ 已安装"
+
+  if ! command -v nginx >/dev/null 2>&1; then
+    nginx_status="未安装"
   else
-    nginx_status="✗ 未安装"
+    nginx_raw="$(systemctl is-active nginx 2>/dev/null || echo unknown)"
+    if [ "$nginx_raw" = "unknown" ]; then
+      nginx_status="已安装"
+    else
+      nginx_status="$(service_state_zh "$nginx_raw")"
+    fi
   fi
-  
-  # 磁盘使用率
+
   disk_usage="$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')"
-  
-  # 运行中容器数量
-  container_count="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
-  
-  # Compose 项目数量
+  disk_usage="${disk_usage:-未知}"
   project_count="$(find_compose_files 2>/dev/null | wc -l | tr -d ' ')"
-  
+
   echo "系统状态："
-  echo "  Docker:  $docker_status"
-  echo "  Nginx:   $nginx_status"
-  echo "  磁盘:    $disk_usage"
-  echo "  容器:    $container_count 个运行中"
-  echo "  项目:    $project_count 个"
+  echo "  Docker：$docker_status"
+  echo "  Nginx： $nginx_status"
+  echo "  磁盘：  $disk_usage"
+  echo "  容器：  $container_count 个运行中"
+  echo "  项目：  $project_count 个 Compose 文件"
   echo
 }
 
@@ -2127,7 +2462,7 @@ main_menu(){
   while true; do
     clear
     echo "========================================"
-    echo "Docker + Nginx 工具箱 $VERSION"
+    echo "Docker + Nginx 工具箱 $TOOL_VERSION"
     echo "默认 Docker 目录：$LAST_BASE"
     echo "========================================"
     show_system_status
@@ -2158,9 +2493,11 @@ main_menu(){
       q|Q)
         echo
         echo "=== Docker 状态 ==="
-        docker ps
-        echo
-        docker stats --no-stream
+        if require_docker_running; then
+          docker_list_containers running
+          echo
+          docker_stats_summary
+        fi
         pause
         ;;
       s|S)
@@ -2171,9 +2508,9 @@ main_menu(){
         ;;
       l|L)
         echo
-        echo "=== 最近容器日志（最后 20 行）==="
+        echo "=== 最近容器日志（最近 ${LOG_TAIL_DEFAULT} 条）==="
         select_container || continue
-        docker logs --tail 20 "$SELECTED_CONTAINER"
+        docker logs --tail "$LOG_TAIL_DEFAULT" "$SELECTED_CONTAINER"
         pause
         ;;
       0) exit 0 ;;
