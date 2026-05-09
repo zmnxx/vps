@@ -692,17 +692,46 @@ create_docker_template(){
       : > "$file"
       ;;
     *)
+      # 询问是否配置日志轮转
+      local log_config=""
+      echo
+      info "日志轮转说明：限制容器日志大小，防止占满磁盘"
+      if ask_yn "是否为此项目配置日志轮转？" "y"; then
+        local max_size max_file
+        echo
+        echo "max-size: 单个日志文件最大大小（如 10m = 10MB）"
+        read -rp "输入 max-size（默认 10m）: " max_size
+        max_size="${max_size:-10m}"
+        
+        echo
+        echo "max-file: 最多保留几个日志文件（如 3 = 最多 3 个文件轮转）"
+        read -rp "输入 max-file（默认 3）: " max_file
+        max_file="${max_file:-3}"
+        
+        log_config="
+    # 日志轮转配置：限制日志大小，防止占满磁盘
+    # max-size: 单个日志文件最大 ${max_size}
+    # max-file: 最多保留 ${max_file} 个日志文件
+    logging:
+      driver: \"json-file\"
+      options:
+        max-size: \"$max_size\"
+        max-file: \"$max_file\""
+      fi
+
 cat > "$file" <<EOF
 services:
   $name:
     image: 请改成你的镜像名:latest
     container_name: $name
-    restart: unless-stopped
+    restart: unless-stopped  # 容器退出时自动重启（除非手动停止）
     ports:
-      # 面板/后台类服务推荐绑定 127.0.0.1，然后用 Nginx 反向代理
+      # 端口映射：127.0.0.1:8080 表示只允许本机访问，然后用 Nginx 反向代理
+      # 如需外网直接访问，改为 "8080:8080"
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./data:/app/data
+      # 数据持久化：./data 映射到容器内 /app/data
+      - ./data:/app/data$log_config
 EOF
       ;;
   esac
@@ -883,29 +912,338 @@ update_all_services(){
   log "全部更新完成"
 }
 
-docker_prune(){
-  warn "清理旧镜像/无用资源可以释放空间，但不会删除正在运行的容器"
-  echo "1) 只清理无用镜像（推荐）"
-  echo "2) 清理无用镜像、停止容器、无用网络、构建缓存"
-  echo "0) 取消"
-  read -rp "请选择（默认 0 取消）: " c
-  c="${c:-0}"
+# ============ Docker 子菜单 ============
 
-  case "$c" in
-    1)
-      docker image prune -f
-      ;;
-    2)
-      ask_yn "确认执行 docker system prune？" "n" || return 0
-      docker system prune
-      ;;
-    *)
-      warn "已取消"
-      return 0
-      ;;
-  esac
+docker_env_menu(){
+  while true; do
+    clear
+    echo "========== Docker 环境 =========="
+    echo "1) 安装/检测 Docker"
+    echo "2) 配置日志轮转（全局）"
+    echo "3) 修改项目目录"
+    echo "4) 卸载 Docker"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
 
-  log "清理完成"
+    case "$c" in
+      1) install_docker; pause ;;
+      2) docker_config_log_rotation; pause ;;
+      3) change_default_base; pause ;;
+      4) docker_uninstall; pause ;;
+      0) return ;;
+      "") continue ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+docker_project_menu(){
+  while true; do
+    clear
+    echo "========== 项目管理 =========="
+    echo "1) 查看所有项目"
+    echo "2) 创建新项目"
+    echo "3) 编辑项目配置"
+    echo "4) 启动/重启项目"
+    echo "5) 停止项目"
+    echo "6) 查看项目日志"
+    echo "7) 更新项目镜像"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
+
+    case "$c" in
+      1) show_compose_projects; pause ;;
+      2) create_docker_template; pause ;;
+      3) compose_edit; pause ;;
+      4) compose_restart; pause ;;
+      5) compose_stop; pause ;;
+      6) compose_logs; pause ;;
+      7) compose_update_menu; pause ;;
+      0) return ;;
+      "") continue ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+docker_container_menu(){
+  while true; do
+    clear
+    echo "========== 容器管理 =========="
+    echo "1) 查看运行中容器"
+    echo "2) 查看所有容器"
+    echo "3) 容器操作（启动/停止/重启）"
+    echo "4) 进入容器终端"
+    echo "5) 查看容器日志"
+    echo "6) 查看容器详情"
+    echo "7) 查看资源占用"
+    echo "8) 删除已停止容器"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
+
+    case "$c" in
+      1) docker ps; pause ;;
+      2) docker ps -a; pause ;;
+      3)
+        echo "1) 启动容器"
+        echo "2) 停止容器"
+        echo "3) 重启容器"
+        read -rp "请选择: " op
+        case "$op" in
+          1) container_action start; pause ;;
+          2) container_action stop; pause ;;
+          3) container_action restart; pause ;;
+        esac
+        ;;
+      4) container_shell; pause ;;
+      5) container_logs; pause ;;
+      6) container_detail; pause ;;
+      7) docker stats --no-stream; pause ;;
+      8) ask_yn "确认删除所有已停止容器？" "n" && docker container prune -f; pause ;;
+      0) return ;;
+      "") continue ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+docker_log_menu(){
+  while true; do
+    clear
+    echo "========== 日志管理 =========="
+    echo "1) 清理单个容器日志"
+    echo "2) 批量清理所有日志"
+    echo "3) 查看日志占用空间"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
+
+    case "$c" in
+      1) container_clean_logs; pause ;;
+      2) docker_clean_all_logs; pause ;;
+      3)
+        echo "容器日志占用："
+        du -sh /var/lib/docker/containers/*/*.log 2>/dev/null | sort -h | tail -20
+        pause
+        ;;
+      0) return ;;
+      "") continue ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+docker_cleanup_menu(){
+  while true; do
+    clear
+    echo "========== 空间清理 =========="
+    echo "1) 查看空间占用统计"
+    echo "2) 清理无用镜像"
+    echo "3) 清理无用卷"
+    echo "4) 清理构建缓存"
+    echo "5) 一键清理全部"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
+
+    case "$c" in
+      1) docker_system_df; pause ;;
+      2)
+        if ask_yn "确认清理无用镜像？" "y"; then
+          docker image prune -a
+        fi
+        pause
+        ;;
+      3) docker_volume_manage ;;
+      4)
+        if ask_yn "确认清理构建缓存？" "y"; then
+          docker builder prune
+        fi
+        pause
+        ;;
+      5)
+        warn "这会清理：无用镜像、停止容器、无用网络、构建缓存、无用卷"
+        if ask_yn "确认一键清理全部？" "n"; then
+          docker system prune -a --volumes
+        fi
+        pause
+        ;;
+      0) return ;;
+      "") continue ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+docker_system_df(){
+  info "Docker 空间占用统计"
+  echo
+  docker system df
+  echo
+  echo "详细信息："
+  docker system df -v | head -50
+}
+
+docker_config_log_rotation(){
+  local daemon_json="/etc/docker/daemon.json"
+  
+  info "配置 Docker 全局日志轮转（限制所有容器日志大小）"
+  echo "说明："
+  echo "  - 只对新创建的容器生效"
+  echo "  - 已有容器需要重建才能应用新配置"
+  echo "  - 防止日志占满磁盘空间"
+  echo
+  
+  echo "max-size: 单个日志文件最大大小（如 10m = 10MB）"
+  read -rp "输入 max-size（默认 10m）: " max_size
+  max_size="${max_size:-10m}"
+  
+  echo
+  echo "max-file: 最多保留几个日志文件（如 3 = 最多 3 个文件轮转）"
+  read -rp "输入 max-file（默认 3）: " max_file
+  max_file="${max_file:-3}"
+  
+  echo
+  echo "将配置："
+  echo "  max-size: $max_size （单个文件最大 $max_size）"
+  echo "  max-file: $max_file （最多保留 $max_file 个文件）"
+  echo "  总日志上限: 约 $(echo "$max_size" | sed 's/m/*'"$max_file"'/') MB/容器"
+  echo
+  
+  if ! ask_yn "确认修改 $daemon_json ？" "y"; then
+    info "已取消"
+    return 0
+  fi
+  
+  # 备份原文件
+  if [ -f "$daemon_json" ]; then
+    cp "$daemon_json" "${daemon_json}.bak.$(date +%Y%m%d_%H%M%S)"
+    info "已备份原配置到 ${daemon_json}.bak.*"
+  fi
+  
+  # 使用 jq 合并配置（如果有 jq）
+  if command -v jq >/dev/null 2>&1 && [ -f "$daemon_json" ]; then
+    jq --arg ms "$max_size" --arg mf "$max_file" \
+      '.["log-driver"] = "json-file" | .["log-opts"] = {"max-size": $ms, "max-file": $mf}' \
+      "$daemon_json" > "${daemon_json}.tmp" && mv "${daemon_json}.tmp" "$daemon_json"
+  else
+    # 没有 jq 或文件不存在，直接写入
+    cat > "$daemon_json" << EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "$max_size",
+    "max-file": "$max_file"
+  }
+}
+EOF
+  fi
+  
+  log "已配置 Docker 全局日志轮转"
+  echo
+  if ask_yn "是否立即重启 Docker 服务？（会短暂中断容器）" "y"; then
+    systemctl restart docker
+    log "Docker 已重启，新配置已生效"
+  else
+    warn "请手动执行：systemctl restart docker"
+  fi
+}
+
+docker_clean_all_logs(){
+  info "批量清理所有容器日志"
+  warn "这会清空所有容器的日志文件"
+  echo
+  
+  if ! ask_yn "确认清空所有容器日志？" "n"; then
+    info "已取消"
+    return 0
+  fi
+  
+  local count=0
+  local failed=0
+  
+  for container in $(docker ps -aq 2>/dev/null); do
+    local name
+    name="$(docker inspect "$container" --format '{{.Name}}' 2>/dev/null | sed 's/^\///')"
+    local log_path
+    log_path="$(docker inspect "$container" --format '{{.LogPath}}' 2>/dev/null)"
+    
+    if [ -n "$log_path" ] && [ -f "$log_path" ]; then
+      local size_before
+      size_before="$(du -h "$log_path" 2>/dev/null | awk '{print $1}')"
+      
+      if truncate -s 0 "$log_path" 2>/dev/null; then
+        echo "✓ $name ($size_before)"
+        count=$((count + 1))
+      else
+        echo "✗ $name (失败)"
+        failed=$((failed + 1))
+      fi
+    fi
+  done
+  
+  echo
+  log "已清理 $count 个容器日志"
+  [ "$failed" -gt 0 ] && warn "失败 $failed 个"
+}
+
+docker_volume_manage(){
+  while true; do
+    clear
+    echo "========== Docker 卷管理 =========="
+    echo "1) 列出所有卷"
+    echo "2) 查看卷详情"
+    echo "3) 删除未使用的卷"
+    echo "4) 删除指定卷"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
+    
+    case "$c" in
+      1)
+        docker volume ls
+        pause
+        ;;
+      2)
+        read -rp "输入卷名: " vol
+        if [ -n "$vol" ]; then
+          docker volume inspect "$vol"
+        fi
+        pause
+        ;;
+      3)
+        warn "这会删除所有未被容器使用的卷"
+        if ask_yn "确认删除未使用的卷？" "n"; then
+          docker volume prune
+        fi
+        pause
+        ;;
+      4)
+        docker volume ls
+        echo
+        read -rp "输入要删除的卷名: " vol
+        if [ -n "$vol" ]; then
+          if ask_yn "确认删除卷 $vol ？" "n"; then
+            docker volume rm "$vol"
+          fi
+        fi
+        pause
+        ;;
+      0)
+        return
+        ;;
+      "")
+        continue
+        ;;
+      *)
+        echo "无效选项"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
 docker_uninstall(){
@@ -1007,42 +1345,49 @@ container_action(){
 
 container_detail(){
   select_container || return 0
-  docker inspect "$SELECTED_CONTAINER" | less -R 2>/dev/null || docker inspect "$SELECTED_CONTAINER"
+  echo "容器详情：$SELECTED_CONTAINER"
+  echo "----------------------------------------"
+  docker inspect "$SELECTED_CONTAINER" --format '
+镜像：{{.Config.Image}}
+状态：{{.State.Status}}
+运行中：{{.State.Running}}
+启动时间：{{.State.StartedAt}}
+重启策略：{{.HostConfig.RestartPolicy.Name}}
+端口映射：{{range $p, $conf := .NetworkSettings.Ports}}{{$p}} -> {{(index $conf 0).HostPort}} {{end}}
+挂载卷：{{range .Mounts}}
+  {{.Source}} -> {{.Destination}}{{end}}
+网络：{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} ({{$conf.IPAddress}}){{end}}
+' 2>/dev/null || echo "无法获取容器详情"
 }
 
-container_manage_menu(){
-  while true; do
-    clear
-    echo "========== 容器细节管理 =========="
-    echo "1) 查看运行中容器"
-    echo "2) 查看所有容器"
-    echo "3) 查看容器日志"
-    echo "4) 重启容器"
-    echo "5) 停止容器"
-    echo "6) 启动容器"
-    echo "7) 进入容器命令行"
-    echo "8) 查看容器详情"
-    echo "9) 查看资源占用"
-    echo "10) 删除已停止容器"
-    echo "0) 返回"
-    echo
-    read -rp "请选择: " c
-    case "$c" in
-      1) docker ps; pause ;;
-      2) docker ps -a; pause ;;
-      3) container_logs; pause ;;
-      4) container_action restart; pause ;;
-      5) container_action stop; pause ;;
-      6) container_action start; pause ;;
-      7) container_shell; pause ;;
-      8) container_detail; pause ;;
-      9) docker stats; pause ;;
-      10) ask_yn "确认删除所有已停止容器？" "n" && docker container prune -f; pause ;;
-      0) return ;;
-      "") continue ;;
-      *) echo "无效选项"; sleep 1 ;;
-    esac
-  done
+container_clean_logs(){
+  select_container || return 0
+  local log_path
+  log_path="$(docker inspect "$SELECTED_CONTAINER" --format '{{.LogPath}}' 2>/dev/null)"
+  
+  if [ -z "$log_path" ] || [ ! -f "$log_path" ]; then
+    warn "未找到容器日志文件"
+    return 0
+  fi
+  
+  local log_size
+  log_size="$(du -h "$log_path" 2>/dev/null | awk '{print $1}')"
+  
+  echo "容器：$SELECTED_CONTAINER"
+  echo "日志文件：$log_path"
+  echo "当前大小：$log_size"
+  echo
+  
+  if ! ask_yn "确认清空该容器的日志？" "n"; then
+    info "已取消"
+    return 0
+  fi
+  
+  if truncate -s 0 "$log_path" 2>/dev/null; then
+    log "已清空容器日志：$SELECTED_CONTAINER"
+  else
+    err "清空日志失败，可能需要 root 权限"
+  fi
 }
 
 # ----------------------------
@@ -1117,21 +1462,30 @@ server {
     listen 80;
     server_name $domain;
 
-    client_max_body_size 100M;
+    # 允许上传最大 10G 文件（适合网盘、文件管理等应用）
+    client_max_body_size 10G;
 
     location / {
+        # 反向代理到本地端口
         proxy_pass http://127.0.0.1:$port;
 
         proxy_http_version 1.1;
 
+        # 传递真实客户端信息
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
 
+        # WebSocket 支持
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
 
+        # 关闭缓冲，支持流式传输（大文件上传下载、视频流）
+        proxy_request_buffering off;
+        proxy_buffering off;
+
+        # 超时时间 3 小时（适合大文件传输）
         send_timeout 10800;
         proxy_read_timeout 10800;
         proxy_send_timeout 10800;
@@ -1642,35 +1996,21 @@ docker_menu(){
   while true; do
     clear
     echo "========== Docker 管理 =========="
-    echo "1) 安装/检测 Docker"
-    echo "2) 查看 Compose 项目"
-    echo "3) 创建 Compose 模板"
-    echo "4) 编辑 Compose 项目"
-    echo "5) 启动/应用/重建项目"
-    echo "6) 停止项目"
-    echo "7) 查看项目日志"
-    echo "8) 更新项目"
-    echo "9) 容器细节管理"
-    echo "10) 清理空间"
-    echo "11) 修改默认项目目录"
-    echo "12) 卸载 Docker"
+    echo "1) Docker 环境"
+    echo "2) 项目管理"
+    echo "3) 容器管理"
+    echo "4) 日志管理"
+    echo "5) 空间清理"
     echo "0) 返回"
     echo
     read -rp "请选择: " c
 
     case "$c" in
-      1) install_docker; pause ;;
-      2) show_compose_projects; pause ;;
-      3) create_docker_template; pause ;;
-      4) compose_edit; pause ;;
-      5) compose_restart; pause ;;
-      6) compose_stop; pause ;;
-      7) compose_logs; pause ;;
-      8) compose_update_menu; pause ;;
-      9) container_manage_menu ;;
-      10) docker_prune; pause ;;
-      11) change_default_base; pause ;;
-      12) docker_uninstall; pause ;;
+      1) docker_env_menu ;;
+      2) docker_project_menu ;;
+      3) docker_container_menu ;;
+      4) docker_log_menu ;;
+      5) docker_cleanup_menu ;;
       0) return ;;
       "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
@@ -1744,6 +2084,45 @@ https_menu(){
   done
 }
 
+# ============ 系统状态显示 ============
+
+show_system_status(){
+  local docker_status nginx_status disk_usage container_count project_count
+  
+  # Docker 状态
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    docker_status="✓ 运行中"
+  else
+    docker_status="✗ 未运行"
+  fi
+  
+  # Nginx 状态
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    nginx_status="✓ 运行中"
+  elif command -v nginx >/dev/null 2>&1; then
+    nginx_status="○ 已安装"
+  else
+    nginx_status="✗ 未安装"
+  fi
+  
+  # 磁盘使用率
+  disk_usage="$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')"
+  
+  # 运行中容器数量
+  container_count="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+  
+  # Compose 项目数量
+  project_count="$(find_compose_files 2>/dev/null | wc -l | tr -d ' ')"
+  
+  echo "系统状态："
+  echo "  Docker:  $docker_status"
+  echo "  Nginx:   $nginx_status"
+  echo "  磁盘:    $disk_usage"
+  echo "  容器:    $container_count 个运行中"
+  echo "  项目:    $project_count 个"
+  echo
+}
+
 main_menu(){
   while true; do
     clear
@@ -1751,12 +2130,20 @@ main_menu(){
     echo "Docker + Nginx 工具箱 $VERSION"
     echo "默认 Docker 目录：$LAST_BASE"
     echo "========================================"
+    show_system_status
+    echo "========================================"
     echo "1) 一键安装/建站向导"
     echo "2) Docker 管理"
     echo "3) Nginx 管理"
     echo "4) HTTPS 证书"
     echo "5) 查看状态"
     echo "6) 常用命令"
+    echo
+    echo "快捷操作："
+    echo "  q) 查看 Docker 状态"
+    echo "  s) 查看空间占用"
+    echo "  l) 查看最近日志"
+    echo
     echo "0) 退出"
     echo
     read -rp "请选择: " c
@@ -1768,6 +2155,27 @@ main_menu(){
       4) https_menu ;;
       5) show_status; pause ;;
       6) show_commands; pause ;;
+      q|Q)
+        echo
+        echo "=== Docker 状态 ==="
+        docker ps
+        echo
+        docker stats --no-stream
+        pause
+        ;;
+      s|S)
+        echo
+        echo "=== 空间占用统计 ==="
+        docker_system_df
+        pause
+        ;;
+      l|L)
+        echo
+        echo "=== 最近容器日志（最后 20 行）==="
+        select_container || continue
+        docker logs --tail 20 "$SELECTED_CONTAINER"
+        pause
+        ;;
       0) exit 0 ;;
       "") continue ;;
       *) echo "无效选项"; sleep 1 ;;
