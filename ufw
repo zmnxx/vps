@@ -8,7 +8,7 @@ LOG_DIR="/var/log/vps-manager"
 
 clear_screen(){ printf '\033[2J\033[H'; }
 line(){ echo -e "${CYAN}────────────────────────────────────────${NC}"; }
-pause(){ [ -t 0 ] && { echo; read -r -n1 -s -p "按任意键继续..."; echo; }; }
+pause(){ [ -t 0 ] && { echo; read -r -p "按回车键继续..." _; }; }
 need_root(){ [ "$EUID" -eq 0 ] || { echo -e "${RED}错误：请使用 root 权限运行：sudo bash $0${NC}"; exit 1; }; }
 cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 
@@ -68,7 +68,11 @@ ask_yes_no(){
 }
 
 # ---------------- UFW ----------------
-ensure_ufw(){ cmd_exists ufw || pkg_install ufw; }
+ensure_ufw(){
+    if cmd_exists ufw; then return 0; fi
+    warn "未检测到 UFW，准备安装。"
+    pkg_install ufw
+}
 
 ufw_set_ipv6(){
     local val="$1"
@@ -79,32 +83,83 @@ ufw_set_ipv6(){
 
 ufw_install_basic(){
     ensure_ufw || return 1
-    echo -e "${CYAN}UFW 基础配置${NC}"
-    local ssh_port ipv6 web_open
-    ssh_port=$(ask_default "请输入 SSH 端口，避免防火墙把自己锁外面" "22")
-    if ask_yes_no "是否启用 IPv6 防火墙规则？输入 y 启用，n 关闭" "y"; then ufw_set_ipv6 yes; else ufw_set_ipv6 no; fi
+    echo -e "${CYAN}UFW 安全配置向导${NC}"
 
-    info "设置默认策略：拒绝所有入站，允许所有出站"
-    ufw --force reset >/dev/null 2>&1
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow "$ssh_port/tcp"
-    ok "已放行 SSH 端口：$ssh_port/tcp"
+    local active="n"
+    ufw status 2>/dev/null | grep -q "Status: active" && active="y"
 
-    if ask_yes_no "是否同时放行网站端口 80 和 443？" "y"; then
-        ufw allow 80/tcp
-        ufw allow 443/tcp
-        ok "已放行 80/tcp 和 443/tcp"
+    local detected_port=""
+    detected_port=$(echo "${SSH_CONNECTION:-}" | awk '{print $4}')
+    if [ -z "$detected_port" ] && cmd_exists ss; then
+        detected_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {split($4,a,":"); print a[length(a)]; exit}')
+    fi
+    detected_port=${detected_port:-22}
+
+    if [ "$active" = "y" ]; then
+        warn "检测到 UFW 已经启用。"
+        echo "为避免 SSH 失联，本功能不会重置防火墙、不会修改默认策略、不会重复安装。"
+        echo "如果只想加端口，请返回菜单选择：3. 批量放行端口。"
+        echo
+        echo "当前检测到的 SSH 端口：$detected_port"
+        if ! ask_yes_no "是否只检查并补充 SSH 端口放行规则？" "y"; then
+            warn "已取消。"
+            return
+        fi
+        local ssh_port
+        ssh_port=$(ask_default "请输入当前 SSH 连接端口，必须正确" "$detected_port")
+        if ! echo "$ssh_port" | grep -Eq '^[0-9]+$'; then err "SSH端口格式错误，已取消。"; return; fi
+        if ufw status numbered 2>/dev/null | grep -qE "^[[] *[0-9]+[]].*${ssh_port}(/tcp)?"; then
+            ok "SSH端口 $ssh_port/tcp 已存在放行规则，未重复添加。"
+        else
+            ufw allow "$ssh_port/tcp" comment "SSH远程连接端口" >/dev/null 2>&1 && ok "已补充放行 SSH 端口：$ssh_port/tcp"
+        fi
+        ufw logging on >/dev/null 2>&1
+        ufw reload >/dev/null 2>&1
+        ok "UFW 已安全重载，原有规则已保留。"
+        return
+    fi
+
+    info "检测到 UFW 未启用，将进行首次安全配置。"
+    warn "首次启用前必须先放行当前 SSH 端口，否则可能失联。"
+    local ssh_port
+    ssh_port=$(ask_default "请输入当前 SSH 连接端口，务必正确" "$detected_port")
+    if ! echo "$ssh_port" | grep -Eq '^[0-9]+$'; then err "SSH端口格式错误，已取消操作。"; return; fi
+
+    if ask_yes_no "是否启用 IPv6 防火墙规则？不了解可选 n" "n"; then ufw_set_ipv6 yes; else ufw_set_ipv6 no; fi
+
+    echo
+    echo "将执行首次配置："
+    echo "1. 默认拒绝入站"
+    echo "2. 默认允许出站"
+    echo "3. 放行 SSH 端口 $ssh_port/tcp"
+    echo "4. 可选放行 80/443"
+    if ! ask_yes_no "确认启用 UFW？" "n"; then warn "已取消。"; return; fi
+
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    ufw allow "$ssh_port/tcp" comment "SSH远程连接端口" >/dev/null 2>&1 && ok "已放行 SSH 端口：$ssh_port/tcp"
+
+    if ask_yes_no "是否放行网站端口 80 和 443？" "y"; then
+        ufw allow 80/tcp comment "用户允许规则" >/dev/null 2>&1
+        ufw allow 443/tcp comment "用户允许规则" >/dev/null 2>&1
+        ok "已确认放行 80/tcp 和 443/tcp。"
     fi
 
     ufw logging on >/dev/null 2>&1
-    ufw --force enable
-    ok "UFW 已启用，并开启日志记录。"
+    ufw --force enable >/dev/null 2>&1
+    ok "UFW 已启用。"
+    warn "安全提醒：请确认云厂商安全组也放行了 SSH 端口 $ssh_port。"
 }
 
 ufw_apply_one(){
     local act="$1" port="$2" proto="$3" scope="$4"
     [ "$proto" = "both" ] && { ufw_apply_one "$act" "$port" tcp "$scope"; ufw_apply_one "$act" "$port" udp "$scope"; return; }
+
+    # 简单去重：已有相同端口和协议时，allow 不再重复添加
+    if [ "$act" = "allow" ] && ufw status numbered 2>/dev/null | grep -qE "^[[] *[0-9]+[]].*${port}(/${proto})?([[:space:]]|$)"; then
+        return 0
+    fi
+
     case "$scope" in
         4) ufw "$act" proto "$proto" from 0.0.0.0/0 to any port "$port" ;;
         6) ufw "$act" proto "$proto" from ::/0 to any port "$port" ;;
@@ -155,11 +210,21 @@ ufw_ip_rule(){
 
 ufw_show_rules(){
     ensure_ufw || return
-    echo -e "${CYAN}UFW 当前状态与规则${NC}"
-    ufw status verbose
+    echo -e "${CYAN}UFW 当前状态：${NC}"
+    local st log def
+    st=$(ufw status 2>/dev/null | head -1 | sed 's/Status: //')
+    log=$(ufw status verbose 2>/dev/null | awk -F': ' '/Logging:/ {print $2; exit}')
+    def=$(ufw status verbose 2>/dev/null | awk -F': ' '/Default:/ {print $2; exit}')
+    echo "状态：${st:-未知}"
+    echo "日志：${log:-未知}"
+    echo "默认策略：${def:-未知}"
     echo
-    echo -e "${CYAN}带编号规则，删除规则时使用编号：${NC}"
-    ufw status numbered
+    echo -e "${CYAN}规则列表（删除规则时使用编号）：${NC}"
+    ufw status numbered | awk '
+        /^\[/ {print; next}
+        /^[[:space:]]*#/ {next}
+        NF==0 {next}
+    '
 }
 
 ufw_delete_rules(){
@@ -180,7 +245,7 @@ ufw_menu(){
     while true; do
         header; status_bar; line
         echo -e "${BOLD}UFW 防火墙${NC}"
-        echo "1. 安装/基础配置"
+        echo "1. 安装/安全检查"
         echo "2. 查看状态/规则"
         echo "3. 批量放行端口"
         echo "4. 批量拒绝端口"
@@ -370,7 +435,7 @@ f2b_menu(){
     while true; do
         header; status_bar; line
         echo -e "${BOLD}Fail2Ban 防护${NC}"
-        echo "1. 安装/基础配置"
+        echo "1. 安装/安全检查"
         echo "2. 查看防护状态"
         echo "3. 修改基础配置"
         echo "4. 解封IP"
@@ -396,11 +461,10 @@ f2b_menu(){
 one_key_install(){
     header; status_bar; line
     echo -e "${BOLD}一键安装 UFW + Fail2Ban${NC}"
-    echo "此功能会："
-    echo "1. 安装并启用 UFW 防火墙"
-    echo "2. 交互设置 SSH 端口、网站端口、IPv6"
-    echo "3. 安装并配置 Fail2Ban"
-    echo "4. 启用 SSH爆破防护、UFW端口扫描防护、重复封禁"
+    echo "安全说明："
+    echo "1. 如果 UFW 已启用：不会重置规则、不会改默认策略，只检查SSH端口。"
+    echo "2. 如果 UFW 未启用：会先放行SSH端口，再启用防火墙。"
+    echo "3. Fail2Ban 会重新生成基础防护配置。"
     line
     read -r -p "是否继续？输入 yes 继续: " okv
     [ "$okv" = "yes" ] || { warn "已取消"; pause; return; }
