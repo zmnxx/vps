@@ -21,7 +21,7 @@ CYAN='\033[1;36m'
 NC='\033[0m'
 
 # ---------- 版本 ----------
-VERSION="v14"
+VERSION="v15"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -94,11 +94,11 @@ valid_domain(){ echo "$1" | grep -Eq '^([a-zA-Z][a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$';
 
 # ---------- 状态函数 ----------
 get_docker_status(){
-  systemctl is-active --quiet docker 2>/dev/null && echo "running" || echo "stopped"
+  systemctl is-active --quiet docker 2>/dev/null && echo "运行中" || echo "未运行"
 }
 
 get_nginx_status(){
-  systemctl is-active --quiet nginx 2>/dev/null && echo "running" || echo "stopped"
+  systemctl is-active --quiet nginx 2>/dev/null && echo "运行中" || echo "未运行"
 }
 
 get_disk_info(){
@@ -1039,52 +1039,66 @@ nginx_menu(){
         ;;
       3)
         echo
-        echo "可用站点："
-        ls /etc/nginx/sites-available/ 2>/dev/null | grep -v "^total\|^d" | while read f; do
-          [ ! -L "/etc/nginx/sites-enabled/$f" ] && echo "  $f"
+        echo "+----------------------------------------+"
+        echo "| 选择要启用的站点                        |"
+        echo "+----------------------------------------+"
+        local sites=($(ls /etc/nginx/sites-available/ 2>/dev/null))
+        [ ${#sites[@]} -eq 0 ] && { warn "没有可用站点"; continue; }
+        for i in "${!sites[@]}"; do
+          [ -L "/etc/nginx/sites-enabled/${sites[$i]}" ] && echo "  [$((i+1))] ${sites[$i]} (已启用)" || echo "  [$((i+1))] ${sites[$i]}"
         done
+        echo "  [0] 取消"
         echo
-        read -rp "输入要启用的站点名: " name
-        [ -z "$name" ] && continue
-        if [ -f "/etc/nginx/sites-available/$name" ]; then
-          ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
-          if nginx_config_test; then
-            systemctl reload nginx
-            ok "站点已启用: $name"
-          else
-            rm -f "/etc/nginx/sites-enabled/$name"
-            err "Nginx 配置检查失败"
-          fi
+        read -rp "选择 [0-${#sites[@]}]: " n
+        [ "$n" = "0" ] || [ -z "$n" ] && continue
+        local idx=$((n-1))
+        [ "$idx" -lt 0 ] || [ "$idx" -ge ${#sites[@]} ] && { err "选择无效"; continue; }
+        local name="${sites[$idx]}"
+        ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
+        if nginx_config_test; then
+          systemctl reload nginx
+          ok "站点已启用: $name"
         else
-          err "站点不存在"
+          rm -f "/etc/nginx/sites-enabled/$name"
+          err "Nginx 配置检查失败"
         fi
         ;;
       4)
         echo
-        echo "已启用站点："
-        ls /etc/nginx/sites-enabled/ 2>/dev/null | while read f; do
-          [ "$f" != "default" ] && echo "  $f"
-        done
+        echo "+----------------------------------------+"
+        echo "| 选择要禁用的站点                        |"
+        echo "+----------------------------------------+"
+        local enabled=($(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "^default$"))
+        [ ${#enabled[@]} -eq 0 ] && { warn "没有已启用站点"; continue; }
+        for i in "${!enabled[@]}"; do echo "  [$((i+1))] ${enabled[$i]}"; done
+        echo "  [0] 取消"
         echo
-        read -rp "输入要禁用的站点名: " name
-        [ -z "$name" ] && continue
-        if [ -L "/etc/nginx/sites-enabled/$name" ]; then
-          rm -f "/etc/nginx/sites-enabled/$name"
-          systemctl reload nginx
-          ok "站点已禁用: $name"
-        else
-          err "站点未启用"
-        fi
+        read -rp "选择 [0-${#enabled[@]}]: " n
+        [ "$n" = "0" ] || [ -z "$n" ] && continue
+        local idx=$((n-1))
+        [ "$idx" -lt 0 ] || [ "$idx" -ge ${#enabled[@]} ] && { err "选择无效"; continue; }
+        local name="${enabled[$idx]}"
+        rm -f "/etc/nginx/sites-enabled/$name"
+        systemctl reload nginx
+        ok "站点已禁用: $name"
         ;;
       5)
         echo
-        echo "已启用站点："
-        ls /etc/nginx/sites-enabled/ 2>/dev/null | while read f; do
-          [ "$f" != "default" ] && echo "  $f"
+        echo "+----------------------------------------+"
+        echo "| 选择要删除的站点                        |"
+        echo "+----------------------------------------+"
+        local all=($(ls /etc/nginx/sites-available/ 2>/dev/null))
+        [ ${#all[@]} -eq 0 ] && { warn "没有站点配置"; continue; }
+        for i in "${!all[@]}"; do
+          [ -L "/etc/nginx/sites-enabled/${all[$i]}" ] && echo "  [$((i+1))] ${all[$i]} (已启用)" || echo "  [$((i+1))] ${all[$i]}"
         done
+        echo "  [0] 取消"
         echo
-        read -rp "输入要删除的站点名: " name
-        [ -z "$name" ] && continue
+        read -rp "选择 [0-${#all[@]}]: " n
+        [ "$n" = "0" ] || [ -z "$n" ] && continue
+        local idx=$((n-1))
+        [ "$idx" -lt 0 ] || [ "$idx" -ge ${#all[@]} ] && { err "选择无效"; continue; }
+        local name="${all[$idx]}"
         ask_yn "确认删除 $name？" || continue
         rm -f "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
         systemctl reload nginx
@@ -1092,23 +1106,25 @@ nginx_menu(){
         ;;
       6)
         echo
-        echo "已启用站点："
-        ls /etc/nginx/sites-enabled/ 2>/dev/null | while read f; do
-          [ "$f" != "default" ] && echo "  $f"
-        done
+        echo "+----------------------------------------+"
+        echo "| 选择要编辑的站点                        |"
+        echo "+----------------------------------------+"
+        local sites=($(ls /etc/nginx/sites-available/ 2>/dev/null))
+        [ ${#sites[@]} -eq 0 ] && { warn "没有站点配置"; continue; }
+        for i in "${!sites[@]}"; do echo "  [$((i+1))] ${sites[$i]}"; done
+        echo "  [0] 取消"
         echo
-        read -rp "输入要编辑的站点名: " name
-        [ -z "$name" ] && continue
-        if [ -f "/etc/nginx/sites-available/$name" ]; then
-          nano "/etc/nginx/sites-available/$name"
-          if nginx_config_test; then
-            systemctl reload nginx
-            ok "配置已重载"
-          else
-            err "Nginx 配置检查失败"
-          fi
+        read -rp "选择 [0-${#sites[@]}]: " n
+        [ "$n" = "0" ] || [ -z "$n" ] && continue
+        local idx=$((n-1))
+        [ "$idx" -lt 0 ] || [ "$idx" -ge ${#sites[@]} ] && { err "选择无效"; continue; }
+        local name="${sites[$idx]}"
+        nano "/etc/nginx/sites-available/$name"
+        if nginx_config_test; then
+          systemctl reload nginx
+          ok "配置已重载"
         else
-          err "站点不存在"
+          err "Nginx 配置检查失败"
         fi
         ;;
       7)
@@ -1355,11 +1371,14 @@ main_menu(){
     clear
     echo
     echo "+========================================+"
-    echo "|       Docker + Nginx 工具箱  $VERSION   |"
+    echo "|    [🚀] Docker + Nginx 工具箱 $VERSION |"
     echo "+========================================+"
-    echo "| [1] 一键安装    [2] Docker 管理         |"
-    echo "| [3] Nginx 管理  [4] HTTPS 证书         |"
-    echo "| [5] 系统状态    [6] 健康检查           |"
+    echo "| [1] [一] 一键安装                     |"
+    echo "| [2] [D] Docker 管理                  |"
+    echo "| [3] [N] Nginx 管理                   |"
+    echo "| [4] [S] HTTPS 证书                  |"
+    echo "| [5] [L] 系统状态                     |"
+    echo "| [6] [H] 健康检查                     |"
     echo "+========================================+"
     echo
     
