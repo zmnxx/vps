@@ -275,10 +275,25 @@ ufw_menu(){
 # ---------------- Fail2Ban ----------------
 ensure_fail2ban(){ cmd_exists fail2ban-client || pkg_install fail2ban; }
 
+f2b_install_only(){
+    echo -e "${CYAN}安装 Fail2Ban${NC}"
+    if cmd_exists fail2ban-client; then
+        ok "检测到 Fail2Ban 已安装，跳过安装。"
+    else
+        info "正在安装 Fail2Ban，请稍等..."
+        pkg_install fail2ban || { err "Fail2Ban 安装失败。"; return; }
+        ok "Fail2Ban 安装完成。"
+    fi
+    svc_enable fail2ban
+    svc start fail2ban >/tmp/fail2ban-start.log 2>&1 || true
+    warn "当前仅完成安装。请在 Fail2Ban 菜单中选择具体防护项目进行配置。"
+}
+
 f2b_log_path(){
     if [ -f /var/log/ufw.log ]; then echo "/var/log/ufw.log"; return; fi
     if [ -f /var/log/kern.log ]; then echo "/var/log/kern.log"; return; fi
     if [ -f /var/log/syslog ]; then echo "/var/log/syslog"; return; fi
+    touch /var/log/ufw.log 2>/dev/null
     echo "/var/log/ufw.log"
 }
 
@@ -289,127 +304,149 @@ f2b_auth_log_path(){
     echo "/var/log/auth.log"
 }
 
-f2b_write_portscan_filter(){
-    mkdir -p /etc/fail2ban/filter.d
+f2b_prepare_dirs(){ mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d /var/log; }
+
+f2b_apply_restart(){
+    ensure_fail2ban || return 1
+    svc_enable fail2ban
+    if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
+        if svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 || svc start fail2ban >/tmp/fail2ban-start.log 2>&1; then
+            sleep 1
+            if fail2ban-client ping >/dev/null 2>&1; then ok "Fail2Ban 配置已应用并运行。"; else warn "配置已写入，但服务暂未响应。"; sed -n '1,8p' /tmp/fail2ban-start.log; fi
+        else
+            err "Fail2Ban 启动失败。常见原因：日志路径不存在、filter名称错误、系统日志服务未启用。"
+            sed -n '1,12p' /tmp/fail2ban-start.log 2>/dev/null
+        fi
+    else
+        err "Fail2Ban 配置检测失败："
+        sed -n '1,15p' /tmp/fail2ban-check.log 2>/dev/null
+    fi
+}
+
+f2b_config_ssh(){
+    ensure_fail2ban || return
+    f2b_prepare_dirs
+    echo -e "${CYAN}配置 SSH 爆破防护${NC}"
+    echo "说明：短时间内 SSH 登录失败太多，会自动封禁来源IP。"
+    local port retry findtime bantime auth_log
+    port=$(ask_default "SSH端口，默认 ssh，也可填 22/2222" "ssh")
+    retry=$(ask_default "允许失败次数，超过就封禁" "3")
+    findtime=$(ask_default "检测时间窗口，单位秒，600表示10分钟" "600")
+    bantime=$(ask_default "封禁时间，单位秒，86400表示1天" "86400")
+    auth_log=$(f2b_auth_log_path)
+    cat > /etc/fail2ban/jail.d/vps-ssh.local <<EOF
+[sshd]
+enabled = true
+port = ${port}
+filter = sshd
+logpath = ${auth_log}
+maxretry = ${retry}
+findtime = ${findtime}
+bantime = ${bantime}
+EOF
+    ok "SSH 防护配置已写入。"
+    f2b_apply_restart
+}
+
+f2b_config_portscan(){
+    ensure_fail2ban || return
+    f2b_prepare_dirs
+    echo -e "${CYAN}配置 UFW 端口扫描防护${NC}"
+    echo "说明：某个IP短时间内多次被UFW拦截，视为扫描端口并封禁。"
+    echo "前提：UFW需要启用，并开启日志 logging on。"
+    local retry findtime bantime logpath
+    retry=$(ask_default "触发次数，例如10表示达到10次就封禁" "10")
+    findtime=$(ask_default "检测窗口，单位秒，300表示5分钟" "300")
+    bantime=$(ask_default "封禁时间，单位秒，86400表示1天" "86400")
+    logpath=$(f2b_log_path)
     cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
 [Definition]
 failregex = ^.*\[UFW (?:BLOCK|DENY)\].*SRC=<HOST>.*$
 ignoreregex =
 EOF
-}
-
-f2b_write_config(){
-    local ssh_port="$1" ssh_retry="$2" ssh_ban="$3" findtime="$4" scan_retry="$5" scan_ban="$6" enable_web="$7"
-    local ufw_log auth_log; ufw_log=$(f2b_log_path); auth_log=$(f2b_auth_log_path)
-    mkdir -p /etc/fail2ban /var/log
-    touch "$ufw_log" /var/log/fail2ban.log 2>/dev/null
-    f2b_write_portscan_filter
-    cat > /etc/fail2ban/jail.local <<EOF
-[DEFAULT]
-ignoreip = 127.0.0.1/8 ::1
-findtime = ${findtime}
-bantime = ${ssh_ban}
-maxretry = ${ssh_retry}
-banaction = iptables-multiport
-
-[sshd]
-enabled = true
-port = ${ssh_port}
-filter = sshd
-logpath = ${auth_log}
-maxretry = ${ssh_retry}
-findtime = ${findtime}
-bantime = ${ssh_ban}
-
+    cat > /etc/fail2ban/jail.d/vps-ufw-port-scan.local <<EOF
 [ufw-port-scan]
 enabled = true
 filter = ufw-port-scan
-logpath = ${ufw_log}
-maxretry = ${scan_retry}
-findtime = 300
-bantime = ${scan_ban}
+logpath = ${logpath}
+maxretry = ${retry}
+findtime = ${findtime}
+bantime = ${bantime}
 action = iptables-allports[name=ufw-port-scan]
+EOF
+    ufw logging on >/dev/null 2>&1 || true
+    ok "端口扫描防护配置已写入。日志路径：${logpath}"
+    f2b_apply_restart
+}
 
+f2b_config_recidive(){
+    ensure_fail2ban || return
+    f2b_prepare_dirs
+    echo -e "${CYAN}配置重复封禁防护${NC}"
+    echo "说明：同一IP多次被Fail2Ban封禁，会被封禁更久。"
+    local retry findtime bantime
+    retry=$(ask_default "重复次数，默认5次" "5")
+    findtime=$(ask_default "统计窗口，单位秒，86400表示1天" "86400")
+    bantime=$(ask_default "长期封禁时间，单位秒，604800表示7天" "604800")
+    touch /var/log/fail2ban.log 2>/dev/null
+    cat > /etc/fail2ban/jail.d/vps-recidive.local <<EOF
 [recidive]
 enabled = true
 logpath = /var/log/fail2ban.log
-bantime = 604800
-findtime = 86400
-maxretry = 5
+maxretry = ${retry}
+findtime = ${findtime}
+bantime = ${bantime}
 EOF
-    if [ "$enable_web" = "y" ]; then
-        mkdir -p /var/log/nginx /var/log/apache2
-        touch /var/log/nginx/error.log /var/log/apache2/error.log 2>/dev/null
-        cat >> /etc/fail2ban/jail.local <<'EOF'
+    ok "重复封禁防护配置已写入。"
+    f2b_apply_restart
+}
 
+f2b_config_web(){
+    ensure_fail2ban || return
+    f2b_prepare_dirs
+    echo -e "${CYAN}配置 Web 基础认证防护${NC}"
+    echo "说明：防护 nginx/apache 的 HTTP Basic Auth 登录失败。"
+    local web retry bantime
+    retry=$(ask_default "允许失败次数" "5")
+    bantime=$(ask_default "封禁时间，单位秒" "3600")
+    echo "选择Web服务：1.nginx  2.apache  3.两个都配置"
+    web=$(ask_default "请选择" "1")
+    mkdir -p /var/log/nginx /var/log/apache2
+    touch /var/log/nginx/error.log /var/log/apache2/error.log 2>/dev/null
+    : > /etc/fail2ban/jail.d/vps-web-auth.local
+    if [ "$web" = "1" ] || [ "$web" = "3" ]; then
+        cat >> /etc/fail2ban/jail.d/vps-web-auth.local <<EOF
 [nginx-http-auth]
 enabled = true
 port = http,https
 filter = nginx-http-auth
 logpath = /var/log/nginx/error.log
-maxretry = 5
-bantime = 3600
+maxretry = ${retry}
+bantime = ${bantime}
 
+EOF
+    fi
+    if [ "$web" = "2" ] || [ "$web" = "3" ]; then
+        cat >> /etc/fail2ban/jail.d/vps-web-auth.local <<EOF
 [apache-auth]
 enabled = true
 port = http,https
 filter = apache-auth
 logpath = /var/log/apache2/error.log
-maxretry = 5
-bantime = 3600
+maxretry = ${retry}
+bantime = ${bantime}
 EOF
     fi
-}
-
-f2b_install_basic(){
-    ensure_fail2ban || return
-    echo -e "${CYAN}Fail2Ban 基础防护配置${NC}"
-    echo "说明："
-    echo "SSH防护：防止SSH密码爆破。"
-    echo "端口扫描防护：配合UFW日志，检测频繁被防火墙拦截的IP。"
-    echo "重复封禁：多次触发封禁的IP会被封禁更久。"
-    echo
-    local ssh_port ssh_retry findtime ssh_ban scan_retry scan_ban enable_web
-    ssh_port=$(ask_default "SSH端口，默认 ssh 表示读取系统SSH服务名，也可填 22/2222" "ssh")
-    ssh_retry=$(ask_default "SSH允许失败次数，超过就封禁" "3")
-    findtime=$(ask_default "检测时间窗口，单位秒，例如600表示10分钟内" "600")
-    ssh_ban=$(ask_default "SSH封禁时间，单位秒，86400表示1天" "86400")
-    scan_retry=$(ask_default "端口扫描触发次数，300秒内被UFW拦截多少次就封禁" "10")
-    scan_ban=$(ask_default "端口扫描封禁时间，单位秒" "86400")
-    if ask_yes_no "是否启用 Web 基础认证防护？适合 nginx/apache 服务器" "n"; then enable_web="y"; else enable_web="n"; fi
-
-    f2b_write_config "$ssh_port" "$ssh_retry" "$ssh_ban" "$findtime" "$scan_retry" "$scan_ban" "$enable_web"
-    svc_enable fail2ban
-
-    if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
-        if svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 || svc start fail2ban >/tmp/fail2ban-start.log 2>&1; then
-            sleep 1
-            if fail2ban-client ping >/dev/null 2>&1; then
-                ok "Fail2Ban 已配置并运行。"
-            else
-                warn "配置已写入，但服务未正常响应。请查看：/tmp/fail2ban-start.log"
-                sed -n '1,8p' /tmp/fail2ban-start.log 2>/dev/null
-            fi
-        else
-            err "Fail2Ban 启动失败，下面是中文提示："
-            echo "可能原因：日志文件路径不存在、系统日志服务未写入auth.log、或Fail2Ban动作不兼容。"
-            sed -n '1,12p' /tmp/fail2ban-start.log 2>/dev/null
-        fi
-    else
-        err "Fail2Ban 配置检测失败，已显示前几行错误："
-        sed -n '1,15p' /tmp/fail2ban-check.log 2>/dev/null
-    fi
-    warn "端口扫描防护依赖 UFW 日志，请确保 UFW 已启用且 logging on。"
+    ok "Web认证防护配置已写入。"
+    f2b_apply_restart
 }
 
 f2b_status(){
     ensure_fail2ban || return
     if ! fail2ban-client ping >/dev/null 2>&1; then
         err "Fail2Ban 服务未运行，无法读取状态。"
-        echo "处理建议："
-        echo "1. 先选择 1 或 3 重新生成基础配置。"
-        echo "2. 如果仍失败，查看日志：/var/log/fail2ban.log"
-        echo "3. 也可以执行：fail2ban-client -t 检查配置。"
+        echo "处理建议：先选择 1 安装，再选择具体防护项目配置。"
+        echo "配置检测命令：fail2ban-client -t"
         return
     fi
     echo -e "${CYAN}Fail2Ban 总体状态：${NC}"
@@ -435,21 +472,26 @@ f2b_menu(){
     while true; do
         header; status_bar; line
         echo -e "${BOLD}Fail2Ban 防护${NC}"
-        echo "1. 安装/安全检查"
-        echo "2. 查看防护状态"
-        echo "3. 修改基础配置"
-        echo "4. 解封IP"
-        echo "5. 查看日志"
-        echo "6. 重启服务"
+        echo "1. 安装 Fail2Ban"
+        echo "2. 配置 SSH 爆破防护"
+        echo "3. 配置 UFW 端口扫描防护"
+        echo "4. 配置 重复封禁防护"
+        echo "5. 配置 Web认证防护"
+        echo "6. 查看状态"
+        echo "7. 解封IP"
+        echo "8. 查看日志"
         echo "0. 返回"
         line
         read -r -p "请选择: " c
         case "$c" in
-            1|3) f2b_install_basic ;;
-            2) f2b_status ;;
-            4) f2b_unban ;;
-            5) tail -80 /var/log/fail2ban.log 2>/dev/null || journalctl -u fail2ban -n 80 --no-pager ;;
-            6) svc restart fail2ban && ok "Fail2Ban 已重启" ;;
+            1) f2b_install_only ;;
+            2) f2b_config_ssh ;;
+            3) f2b_config_portscan ;;
+            4) f2b_config_recidive ;;
+            5) f2b_config_web ;;
+            6) f2b_status ;;
+            7) f2b_unban ;;
+            8) tail -80 /var/log/fail2ban.log 2>/dev/null || journalctl -u fail2ban -n 80 --no-pager ;;
             0) break ;;
             *) err "无效选择" ;;
         esac
@@ -462,17 +504,17 @@ one_key_install(){
     header; status_bar; line
     echo -e "${BOLD}一键安装 UFW + Fail2Ban${NC}"
     echo "安全说明："
-    echo "1. 如果 UFW 已启用：不会重置规则、不会改默认策略，只检查SSH端口。"
-    echo "2. 如果 UFW 未启用：会先放行SSH端口，再启用防火墙。"
-    echo "3. Fail2Ban 会重新生成基础防护配置。"
+    echo "1. UFW：只做安全检查。已启用则不重置、不改默认策略。"
+    echo "2. Fail2Ban：只安装软件，不进入防护配置交互。"
+    echo "3. 安装完成后，请到 Fail2Ban 菜单选择具体防护项目配置。"
     line
     read -r -p "是否继续？输入 yes 继续: " okv
     [ "$okv" = "yes" ] || { warn "已取消"; pause; return; }
     ufw_install_basic
     echo
-    f2b_install_basic
+    f2b_install_only
     echo
-    ok "一键安装与基础安全配置完成。"
+    ok "一键安装完成。防护规则请进入 Fail2Ban 菜单单独配置。"
     pause
 }
 
