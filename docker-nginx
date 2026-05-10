@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v21
-# 优化：确认默认值、安装流程去重、简洁UI
+# Docker + Nginx + HTTPS 工具箱 v22
+# 优化：删除项目目录、空输入返回、证书编号删除、全局默认提示
 # ============================================================
 
 set -o pipefail
@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v21"
+VERSION="v22"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -23,6 +23,7 @@ DEFAULT_BASE="/docker"
 LAST_BASE="$DEFAULT_BASE"
 SELECTED_CONTAINER=""
 SELECTED_DIR=""
+SELECTED_CERT=""
 
 # 输出
 ok(){ echo -e "  ${GREEN}[OK]${NC} $1"; }
@@ -223,16 +224,13 @@ create_docker_project(){
   echo
   
   local name
-  read -rp "  项目名称: " name
-  while [ -z "$name" ]; do
-    err "名称不能为空"
-    read -rp "  项目名称: " name
-  done
+  read -rp "  项目名称（留空返回）: " name
+  [ -z "$name" ] && { info "已取消创建项目"; return 0; }
   
   while ! safe_name "$name"; do
     err "只能用字母、数字、横杠、下划线"
-    read -rp "  项目名称: " name
-    [ -z "$name" ] && return 0
+    read -rp "  项目名称（留空返回）: " name
+    [ -z "$name" ] && { info "已取消创建项目"; return 0; }
   done
   
   read -rp "  存放目录 [默认 $LAST_BASE]: " base
@@ -256,7 +254,7 @@ create_docker_project(){
   echo "    [2] 空模板（完全空白）"
   echo
   local t
-  read -rp "  请选择 [1]: " t
+  read -rp "  请选择 [1，回车默认]: " t
   [ -z "$t" ] && t="1"
   
   if [ "$t" = "2" ]; then
@@ -322,7 +320,7 @@ restart_project(){
   echo "    [2] 仅重启容器（不改配置）"
   echo
   local t
-  read -rp "  请选择 [1]: " t
+  read -rp "  请选择 [1，回车默认]: " t
   [ -z "$t" ] && t="1"
   
   if [ "$t" = "1" ]; then
@@ -372,21 +370,16 @@ update_project(){
 
 delete_project_config(){
   select_compose_dir || return 0
-  local file="$SELECTED_DIR/docker-compose.yml"
   echo
-  warn "将删除配置文件: $file"
-  warn "不会默认删除数据目录，避免误删业务数据。"
-  ask_yn "确认删除该项目配置？" "n" || return 0
+  warn "将删除整个项目目录: $SELECTED_DIR"
+  warn "包括 docker-compose.yml 以及该目录下的数据文件。"
+  warn "不会删除 Docker volumes 命名卷；如需清理请到空间清理中操作。"
+  ask_yn "确认删除整个项目目录？" "n" || return 0
   if ask_yn "删除前先停止该项目？" "y"; then
-    (cd "$SELECTED_DIR" && docker compose stop) 2>/dev/null || true
+    (cd "$SELECTED_DIR" && docker compose down) 2>/dev/null || (cd "$SELECTED_DIR" && docker compose stop) 2>/dev/null || true
   fi
-  rm -f "$file"
-  ok "已删除配置文件"
-  if [ -d "$SELECTED_DIR" ] && [ -z "$(find "$SELECTED_DIR" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
-    ask_yn "项目目录为空，是否删除目录？" "y" && rmdir "$SELECTED_DIR" && ok "已删除空目录"
-  else
-    info "项目目录保留: $SELECTED_DIR"
-  fi
+  rm -rf -- "$SELECTED_DIR"
+  ok "已删除项目目录: $SELECTED_DIR"
 }
 
 # =============================================
@@ -696,7 +689,7 @@ create_nginx_proxy(){
   echo "    [2] 空模板（完全空白）"
   echo
   local t
-  read -rp "  请选择 [1]: " t
+  read -rp "  请选择 [1，回车默认]: " t
   [ -z "$t" ] && t="1"
   
   if [ "$t" = "2" ]; then
@@ -871,6 +864,30 @@ nginx_menu(){
 # =============================================
 # HTTPS
 # =============================================
+list_cert_names(){
+  if [ -d /etc/letsencrypt/renewal ]; then
+    find /etc/letsencrypt/renewal -maxdepth 1 -type f -name "*.conf" 2>/dev/null | sed 's#.*/##; s#\.conf$##' | sort -u
+  elif [ -d /etc/letsencrypt/live ]; then
+    find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's#.*/##' | grep -v '^README$' | sort -u
+  fi
+}
+
+select_cert_name(){
+  local certs=($(list_cert_names))
+  [ ${#certs[@]} -eq 0 ] && { warn "没有找到证书"; return 1; }
+  echo
+  echo "  选择证书："
+  for i in "${!certs[@]}"; do echo "    [$((i+1))] ${certs[$i]}"; done
+  echo "    [0] 取消"
+  echo
+  local n
+  read -rp "  请选择 [0-${#certs[@]}]: " n
+  [ "$n" = "0" ] || [ -z "$n" ] && return 1
+  local idx=$((n-1))
+  [ "$idx" -lt 0 ] || [ "$idx" -ge ${#certs[@]} ] && { err "选择无效"; return 1; }
+  SELECTED_CERT="${certs[$idx]}"
+}
+
 certbot_menu(){
   while true; do
     ui_header "HTTPS 证书"
@@ -878,7 +895,7 @@ certbot_menu(){
     echo "  [2] 查看证书列表"
     echo "  [3] 测试续期"
     echo "  [4] 强制续期"
-    echo "  [5] 删除证书"
+    echo "  [5] 删除证书（编号选择）"
     echo "  [0] 返回"
     echo
     read -rp "  请选择 [0-5]: " c
@@ -896,15 +913,13 @@ certbot_menu(){
       2) certbot certificates 2>/dev/null; pause ;;
       3) certbot renew --dry-run && ok "续期测试通过" || err "测试失败"; pause ;;
       4)
-        read -rp "  域名: " domain
-        [ -z "$domain" ] && continue
-        certbot renew --cert-name "$domain" --force-renewal && ok "续期完成" || err "续期失败"
+        select_cert_name || { pause; continue; }
+        certbot renew --cert-name "$SELECTED_CERT" --force-renewal && ok "续期完成: $SELECTED_CERT" || err "续期失败"
         pause
         ;;
       5)
-        read -rp "  证书名: " name
-        [ -z "$name" ] && continue
-        ask_yn "确认删除 $name？" && certbot delete --cert-name "$name" && ok "已删除"
+        select_cert_name || { pause; continue; }
+        ask_yn "确认删除证书 $SELECTED_CERT？" "n" && certbot delete --cert-name "$SELECTED_CERT" && ok "已删除证书: $SELECTED_CERT"
         pause
         ;;
       0) return ;;
