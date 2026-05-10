@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# VPS Manager v3.0 简洁稳定版
-# 功能: UFW / Fail2Ban SSH / BBR / Swap / 系统信息
+# VPS Manager v4.0 中文稳定版
+# UFW / Fail2Ban / BBR / Swap / 系统信息
 
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; CYAN='\033[36m'; BOLD='\033[1m'; NC='\033[0m'
 CONF_DIR="/opt/vps-manager"
 LOG_DIR="/var/log/vps-manager"
 
 clear_screen(){ printf '\033[2J\033[H'; }
-pause(){ [ -t 0 ] && { echo; read -r -n1 -s -p "按任意键继续..."; echo; }; }
 line(){ echo -e "${CYAN}────────────────────────────────────────${NC}"; }
-need_root(){ [ "$EUID" -eq 0 ] || { echo -e "${RED}请使用 root 运行: sudo bash $0${NC}"; exit 1; }; }
+pause(){ [ -t 0 ] && { echo; read -r -n1 -s -p "按任意键继续..."; echo; }; }
+need_root(){ [ "$EUID" -eq 0 ] || { echo -e "${RED}错误：请使用 root 权限运行：sudo bash $0${NC}"; exit 1; }; }
 cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
+
+ok(){ echo -e "${GREEN}✓ $*${NC}"; }
+warn(){ echo -e "${YELLOW}提示：$*${NC}"; }
+err(){ echo -e "${RED}错误：$*${NC}"; }
+info(){ echo -e "${BLUE}信息：$*${NC}"; }
 
 pkg_install(){
     if cmd_exists apt; then apt update && apt install -y "$@"; return; fi
     if cmd_exists dnf; then dnf install -y "$@"; return; fi
     if cmd_exists yum; then yum install -y "$@"; return; fi
     if cmd_exists apk; then apk add "$@"; return; fi
-    echo -e "${RED}未找到包管理器，请手动安装: $*${NC}"; return 1
+    err "未找到包管理器，请手动安装：$*"; return 1
 }
 
 svc(){
@@ -35,222 +40,330 @@ svc_enable(){
 header(){
     clear_screen
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}        ${BOLD}${GREEN}VPS 管理脚本 v3.0${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}        ${BOLD}${GREEN}VPS 管理脚本 v4.0${NC}              ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 }
 
 status_bar(){
     local ufw_s="未安装" f2b_s="未安装" bbr_s="未启用" swap_s="未配置"
-    cmd_exists ufw && { ufw status 2>/dev/null | grep -q "Status: active" && ufw_s="已启用" || ufw_s="未启用"; }
-    cmd_exists fail2ban-client && { fail2ban-client ping >/dev/null 2>&1 && f2b_s="运行中" || f2b_s="未运行"; }
+    if cmd_exists ufw; then ufw status 2>/dev/null | grep -q "Status: active" && ufw_s="已启用" || ufw_s="未启用"; fi
+    if cmd_exists fail2ban-client; then fail2ban-client ping >/dev/null 2>&1 && f2b_s="运行中" || f2b_s="未运行"; fi
     sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && bbr_s="已启用"
     local sw; sw=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
     [ -n "$sw" ] && [ "$sw" != "0" ] && [ "$sw" != "0B" ] && swap_s="$sw"
     echo -e "UFW:${GREEN}$ufw_s${NC}  Fail2Ban:${GREEN}$f2b_s${NC}  BBR:${GREEN}$bbr_s${NC}  Swap:${GREEN}$swap_s${NC}"
 }
 
-# ---------------- UFW ----------------
-ufw_install(){
-    cmd_exists ufw || pkg_install ufw || return
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw --force enable
-    echo -e "${GREEN}UFW 已安装并启用。默认: 拒绝入站 / 允许出站${NC}"
+ask_default(){
+    local prompt="$1" def="$2" v
+    read -r -p "$prompt [$def]: " v
+    echo "${v:-$def}"
 }
 
-ufw_rule_cmd(){
-    local act="$1" port="$2" proto="$3" ipver="$4"
-    local p
-    [ "$proto" = "both" ] && { ufw_rule_cmd "$act" "$port" tcp "$ipver"; ufw_rule_cmd "$act" "$port" udp "$ipver"; return; }
+ask_yes_no(){
+    local prompt="$1" def="$2" v
+    read -r -p "$prompt [$def]: " v
+    v=${v:-$def}
+    [ "$v" = "y" ] || [ "$v" = "yes" ] || [ "$v" = "Y" ] || [ "$v" = "是" ]
+}
 
-    case "$ipver" in
-        4) ufw "$act" proto "$proto" from 0.0.0.0/0 to 0.0.0.0/0 port "$port" ;;
-        6) ufw "$act" proto "$proto" from ::/0 to ::/0 port "$port" ;;
+# ---------------- UFW ----------------
+ensure_ufw(){ cmd_exists ufw || pkg_install ufw; }
+
+ufw_set_ipv6(){
+    local val="$1"
+    if [ -f /etc/default/ufw ]; then
+        sed -i "s/^IPV6=.*/IPV6=$val/" /etc/default/ufw
+    fi
+}
+
+ufw_install_basic(){
+    ensure_ufw || return 1
+    echo -e "${CYAN}UFW 基础配置${NC}"
+    local ssh_port ipv6 web_open
+    ssh_port=$(ask_default "请输入 SSH 端口，避免防火墙把自己锁外面" "22")
+    if ask_yes_no "是否启用 IPv6 防火墙规则？输入 y 启用，n 关闭" "y"; then ufw_set_ipv6 yes; else ufw_set_ipv6 no; fi
+
+    info "设置默认策略：拒绝所有入站，允许所有出站"
+    ufw --force reset >/dev/null 2>&1
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow "$ssh_port/tcp"
+    ok "已放行 SSH 端口：$ssh_port/tcp"
+
+    if ask_yes_no "是否同时放行网站端口 80 和 443？" "y"; then
+        ufw allow 80/tcp
+        ufw allow 443/tcp
+        ok "已放行 80/tcp 和 443/tcp"
+    fi
+
+    ufw logging on >/dev/null 2>&1
+    ufw --force enable
+    ok "UFW 已启用，并开启日志记录。"
+}
+
+ufw_apply_one(){
+    local act="$1" port="$2" proto="$3" scope="$4"
+    [ "$proto" = "both" ] && { ufw_apply_one "$act" "$port" tcp "$scope"; ufw_apply_one "$act" "$port" udp "$scope"; return; }
+    case "$scope" in
+        4) ufw "$act" proto "$proto" from 0.0.0.0/0 to any port "$port" ;;
+        6) ufw "$act" proto "$proto" from ::/0 to any port "$port" ;;
         *) ufw "$act" "$port/$proto" ;;
     esac
 }
 
-ufw_batch_ports(){
-    cmd_exists ufw || { echo -e "${RED}UFW 未安装${NC}"; return; }
-    echo -e "${CYAN}批量放行端口${NC}"
-    echo "示例: 22,80,443,10000:10100"
-    read -r -p "端口列表: " ports
-    [ -z "$ports" ] && { echo -e "${RED}端口不能为空${NC}"; return; }
-    read -r -p "协议 tcp/udp/both [tcp]: " proto; proto=${proto:-tcp}
-    read -r -p "IP版本 all/4/6 [all]: " ipver; ipver=${ipver:-all}
+ufw_batch_rule(){
+    local act="$1" title="$2"
+    ensure_ufw || return
+    echo -e "${CYAN}$title${NC}"
+    echo "端口格式：22,80,443,10000:10100"
+    echo "协议说明：tcp=常用，udp=UDP服务，both=TCP和UDP都处理"
+    echo "IP版本：all=IPv4和IPv6，4=只IPv4，6=只IPv6"
+    local ports proto scope
+    read -r -p "请输入端口列表: " ports
+    [ -z "$ports" ] && { err "端口列表不能为空"; return; }
+    proto=$(ask_default "请选择协议 tcp/udp/both" "tcp")
+    scope=$(ask_default "请选择IP版本 all/4/6" "all")
 
     echo "$ports" | tr ',' '\n' | while read -r p; do
         p=$(echo "$p" | xargs)
         [ -z "$p" ] && continue
-        if ufw_rule_cmd allow "$p" "$proto" "$ipver" >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ 已放行 $p/$proto ($ipver)${NC}"
+        if ufw_apply_one "$act" "$p" "$proto" "$scope" >/dev/null 2>&1; then
+            ok "已处理：$p/$proto，IP版本：$scope"
         else
-            echo -e "${RED}✗ 失败 $p/$proto${NC}"
+            err "处理失败：$p/$proto，请检查端口格式"
         fi
     done
     ufw reload >/dev/null 2>&1
-}
-
-ufw_batch_deny(){
-    cmd_exists ufw || { echo -e "${RED}UFW 未安装${NC}"; return; }
-    read -r -p "要拒绝的端口列表: " ports
-    [ -z "$ports" ] && return
-    read -r -p "协议 tcp/udp/both [tcp]: " proto; proto=${proto:-tcp}
-    read -r -p "IP版本 all/4/6 [all]: " ipver; ipver=${ipver:-all}
-    echo "$ports" | tr ',' '\n' | while read -r p; do
-        p=$(echo "$p" | xargs); [ -z "$p" ] && continue
-        ufw_rule_cmd deny "$p" "$proto" "$ipver" >/dev/null 2>&1 && echo -e "${GREEN}✓ 已拒绝 $p/$proto${NC}" || echo -e "${RED}✗ 失败 $p${NC}"
-    done
-    ufw reload >/dev/null 2>&1
+    ok "规则已重载。"
 }
 
 ufw_ip_rule(){
-    cmd_exists ufw || { echo -e "${RED}UFW 未安装${NC}"; return; }
     local act="$1"
-    read -r -p "IP/CIDR: " ip
-    [ -z "$ip" ] && return
-    ufw "$act" from "$ip" && echo -e "${GREEN}完成: $act $ip${NC}"
+    ensure_ufw || return
+    echo "示例：1.2.3.4 或 1.2.3.0/24"
+    local ip
+    read -r -p "请输入 IP 或 CIDR: " ip
+    [ -z "$ip" ] && { err "IP不能为空"; return; }
+    if ufw "$act" from "$ip"; then ok "已完成：$act $ip"; else err "操作失败，请检查IP格式"; fi
 }
 
 ufw_show_rules(){
-    cmd_exists ufw || { echo -e "${RED}UFW 未安装${NC}"; return; }
-    echo -e "${CYAN}IPv4 / IPv6 规则列表:${NC}"
+    ensure_ufw || return
+    echo -e "${CYAN}UFW 当前状态与规则${NC}"
+    ufw status verbose
+    echo
+    echo -e "${CYAN}带编号规则，删除规则时使用编号：${NC}"
     ufw status numbered
 }
 
 ufw_delete_rules(){
-    cmd_exists ufw || { echo -e "${RED}UFW 未安装${NC}"; return; }
+    ensure_ufw || return
     ufw_show_rules
     echo
-    echo "可输入单个或多个编号，多个用逗号分隔，例如: 3,5,8"
-    echo "注意: 会按编号从大到小删除，避免编号变化导致误删。"
-    read -r -p "删除编号: " nums
+    echo "可输入多个编号，例如：3,5,8"
+    echo "脚本会从大到小删除，避免编号变化导致误删。"
+    local nums
+    read -r -p "请输入要删除的规则编号: " nums
     [ -z "$nums" ] && return
     echo "$nums" | tr ',' '\n' | sed 's/[^0-9]//g' | grep -E '^[0-9]+$' | sort -rn | while read -r n; do
-        yes | ufw delete "$n" >/dev/null 2>&1 && echo -e "${GREEN}✓ 已删除规则 [$n]${NC}" || echo -e "${RED}✗ 删除失败 [$n]${NC}"
+        if yes | ufw delete "$n" >/dev/null 2>&1; then ok "已删除规则编号：$n"; else err "删除失败：$n"; fi
     done
-}
-
-ufw_toggle_ipv6(){
-    [ -f /etc/default/ufw ] || { echo -e "${YELLOW}/etc/default/ufw 不存在，跳过${NC}"; return; }
-    grep -q '^IPV6=yes' /etc/default/ufw && cur=yes || cur=no
-    echo "当前 IPv6: $cur"
-    read -r -p "设置 IPv6 yes/no: " val
-    [ "$val" != yes ] && [ "$val" != no ] && return
-    sed -i "s/^IPV6=.*/IPV6=$val/" /etc/default/ufw
-    ufw reload
-    echo -e "${GREEN}IPv6 已设置为 $val${NC}"
 }
 
 ufw_menu(){
     while true; do
         header; status_bar; line
         echo -e "${BOLD}UFW 防火墙${NC}"
-        echo "1. 安装/启用    2. 状态/规则"
-        echo "3. 批量放行端口 4. 批量拒绝端口"
-        echo "5. 允许IP       6. 屏蔽IP"
-        echo "7. 删除规则     8. IPv6开关"
-        echo "9. 重载         0. 返回"
+        echo "1. 安装/基础配置"
+        echo "2. 查看状态/规则"
+        echo "3. 批量放行端口"
+        echo "4. 批量拒绝端口"
+        echo "5. 允许IP白名单"
+        echo "6. 屏蔽IP黑名单"
+        echo "7. 删除规则"
+        echo "8. 重载防火墙"
+        echo "0. 返回"
         line
-        read -r -p "选择: " c
+        read -r -p "请选择: " c
         case "$c" in
-            1) ufw_install ;;
+            1) ufw_install_basic ;;
             2) ufw_show_rules ;;
-            3) ufw_batch_ports ;;
-            4) ufw_batch_deny ;;
+            3) ufw_batch_rule allow "批量放行端口" ;;
+            4) ufw_batch_rule deny "批量拒绝端口" ;;
             5) ufw_ip_rule allow ;;
             6) ufw_ip_rule deny ;;
             7) ufw_delete_rules ;;
-            8) ufw_toggle_ipv6 ;;
-            9) ufw reload && echo -e "${GREEN}已重载${NC}" ;;
+            8) ufw reload && ok "UFW 已重载" ;;
             0) break ;;
-            *) echo -e "${RED}无效选择${NC}" ;;
+            *) err "无效选择" ;;
         esac
         [ "$c" != 0 ] && pause
     done
 }
 
-# ---------------- Fail2Ban SSH only ----------------
-f2b_write_ssh_config(){
+# ---------------- Fail2Ban ----------------
+ensure_fail2ban(){ cmd_exists fail2ban-client || pkg_install fail2ban; }
+
+f2b_log_path(){
+    if [ -f /var/log/ufw.log ]; then echo "/var/log/ufw.log"; return; fi
+    if [ -f /var/log/kern.log ]; then echo "/var/log/kern.log"; return; fi
+    echo "/var/log/ufw.log"
+}
+
+f2b_write_portscan_filter(){
+    mkdir -p /etc/fail2ban/filter.d
+    cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
+[Definition]
+failregex = ^.*\[UFW (?:BLOCK|DENY)\].*SRC=<HOST>.*$
+ignoreregex =
+EOF
+}
+
+f2b_write_config(){
+    local ssh_port="$1" ssh_retry="$2" ssh_ban="$3" findtime="$4" scan_retry="$5" scan_ban="$6" enable_web="$7"
+    local ufw_log; ufw_log=$(f2b_log_path)
     mkdir -p /etc/fail2ban
-    local maxretry="$1" bantime="$2" findtime="$3" port="$4"
+    f2b_write_portscan_filter
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
-bantime = ${bantime}
 findtime = ${findtime}
-maxretry = ${maxretry}
+bantime = ${ssh_ban}
+maxretry = ${ssh_retry}
 banaction = iptables-multiport
 
 [sshd]
 enabled = true
-port = ${port}
+port = ${ssh_port}
 filter = sshd
 logpath = /var/log/auth.log
-maxretry = ${maxretry}
-bantime = ${bantime}
+maxretry = ${ssh_retry}
 findtime = ${findtime}
+bantime = ${ssh_ban}
+
+[ufw-port-scan]
+enabled = true
+filter = ufw-port-scan
+logpath = ${ufw_log}
+maxretry = ${scan_retry}
+findtime = 300
+bantime = ${scan_ban}
+action = iptables-allports[name=ufw-port-scan]
+
+[recidive]
+enabled = true
+logpath = /var/log/fail2ban.log
+bantime = 604800
+findtime = 86400
+maxretry = 5
 EOF
+    if [ "$enable_web" = "y" ]; then
+        cat >> /etc/fail2ban/jail.local <<'EOF'
+
+[nginx-http-auth]
+enabled = true
+port = http,https
+filter = nginx-http-auth
+logpath = /var/log/nginx/error.log
+maxretry = 5
+bantime = 3600
+
+[apache-auth]
+enabled = true
+port = http,https
+filter = apache-auth
+logpath = /var/log/apache*/error.log
+maxretry = 5
+bantime = 3600
+EOF
+    fi
 }
 
-f2b_install(){
-    cmd_exists fail2ban-client || pkg_install fail2ban || return
-    f2b_write_ssh_config 3 86400 600 ssh
+f2b_install_basic(){
+    ensure_fail2ban || return
+    echo -e "${CYAN}Fail2Ban 基础防护配置${NC}"
+    echo "说明："
+    echo "SSH防护：防止SSH密码爆破。"
+    echo "端口扫描防护：配合UFW日志，检测频繁被防火墙拦截的IP。"
+    echo "重复封禁：多次触发封禁的IP会被封禁更久。"
+    echo
+    local ssh_port ssh_retry findtime ssh_ban scan_retry scan_ban enable_web
+    ssh_port=$(ask_default "SSH端口，默认 ssh 表示读取系统SSH服务名，也可填 22/2222" "ssh")
+    ssh_retry=$(ask_default "SSH允许失败次数，超过就封禁" "3")
+    findtime=$(ask_default "检测时间窗口，单位秒，例如600表示10分钟内" "600")
+    ssh_ban=$(ask_default "SSH封禁时间，单位秒，86400表示1天" "86400")
+    scan_retry=$(ask_default "端口扫描触发次数，300秒内被UFW拦截多少次就封禁" "10")
+    scan_ban=$(ask_default "端口扫描封禁时间，单位秒" "86400")
+    if ask_yes_no "是否启用 Web 基础认证防护？适合 nginx/apache 服务器" "n"; then enable_web="y"; else enable_web="n"; fi
+
+    f2b_write_config "$ssh_port" "$ssh_retry" "$ssh_ban" "$findtime" "$scan_retry" "$scan_ban" "$enable_web"
     svc_enable fail2ban
-    svc start fail2ban
-    echo -e "${GREEN}Fail2Ban SSH 防护已安装启用。${NC}"
-}
-
-f2b_config_ssh(){
-    read -r -p "SSH端口 [ssh/22]: " port; port=${port:-ssh}
-    read -r -p "失败次数 [3]: " maxretry; maxretry=${maxretry:-3}
-    read -r -p "检测窗口秒 [600]: " findtime; findtime=${findtime:-600}
-    read -r -p "封禁时间秒 [86400]: " bantime; bantime=${bantime:-86400}
-    f2b_write_ssh_config "$maxretry" "$bantime" "$findtime" "$port"
-    svc restart fail2ban
-    echo -e "${GREEN}SSH 防护配置已更新。${NC}"
+    svc restart fail2ban || svc start fail2ban
+    ok "Fail2Ban 已配置完成。"
+    warn "端口扫描防护依赖 UFW 日志，请确保 UFW 已启用且 logging on。"
 }
 
 f2b_status(){
-    cmd_exists fail2ban-client || { echo -e "${RED}Fail2Ban 未安装${NC}"; return; }
-    fail2ban-client status
+    ensure_fail2ban || return
+    fail2ban-client status || return
     echo
-    fail2ban-client status sshd 2>/dev/null || true
-}
-
-f2b_banned(){
-    cmd_exists fail2ban-client || { echo -e "${RED}Fail2Ban 未安装${NC}"; return; }
-    fail2ban-client status sshd 2>/dev/null | sed -n '/Banned IP list/,$p'
+    for jail in sshd ufw-port-scan recidive nginx-http-auth apache-auth; do
+        fail2ban-client status "$jail" >/dev/null 2>&1 && { echo -e "${CYAN}[$jail]${NC}"; fail2ban-client status "$jail"; echo; }
+    done
 }
 
 f2b_unban(){
-    read -r -p "解封IP: " ip
+    ensure_fail2ban || return
+    read -r -p "请输入要解封的IP: " ip
     [ -z "$ip" ] && return
-    fail2ban-client set sshd unbanip "$ip" && echo -e "${GREEN}已解封 $ip${NC}"
+    if fail2ban-client unban "$ip" 2>/dev/null; then ok "已解封：$ip"; else err "解封失败，可能该IP未被封禁"; fi
 }
 
 f2b_menu(){
     while true; do
         header; status_bar; line
-        echo -e "${BOLD}Fail2Ban - SSH 防护${NC}"
-        echo "1. 安装/启用   2. 状态"
-        echo "3. 配置SSH防护 4. 被封IP"
-        echo "5. 解封IP      6. 重启服务"
+        echo -e "${BOLD}Fail2Ban 防护${NC}"
+        echo "1. 安装/基础配置"
+        echo "2. 查看防护状态"
+        echo "3. 修改基础配置"
+        echo "4. 解封IP"
+        echo "5. 查看日志"
+        echo "6. 重启服务"
         echo "0. 返回"
         line
-        read -r -p "选择: " c
+        read -r -p "请选择: " c
         case "$c" in
-            1) f2b_install ;;
+            1|3) f2b_install_basic ;;
             2) f2b_status ;;
-            3) f2b_config_ssh ;;
-            4) f2b_banned ;;
-            5) f2b_unban ;;
-            6) svc restart fail2ban && echo -e "${GREEN}已重启${NC}" ;;
+            4) f2b_unban ;;
+            5) tail -80 /var/log/fail2ban.log 2>/dev/null || journalctl -u fail2ban -n 80 --no-pager ;;
+            6) svc restart fail2ban && ok "Fail2Ban 已重启" ;;
             0) break ;;
-            *) echo -e "${RED}无效选择${NC}" ;;
+            *) err "无效选择" ;;
         esac
         [ "$c" != 0 ] && pause
     done
+}
+
+# ---------------- One key install ----------------
+one_key_install(){
+    header; status_bar; line
+    echo -e "${BOLD}一键安装 UFW + Fail2Ban${NC}"
+    echo "此功能会："
+    echo "1. 安装并启用 UFW 防火墙"
+    echo "2. 交互设置 SSH 端口、网站端口、IPv6"
+    echo "3. 安装并配置 Fail2Ban"
+    echo "4. 启用 SSH爆破防护、UFW端口扫描防护、重复封禁"
+    line
+    read -r -p "是否继续？输入 yes 继续: " okv
+    [ "$okv" = "yes" ] || { warn "已取消"; pause; return; }
+    ufw_install_basic
+    echo
+    f2b_install_basic
+    echo
+    ok "一键安装与基础安全配置完成。"
+    pause
 }
 
 # ---------------- BBR ----------------
@@ -259,13 +372,7 @@ bbr_enable(){
     echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
     echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
     sysctl -p >/dev/null 2>&1
-    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && echo -e "${GREEN}BBR 已启用${NC}" || echo -e "${YELLOW}启用失败，可能内核不支持 BBR${NC}"
-}
-
-bbr_status(){
-    sysctl net.ipv4.tcp_congestion_control 2>/dev/null
-    sysctl net.core.default_qdisc 2>/dev/null
-    sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && ok "BBR 已启用" || warn "启用失败，可能内核不支持 BBR"
 }
 
 bbr_menu(){
@@ -276,12 +383,12 @@ bbr_menu(){
         echo "2. 查看状态"
         echo "0. 返回"
         line
-        read -r -p "选择: " c
+        read -r -p "请选择: " c
         case "$c" in
             1) bbr_enable ;;
-            2) bbr_status ;;
+            2) sysctl net.ipv4.tcp_congestion_control 2>/dev/null; sysctl net.core.default_qdisc 2>/dev/null; sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null ;;
             0) break ;;
-            *) echo -e "${RED}无效选择${NC}" ;;
+            *) err "无效选择" ;;
         esac
         [ "$c" != 0 ] && pause
     done
@@ -289,20 +396,20 @@ bbr_menu(){
 
 # ---------------- Swap ----------------
 swap_create(){
-    swapon -s 2>/dev/null | grep -q /swapfile && { echo -e "${YELLOW}已存在 /swapfile${NC}"; return; }
-    read -r -p "Swap大小 [1G]: " size; size=${size:-1G}
-    fallocate -l "$size" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024
+    swapon -s 2>/dev/null | grep -q /swapfile && { warn "已存在 /swapfile"; return; }
+    local size; size=$(ask_default "Swap大小，例如 1G/2G" "1G")
+    if fallocate -l "$size" /swapfile 2>/dev/null; then :; else dd if=/dev/zero of=/swapfile bs=1M count=1024; fi
     chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
     grep -q /swapfile /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    echo -e "${GREEN}Swap 已创建: $size${NC}"
+    ok "Swap 已创建：$size"
 }
 
 swap_del(){
-    read -r -p "确认删除 /swapfile ? yes/no: " ok
-    [ "$ok" = yes ] || return
+    read -r -p "确认删除 /swapfile ? 输入 yes: " okv
+    [ "$okv" = yes ] || return
     swapoff /swapfile 2>/dev/null; rm -f /swapfile
     sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null
-    echo -e "${GREEN}Swap 已删除${NC}"
+    ok "Swap 已删除"
 }
 
 swap_menu(){
@@ -314,66 +421,54 @@ swap_menu(){
         echo "2. 删除 Swap"
         echo "0. 返回"
         line
-        read -r -p "选择: " c
+        read -r -p "请选择: " c
         case "$c" in
             1) swap_create ;;
             2) swap_del ;;
             0) break ;;
-            *) echo -e "${RED}无效选择${NC}" ;;
+            *) err "无效选择" ;;
         esac
         [ "$c" != 0 ] && pause
     done
 }
 
-# ---------------- System ----------------
 sys_info(){
     header; status_bar; line
     echo -e "${BOLD}系统信息${NC}"
-    echo "主机: $(hostname)"
-    echo "系统: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$(uname -s)}")"
-    echo "内核: $(uname -r)"
-    echo "时间: $(date '+%F %T')"
+    echo "主机：$(hostname)"
+    echo "系统：$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$(uname -s)}")"
+    echo "内核：$(uname -r)"
+    echo "时间：$(date '+%F %T')"
     echo
-    free -h
+    echo -e "${CYAN}内存：${NC}"; free -h
     echo
-    df -h | grep -E '^/dev|Filesystem'
+    echo -e "${CYAN}磁盘：${NC}"; df -h | grep -E '^/dev|Filesystem'
     echo
-    ss -tlnp 2>/dev/null | head -20 || true
-    pause
-}
-
-quick_secure(){
-    header; echo -e "${YELLOW}将安装/启用 UFW、Fail2Ban SSH、BBR。${NC}"
-    read -r -p "继续? yes/no: " ok
-    [ "$ok" = yes ] || return
-    ufw_install
-    f2b_install
-    bbr_enable
-    echo -e "${GREEN}基础安全加固完成。${NC}"
+    echo -e "${CYAN}监听端口：${NC}"; ss -tlnp 2>/dev/null | head -20 || true
     pause
 }
 
 main_menu(){
     while true; do
         header; status_bar; line
-        echo "1. UFW 防火墙"
-        echo "2. Fail2Ban SSH"
-        echo "3. BBR 加速"
-        echo "4. Swap 管理"
-        echo "5. 系统信息"
-        echo "6. 快速加固"
+        echo "1. 一键安装 UFW + Fail2Ban"
+        echo "2. UFW 防火墙"
+        echo "3. Fail2Ban 防护"
+        echo "4. BBR 加速"
+        echo "5. Swap 管理"
+        echo "6. 系统信息"
         echo "0. 退出"
         line
-        read -r -p "选择: " c
+        read -r -p "请选择: " c
         case "$c" in
-            1) ufw_menu ;;
-            2) f2b_menu ;;
-            3) bbr_menu ;;
-            4) swap_menu ;;
-            5) sys_info ;;
-            6) quick_secure ;;
-            0) echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
-            *) echo -e "${RED}无效选择${NC}"; pause ;;
+            1) one_key_install ;;
+            2) ufw_menu ;;
+            3) f2b_menu ;;
+            4) bbr_menu ;;
+            5) swap_menu ;;
+            6) sys_info ;;
+            0) ok "已退出"; exit 0 ;;
+            *) err "无效选择"; pause ;;
         esac
     done
 }
