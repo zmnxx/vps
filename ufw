@@ -2,10 +2,9 @@
 
 # ==========================================
 # VPS 一键管理脚本 (UFW/Fail2ban/BBR/SWAP)
-# 稳定兼容版：增强服务稳定性与跨平台适配
+# 安全重构版：不重置 UFW、不强制重复安装、Fail2ban 稳定检测
 # ==========================================
 
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -14,26 +13,102 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 检查 Root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${NC}" && exit 1
 
-# 包管理器检测
+PKG_MANAGER=""
+CMD_UPDATE=""
 CMD_INSTALL=""
-if [ -x "$(command -v apt-get)" ]; then
+CMD_QUERY=""
+
+if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+    CMD_UPDATE="apt-get update"
     CMD_INSTALL="apt-get install -y"
-elif [ -x "$(command -v yum)" ]; then
-    CMD_INSTALL="yum install -y"
-elif [ -x "$(command -v dnf)" ]; then
+    CMD_QUERY="dpkg -s"
+elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
     CMD_INSTALL="dnf install -y"
+    CMD_QUERY="rpm -q"
+elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+    CMD_INSTALL="yum install -y"
+    CMD_QUERY="rpm -q"
+else
+    echo -e "${RED}未识别到 apt/yum/dnf 包管理器，脚本退出。${NC}"
+    exit 1
 fi
 
-# 辅助函数：暂停
 pause() {
     echo -e "\n${YELLOW}按回车键返回菜单...${NC}"
-    read
+    read -r _
 }
 
-# 辅助函数：Fail2ban 翻译器
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+pkg_installed() {
+    local pkg="$1"
+    if [ "$PKG_MANAGER" = "apt" ]; then
+        dpkg -s "$pkg" >/dev/null 2>&1
+    else
+        rpm -q "$pkg" >/dev/null 2>&1
+    fi
+}
+
+install_if_missing() {
+    local pkg="$1"
+    local bin_name="${2:-$1}"
+
+    if has_cmd "$bin_name" || pkg_installed "$pkg"; then
+        echo -e "${GREEN}已检测到 $pkg，跳过安装。${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}未检测到 $pkg，正在安装...${NC}"
+    $CMD_INSTALL "$pkg"
+}
+
+service_exists() {
+    systemctl list-unit-files "$1.service" >/dev/null 2>&1 || [ -f "/etc/init.d/$1" ]
+}
+
+svc_enable() {
+    local name="$1"
+    if has_cmd systemctl; then
+        systemctl enable "$name" >/dev/null 2>&1 || true
+    elif has_cmd chkconfig; then
+        chkconfig "$name" on >/dev/null 2>&1 || true
+    fi
+}
+
+svc_start() {
+    local name="$1"
+    if has_cmd systemctl; then
+        systemctl start "$name" >/dev/null 2>&1
+    else
+        service "$name" start >/dev/null 2>&1
+    fi
+}
+
+svc_restart() {
+    local name="$1"
+    if has_cmd systemctl; then
+        systemctl restart "$name" >/dev/null 2>&1
+    else
+        service "$name" restart >/dev/null 2>&1
+    fi
+}
+
+svc_status() {
+    local name="$1"
+    if has_cmd systemctl; then
+        systemctl status "$name" --no-pager -l
+    else
+        service "$name" status
+    fi
+}
+
 translate_f2b() {
     sed -e 's/Status for the jail:/防护监狱状态:/g' \
         -e 's/Number of jail:/监狱数量:/g' \
@@ -45,199 +120,377 @@ translate_f2b() {
         -e 's/Total banned:/总封禁人数:/g' \
         -e 's/Banned IP list:/被封禁 IP 列表:/g' \
         -e 's/started/已启动/g' \
-        -e 's/INFO/信息/g' \
-        -e 's/Creating new jail/创建新监狱/g' \
-        -e 's/Added logfile:/已添加日志:/g'
+        -e 's/INFO/信息/g'
 }
 
-# 辅助函数：内存信息翻译
 translate_mem() {
     sed -e 's/total/总量/g' -e 's/used/已用/g' -e 's/free/空闲/g' \
         -e 's/shared/共享/g' -e 's/buff\/cache/缓存/g' -e 's/available/可用/g' \
         -e 's/Mem:/内存:/g' -e 's/Swap:/虚拟内存:/g'
 }
 
-# 辅助函数：深度修复并检查 Fail2ban
+get_ssh_port() {
+    local port=""
+    if has_cmd sshd; then
+        port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
+    fi
+    if [ -z "$port" ]; then
+        port=$(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {p=$2} END{print p}' /etc/ssh/sshd_config 2>/dev/null)
+    fi
+    echo "${port:-22}"
+}
+
+get_sshd_logpath() {
+    if [ -f /var/log/auth.log ]; then
+        echo "/var/log/auth.log"
+    elif [ -f /var/log/secure ]; then
+        echo "/var/log/secure"
+    else
+        echo "systemd"
+    fi
+}
+
+f2b_ping() {
+    fail2ban-client ping >/dev/null 2>&1
+}
+
+show_f2b_error_hint() {
+    echo -e "${YELLOW}Fail2ban 诊断信息：${NC}"
+    fail2ban-client -t 2>&1 | tail -n 30
+    echo
+    if [ -f /var/log/fail2ban.log ]; then
+        tail -n 30 /var/log/fail2ban.log
+    elif has_cmd journalctl; then
+        journalctl -u fail2ban -n 30 --no-pager
+    else
+        svc_status fail2ban
+    fi
+}
+
 restart_f2b() {
-    echo -e "${CYAN}正在应用配置并启动 Fail2ban 服务...${NC}"
-    
-    # 基础目录检查
-    mkdir -p /var/run/fail2ban
-    mkdir -p /var/lib/fail2ban
-    
-    # 尝试启动
-    systemctl daemon-reload
-    systemctl restart fail2ban
-    
-    # 等待启动完成
+    echo -e "${CYAN}正在检查配置并启动 Fail2ban...${NC}"
+
+    if ! has_cmd fail2ban-client; then
+        echo -e "${RED}未安装 fail2ban，请先执行菜单 1。${NC}"
+        return 1
+    fi
+
+    mkdir -p /run/fail2ban /var/run/fail2ban /var/lib/fail2ban /etc/fail2ban/jail.d
+
+    if ! fail2ban-client -t >/tmp/fail2ban-test.log 2>&1; then
+        echo -e "${RED}Fail2ban 配置检测失败：${NC}"
+        cat /tmp/fail2ban-test.log
+        return 1
+    fi
+
+    svc_enable fail2ban
+    svc_restart fail2ban || svc_start fail2ban || true
+
     local retry=0
-    while [ $retry -lt 5 ]; do
-        if systemctl is-active --quiet fail2ban; then
-            echo -e "${GREEN}Fail2ban 服务已成功启动并运行。${NC}"
+    while [ "$retry" -lt 10 ]; do
+        if f2b_ping; then
+            echo -e "${GREEN}Fail2ban 已正常运行，client/socket 通信正常。${NC}"
             return 0
         fi
-        sleep 2
-        retry=$((retry+1))
+        sleep 1
+        retry=$((retry + 1))
     done
 
-    # 如果还是失败，尝试通过日志排查并强制前台测试
-    echo -e "${RED}警告：Fail2ban 服务启动缓慢或失败。${NC}"
-    echo -e "${YELLOW}正在尝试强制重置 socket 文件并重启...${NC}"
-    rm -f /var/run/fail2ban/fail2ban.sock
-    systemctl restart fail2ban
-    sleep 3
-    
-    if systemctl is-active --quiet fail2ban; then
-        echo -e "${GREEN}服务已恢复正常。${NC}"
-    else
-        echo -e "${RED}严重错误：无法启动 Fail2ban。建议检查系统日志: journalctl -u fail2ban${NC}"
-    fi
+    echo -e "${YELLOW}system 服务可能已启动，但 fail2ban-client 仍无法连接 socket，尝试清理残留 socket 后重启...${NC}"
+    rm -f /run/fail2ban/fail2ban.sock /var/run/fail2ban/fail2ban.sock
+    svc_restart fail2ban || true
+
+    retry=0
+    while [ "$retry" -lt 10 ]; do
+        if f2b_ping; then
+            echo -e "${GREEN}Fail2ban 已恢复正常。${NC}"
+            return 0
+        fi
+        sleep 1
+        retry=$((retry + 1))
+    done
+
+    echo -e "${RED}Fail2ban 启动失败或 socket 不可用。${NC}"
+    show_f2b_error_hint
+    return 1
 }
 
 # ================= 基础安装 =================
 
 install_basics() {
     clear
-    echo -e "${CYAN}--- 核心组件安装/修复 ---${NC}"
-    
-    # 强制重新安装 Fail2ban 确保二进制文件完整
-    echo -e "${YELLOW}正在检查并安装 UFW...${NC}"
-    $CMD_INSTALL ufw
-    
-    echo -e "${YELLOW}正在安装/修复 Fail2ban...${NC}"
-    $CMD_INSTALL fail2ban
-    systemctl enable fail2ban --now
-    
-    read -p "设置 SSH 端口 [默认 22]: " ssh_port; ssh_port=${ssh_port:-22}
-    
-    echo -e "${BLUE}初始化防火墙规则...${NC}"
-    ufw disable > /dev/null 2>&1
-    ufw --force reset > /dev/null 2>&1
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow $ssh_port/tcp
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    sed -i 's/IPV6=no/IPV6=yes/' /etc/default/ufw
-    
-    echo "y" | ufw enable
-    echo -e "${GREEN}基础组件已准备就绪。${NC}"
+    echo -e "${CYAN}--- 核心组件检查/安装 ---${NC}"
+    echo -e "${YELLOW}安全说明：本菜单不会 reset UFW、不会修改现有规则、不会询问/开放 SSH 端口。${NC}\n"
+
+    if [ "$PKG_MANAGER" = "apt" ]; then
+        echo -e "${BLUE}更新软件源索引...${NC}"
+        $CMD_UPDATE
+    fi
+
+    install_if_missing ufw ufw
+    install_if_missing fail2ban fail2ban-client
+
+    mkdir -p /etc/fail2ban/jail.d
+    svc_enable fail2ban
+    svc_start fail2ban || true
+
+    echo -e "\n${CYAN}当前 UFW 状态：${NC}"
+    if has_cmd ufw; then
+        ufw status verbose || true
+    fi
+
+    echo -e "\n${CYAN}当前 SSH 监听端口检测：${NC}$(get_ssh_port)"
+    echo -e "${GREEN}基础组件检查完成。没有改动防火墙规则。${NC}"
     pause
 }
 
 # ================= UFW 管理 =================
 
 manage_ufw() {
+    if ! has_cmd ufw; then
+        echo -e "${RED}未安装 ufw，请先执行菜单 1。${NC}"
+        pause
+        return
+    fi
+
     while true; do
         clear
-        local ipv6_status=$(grep -i "^IPV6=" /etc/default/ufw | cut -d= -f2)
+        local ipv6_status="未知"
+        [ -f /etc/default/ufw ] && ipv6_status=$(grep -i '^IPV6=' /etc/default/ufw | cut -d= -f2)
         echo -e "${PURPLE}=== UFW 防火墙管理 ===${NC}"
         echo -e "1. 查看规则列表"
         echo -e "2. 批量添加端口"
         echo -e "3. 批量删除规则"
         echo -e "4. 防火墙开关/重载"
         echo -e "5. IPv6 开关 [当前: ${CYAN}${ipv6_status}${NC}]"
+        echo -e "6. 安全初始化建议查看（只显示命令，不执行）"
         echo -e "0. 返回主菜单"
         echo -e "${PURPLE}======================${NC}"
-        read -p "请选择: " ufw_choice
+        read -r -p "请选择: " ufw_choice
 
         case $ufw_choice in
             1) ufw status numbered; pause ;;
             2)
-                read -p "端口 (如 80 443 或 400:500): " ports
-                read -p "协议 [1.TCP | 2.UDP, 默认TCP]: " p_choice
+                read -r -p "端口 (如 80 443 或 400:500): " ports
+                read -r -p "协议 [1.TCP | 2.UDP, 默认TCP]: " p_choice
                 proto="tcp"; [[ "$p_choice" == "2" ]] && proto="udp"
-                for p in $ports; do ufw allow $p/$proto > /dev/null; done
-                echo -e "${GREEN}端口已开放。${NC}"; pause ;;
+                for p in $ports; do
+                    if [[ "$p" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+                        ufw allow "$p/$proto"
+                    else
+                        echo -e "${RED}跳过无效端口: $p${NC}"
+                    fi
+                done
+                pause ;;
             3)
                 ufw status numbered
-                read -p "按编号删除 (如 3 2 1): " ids
-                sorted_ids=$(echo $ids | tr ' ' '\n' | sort -rn)
-                for id in $sorted_ids; do echo "y" | ufw delete $id > /dev/null; done
-                echo -e "${GREEN}已删除。${NC}"; pause ;;
+                read -r -p "按编号删除，建议从大到小输入；留空取消: " ids
+                [ -z "$ids" ] && continue
+                sorted_ids=$(echo "$ids" | tr ' ' '\n' | sort -rn)
+                for id in $sorted_ids; do
+                    [[ "$id" =~ ^[0-9]+$ ]] && echo "y" | ufw delete "$id"
+                done
+                pause ;;
             4)
                 echo -e "1. 开启 | 2. 关闭 | 3. 重载"
-                read -p "操作: " op
+                read -r -p "操作: " op
                 [[ "$op" == "1" ]] && ufw enable
                 [[ "$op" == "2" ]] && ufw disable
                 [[ "$op" == "3" ]] && ufw reload
                 pause ;;
             5)
-                [[ "$ipv6_status" == "yes" ]] && sed -i 's/IPV6=yes/IPV6=no/' /etc/default/ufw || sed -i 's/IPV6=no/IPV6=yes/' /etc/default/ufw
-                ufw reload > /dev/null; echo -e "${GREEN}IPv6 状态已切换。${NC}"; pause ;;
+                if [ -f /etc/default/ufw ]; then
+                    if grep -qi '^IPV6=yes' /etc/default/ufw; then
+                        sed -i 's/^IPV6=yes/IPV6=no/I' /etc/default/ufw
+                    else
+                        sed -i 's/^IPV6=no/IPV6=yes/I' /etc/default/ufw
+                    fi
+                    ufw reload || true
+                    echo -e "${GREEN}IPv6 状态已切换。${NC}"
+                else
+                    echo -e "${RED}未找到 /etc/default/ufw${NC}"
+                fi
+                pause ;;
+            6)
+                local ssh_port
+                ssh_port=$(get_ssh_port)
+                echo -e "${YELLOW}以下只是建议命令，不会自动执行：${NC}\n"
+                echo "ufw allow ${ssh_port}/tcp    # 当前检测到的 SSH 端口"
+                echo "ufw allow 80/tcp"
+                echo "ufw allow 443/tcp"
+                echo "ufw default deny incoming"
+                echo "ufw default allow outgoing"
+                echo "ufw enable"
+                echo -e "\n${RED}注意：确认 SSH 端口已放行后再启用 UFW，避免锁外面。${NC}"
+                pause ;;
             0) break ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac
     done
 }
 
 # ================= Fail2ban 管理 =================
 
+write_sshd_jail() {
+    local ssh_bantime="$1"
+    local ssh_maxretry="$2"
+    local ssh_port="$3"
+    local logpath="$4"
+
+    if [ "$logpath" = "systemd" ]; then
+        cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = $ssh_port
+filter = sshd
+backend = systemd
+maxretry = $ssh_maxretry
+bantime = $ssh_bantime
+findtime = 10m
+EOF
+    else
+        cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = $ssh_port
+filter = sshd
+logpath = $logpath
+maxretry = $ssh_maxretry
+bantime = $ssh_bantime
+findtime = 10m
+EOF
+    fi
+}
+
+write_portscan_filter() {
+    cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<EOF
+[Definition]
+failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
+ignoreregex =
+EOF
+}
+
+write_portscan_jail() {
+    local scan_bantime="$1"
+    local scan_maxretry="$2"
+    cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
+[ufw-port-scan]
+enabled = true
+filter = ufw-port-scan
+logpath = /var/log/ufw.log
+maxretry = $scan_maxretry
+bantime = $scan_bantime
+findtime = 10m
+banaction = ufw
+EOF
+}
+
 manage_fail2ban() {
+    if ! has_cmd fail2ban-client; then
+        echo -e "${RED}未安装 fail2ban，请先执行菜单 1。${NC}"
+        pause
+        return
+    fi
+
     while true; do
         clear
         echo -e "${PURPLE}=== Fail2ban 安全管理 ===${NC}"
-        echo -e "1. SSH 登录防护配置"
-        echo -e "2. 端口扫描防护配置"
+        echo -e "1. SSH 登录防护配置/更新"
+        echo -e "2. UFW 端口扫描防护配置/更新"
         echo -e "3. 运行状态概览"
         echo -e "4. 监狱详情查看"
         echo -e "5. 安全日志查看"
         echo -e "6. 一键清除所有封禁 IP"
+        echo -e "7. 配置检测 + 重启修复"
         echo -e "0. 返回主菜单"
         echo -e "${PURPLE}=========================${NC}"
-        read -p "请选择: " f2b_choice
+        read -r -p "请选择: " f2b_choice
 
         case $f2b_choice in
             1)
-                read -p "封禁时长 (如 12h, 1d, 默认 1h): " ssh_bantime; ssh_bantime=${ssh_bantime:-1h}
-                read -p "最大尝试次数 (默认 5): " ssh_maxretry; ssh_maxretry=${ssh_maxretry:-5}
-                cat > /etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = $ssh_maxretry
-bantime = $ssh_bantime
-EOF
-                restart_f2b; pause ;;
+                local def_port def_log
+                def_port=$(get_ssh_port)
+                def_log=$(get_sshd_logpath)
+                read -r -p "SSH 端口 [默认检测: ${def_port}]: " ssh_port; ssh_port=${ssh_port:-$def_port}
+                read -r -p "封禁时长 (如 12h, 1d, 默认 1h): " ssh_bantime; ssh_bantime=${ssh_bantime:-1h}
+                read -r -p "最大尝试次数 (默认 5): " ssh_maxretry; ssh_maxretry=${ssh_maxretry:-5}
+                read -r -p "日志路径 [默认: ${def_log}]: " ssh_logpath; ssh_logpath=${ssh_logpath:-$def_log}
+                mkdir -p /etc/fail2ban/jail.d
+                write_sshd_jail "$ssh_bantime" "$ssh_maxretry" "$ssh_port" "$ssh_logpath"
+                restart_f2b
+                pause ;;
             2)
-                read -p "封禁时长 (如 7d, 默认 12h): " scan_bantime; scan_bantime=${scan_bantime:-12h}
-                read -p "重试阈值 (默认 10): " scan_maxretry; scan_maxretry=${scan_maxretry:-10}
-                ufw logging on > /dev/null
-                cat > /etc/fail2ban/jail.d/portscan.local <<EOF
-[ufw-port-scan]
-enabled = true
-filter = ufw.syslog
-logpath = /var/log/ufw.log
-maxretry = $scan_maxretry
-bantime = $scan_bantime
-banaction = ufw
-EOF
-                if [ ! -f /etc/fail2ban/filter.d/ufw.syslog.conf ]; then
-                    cat > /etc/fail2ban/filter.d/ufw.syslog.conf <<EOF
-[Definition]
-failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
-ignoreregex = 
-EOF
+                if ! has_cmd ufw; then
+                    echo -e "${RED}未安装 ufw，无法配置 UFW 端口扫描防护。${NC}"
+                    pause
+                    continue
                 fi
-                restart_f2b; pause ;;
+                read -r -p "封禁时长 (如 7d, 默认 12h): " scan_bantime; scan_bantime=${scan_bantime:-12h}
+                read -r -p "触发阈值/最大次数 (默认 10): " scan_maxretry; scan_maxretry=${scan_maxretry:-10}
+                mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+                ufw logging on >/dev/null 2>&1 || true
+                write_portscan_filter
+                write_portscan_jail "$scan_bantime" "$scan_maxretry"
+                restart_f2b
+                pause ;;
             3)
-                if ! systemctl is-active --quiet fail2ban; then
-                    echo -e "${RED}Fail2ban 未运行，正在尝试启动...${NC}"
+                if ! f2b_ping; then
+                    echo -e "${YELLOW}Fail2ban client/socket 不可用，正在尝试修复...${NC}"
                     restart_f2b
                 fi
-                fail2ban-client status | translate_f2b; pause ;;
-            4)
-                jails=$(fail2ban-client status | grep "Jail list" | cut -d: -f2 | sed 's/,//g')
-                echo -e "\n当前列表："; i=1
-                for j in $jails; do echo "$i. $j"; eval jail_$i=$j; i=$((i+1)); done
-                read -p "输入编号: " j_idx
-                target_jail=$(eval echo \$jail_$j_idx)
-                [ -n "$target_jail" ] && fail2ban-client status $target_jail | translate_f2b || echo "无效选择"
+                fail2ban-client status 2>&1 | translate_f2b
                 pause ;;
-            5) tail -n 15 /var/log/fail2ban.log | translate_f2b; pause ;;
-            6) fail2ban-client unban --all; echo -e "${GREEN}已解锁所有 IP。${NC}"; pause ;;
+            4)
+                if ! f2b_ping; then
+                    echo -e "${RED}Fail2ban 未正常运行。${NC}"
+                    pause
+                    continue
+                fi
+                jails=$(fail2ban-client status | awk -F: '/Jail list/ {gsub(/,/," ",$2); print $2}')
+                if [ -z "$jails" ]; then
+                    echo -e "${YELLOW}当前没有启用的 jail。${NC}"
+                    pause
+                    continue
+                fi
+                echo -e "\n当前列表："
+                i=1
+                unset jail_names
+                for j in $jails; do
+                    echo "$i. $j"
+                    jail_names="$jail_names $j"
+                    i=$((i + 1))
+                done
+                read -r -p "输入编号或 jail 名称: " j_sel
+                target_jail=""
+                if [[ "$j_sel" =~ ^[0-9]+$ ]]; then
+                    target_jail=$(echo "$jail_names" | awk -v n="$j_sel" '{print $n}')
+                else
+                    target_jail="$j_sel"
+                fi
+                [ -n "$target_jail" ] && fail2ban-client status "$target_jail" 2>&1 | translate_f2b || echo "无效选择"
+                pause ;;
+            5)
+                if [ -f /var/log/fail2ban.log ]; then
+                    tail -n 80 /var/log/fail2ban.log | translate_f2b
+                elif has_cmd journalctl; then
+                    journalctl -u fail2ban -n 80 --no-pager | translate_f2b
+                else
+                    svc_status fail2ban
+                fi
+                pause ;;
+            6)
+                if f2b_ping; then
+                    fail2ban-client unban --all
+                    echo -e "${GREEN}已解锁所有 IP。${NC}"
+                else
+                    echo -e "${RED}Fail2ban 未正常运行，无法解封。${NC}"
+                fi
+                pause ;;
+            7)
+                restart_f2b
+                pause ;;
             0) break ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -249,26 +502,23 @@ manage_bbr() {
         clear
         echo -e "${PURPLE}=== BBR 加速管理 ===${NC}"
         echo -e "1. 开启标准 BBR 方案"
-        echo -e "2. 开启魔改高性能方案"
+        echo -e "2. 开启高性能参数方案"
         echo -e "3. 查看详细加速状态"
         echo -e "4. 关闭加速恢复默认"
         echo -e "0. 返回主菜单"
         echo -e "${PURPLE}====================${NC}"
-        read -p "请选择: " bbr_choice
+        read -r -p "请选择: " bbr_choice
 
         case $bbr_choice in
             1)
-                sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-                sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+                sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
                 echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
                 echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-                sysctl -p > /dev/null; echo -e "${GREEN}标准 BBR 已开启。${NC}"; pause ;;
+                sysctl -p >/dev/null
+                echo -e "${GREEN}标准 BBR 已开启。${NC}"
+                pause ;;
             2)
-                sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-                sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-                sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
-                sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
-                sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
+                sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
                 cat >> /etc/sysctl.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -278,22 +528,26 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 EOF
-                sysctl -p > /dev/null; echo -e "${GREEN}高性能方案已开启。${NC}"; pause ;;
+                sysctl -p >/dev/null
+                echo -e "${GREEN}高性能方案已开启。${NC}"
+                pause ;;
             3)
                 echo -e "\n${CYAN}--- BBR 状态概览 ---${NC}"
-                echo -e "拥塞算法: $(sysctl -n net.ipv4.tcp_congestion_control)"
-                echo -e "队列算法: $(sysctl -n net.core.default_qdisc)"
-                lsmod | grep bbr &> /dev/null && echo -e "内核模块: ${GREEN}正常${NC}" || echo -e "内核模块: ${RED}未加载${NC}"
+                echo -e "拥塞算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+                echo -e "队列算法: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+                lsmod | grep -q bbr && echo -e "内核模块: ${GREEN}正常${NC}" || echo -e "内核模块: ${YELLOW}未显示，若拥塞算法为 bbr 通常也可用${NC}"
                 echo -e "\n${BLUE}调优参数详情:${NC}"
-                sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_fastopen | sed 's/^/  /'
+                sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_fastopen 2>/dev/null | sed 's/^/  /'
                 pause ;;
             4)
-                sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-                sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+                sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
                 echo "net.core.default_qdisc=pfifo_fast" >> /etc/sysctl.conf
                 echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-                sysctl -p > /dev/null; echo -e "${YELLOW}已恢复默认设置。${NC}"; pause ;;
+                sysctl -p >/dev/null
+                echo -e "${YELLOW}已恢复默认设置。${NC}"
+                pause ;;
             0) break ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -303,34 +557,50 @@ EOF
 manage_swap() {
     while true; do
         clear
-        local swp_active=$(free | grep Swap | awk '{print $2}')
-        local swp_val=$(cat /proc/sys/vm/swappiness)
+        local swp_active swp_val
+        swp_active=$(free | awk '/Swap/ {print $2}')
+        swp_val=$(cat /proc/sys/vm/swappiness 2>/dev/null)
         echo -e "${PURPLE}=== SWAP 虚拟内存管理 ===${NC}"
-        echo -e "当前状态: $( [ $swp_active -gt 0 ] && echo -e "${GREEN}已启用${NC}" || echo -e "${RED}未启用${NC}" )"
-        echo -e "调度积极性: ${CYAN}${swp_val}${NC}"
+        echo -e "当前状态: $( [ "${swp_active:-0}" -gt 0 ] && echo -e "${GREEN}已启用${NC}" || echo -e "${RED}未启用${NC}" )"
+        echo -e "调度积极性: ${CYAN}${swp_val:-未知}${NC}"
         echo -e "-------------------------"
         echo -e "1. 创建/重新配置 SWAP"
         echo -e "2. 查看当前详细状态"
         echo -e "3. 彻底删除 SWAP"
         echo -e "0. 返回主菜单"
         echo -e "${PURPLE}=========================${NC}"
-        read -p "请选择: " sw_choice
+        read -r -p "请选择: " sw_choice
 
         case $sw_choice in
             1)
-                swapoff /swapfile 2>/dev/null; rm -f /swapfile
+                swapoff /swapfile 2>/dev/null || true
+                rm -f /swapfile
                 sed -i '/\/swapfile/d' /etc/fstab
-                read -p "大小 (如 1G, 2G, 512M): " raw_size
-                if [[ "$raw_size" =~ ^([0-9]+)([gG])$ ]]; then size=$((${BASH_REMATCH[1]} * 1024))
-                elif [[ "$raw_size" =~ ^([0-9]+)([mM])$ ]]; then size=${BASH_REMATCH[1]}
-                else size=${raw_size:-1024}; fi
-                read -p "积极性 (0-100, 建议 10): " s_val; s_val=${s_val:-10}
+                read -r -p "大小 (如 1G, 2G, 512M，默认 1G): " raw_size
+                raw_size=${raw_size:-1G}
+                if [[ "$raw_size" =~ ^([0-9]+)([gG])$ ]]; then
+                    size=$((${BASH_REMATCH[1]} * 1024))
+                elif [[ "$raw_size" =~ ^([0-9]+)([mM])$ ]]; then
+                    size=${BASH_REMATCH[1]}
+                elif [[ "$raw_size" =~ ^[0-9]+$ ]]; then
+                    size=$raw_size
+                else
+                    echo -e "${RED}大小格式无效。${NC}"
+                    pause
+                    continue
+                fi
+                read -r -p "积极性 (0-100, 建议 10): " s_val; s_val=${s_val:-10}
                 echo -e "${CYAN}正在创建...${NC}"
-                fallocate -l ${size}M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=$size status=progress
-                chmod 600 /swapfile; mkswap /swapfile > /dev/null; swapon /swapfile
+                fallocate -l "${size}M" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$size" status=progress
+                chmod 600 /swapfile
+                mkswap /swapfile >/dev/null
+                swapon /swapfile
                 echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-                sed -i '/vm.swappiness/d' /etc/sysctl.conf; echo "vm.swappiness=$s_val" >> /etc/sysctl.conf; sysctl -p > /dev/null
-                echo -e "${GREEN}设置成功！${NC}"; pause ;;
+                sed -i '/vm.swappiness/d' /etc/sysctl.conf
+                echo "vm.swappiness=$s_val" >> /etc/sysctl.conf
+                sysctl -p >/dev/null
+                echo -e "${GREEN}设置成功！${NC}"
+                pause ;;
             2)
                 echo -e "\n${CYAN}--- 内存使用统计 ---${NC}"
                 free -h | translate_mem
@@ -338,11 +608,15 @@ manage_swap() {
                 swapon --show | sed -e 's/NAME/路径/g' -e 's/TYPE/类型/g' -e 's/SIZE/大小/g' -e 's/USED/已用/g' -e 's/PRIO/优先级/g'
                 pause ;;
             3)
-                swapoff /swapfile 2>/dev/null; rm -f /swapfile
+                swapoff /swapfile 2>/dev/null || true
+                rm -f /swapfile
                 sed -i '/\/swapfile/d' /etc/fstab
-                sed -i '/vm.swappiness/d' /etc/sysctl.conf; sysctl -p > /dev/null
-                echo -e "${GREEN}SWAP 已移除。${NC}"; pause ;;
+                sed -i '/vm.swappiness/d' /etc/sysctl.conf
+                sysctl -p >/dev/null || true
+                echo -e "${GREEN}SWAP 已移除。${NC}"
+                pause ;;
             0) break ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -352,16 +626,16 @@ manage_swap() {
 while true; do
     clear
     echo -e "${CYAN}==========================================${NC}"
-    echo -e "${BLUE}       VPS 一键综合管理脚本 (兼容版)       ${NC}"
+    echo -e "${BLUE}       VPS 一键综合管理脚本 安全重构版      ${NC}"
     echo -e "${CYAN}==========================================${NC}"
-    echo -e "${YELLOW} 1. 安装/初始化${NC}"
+    echo -e "${YELLOW} 1. 检查/安装基础组件（不重置 UFW）${NC}"
     echo -e "${YELLOW} 2. UFW 防火墙管理${NC}"
     echo -e "${YELLOW} 3. Fail2ban 安全管理${NC}"
     echo -e "${YELLOW} 4. BBR 加速管理${NC}"
     echo -e "${YELLOW} 5. SWAP 虚拟内存管理${NC}"
     echo -e "${RED} 0. 退出脚本${NC}"
     echo -e "${CYAN}==========================================${NC}"
-    read -p "请选择: " main_choice
+    read -r -p "请选择: " main_choice
 
     case $main_choice in
         1) install_basics ;;
