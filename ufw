@@ -117,6 +117,7 @@ ufw_batch_rule(){
     ensure_ufw || return
     echo -e "${CYAN}$title${NC}"
     echo "端口格式：22,80,443,10000:10100"
+    echo "也支持空格输入：22 80 443"
     echo "协议说明：tcp=常用，udp=UDP服务，both=TCP和UDP都处理"
     echo "IP版本：all=IPv4和IPv6，4=只IPv4，6=只IPv6"
     local ports proto scope
@@ -125,13 +126,17 @@ ufw_batch_rule(){
     proto=$(ask_default "请选择协议 tcp/udp/both" "tcp")
     scope=$(ask_default "请选择IP版本 all/4/6" "all")
 
-    echo "$ports" | tr ',' '\n' | while read -r p; do
+    echo "$ports" | tr ' ,，;；' '\n' | while read -r p; do
         p=$(echo "$p" | xargs)
         [ -z "$p" ] && continue
-        if ufw_apply_one "$act" "$p" "$proto" "$scope" >/dev/null 2>&1; then
-            ok "已处理：$p/$proto，IP版本：$scope"
+        if echo "$p" | grep -Eq '^[0-9]+(:[0-9]+)?$'; then
+            if ufw_apply_one "$act" "$p" "$proto" "$scope" >/dev/null 2>&1; then
+                ok "已处理：$p/$proto，IP版本：$scope"
+            else
+                err "处理失败：$p/$proto，请检查UFW状态"
+            fi
         else
-            err "处理失败：$p/$proto，请检查端口格式"
+            err "端口格式错误：$p，示例 80 或 10000:10100"
         fi
     done
     ufw reload >/dev/null 2>&1
@@ -161,13 +166,13 @@ ufw_delete_rules(){
     ensure_ufw || return
     ufw_show_rules
     echo
-    echo "可输入多个编号，例如：3,5,8"
+    echo "可输入多个编号，例如：3,5,8 或 8 7 6"
     echo "脚本会从大到小删除，避免编号变化导致误删。"
     local nums
     read -r -p "请输入要删除的规则编号: " nums
     [ -z "$nums" ] && return
-    echo "$nums" | tr ',' '\n' | sed 's/[^0-9]//g' | grep -E '^[0-9]+$' | sort -rn | while read -r n; do
-        if yes | ufw delete "$n" >/dev/null 2>&1; then ok "已删除规则编号：$n"; else err "删除失败：$n"; fi
+    echo "$nums" | tr ' ,，;；' '\n' | grep -E '^[0-9]+$' | sort -rn | while read -r n; do
+        if yes | ufw delete "$n" >/dev/null 2>&1; then ok "已删除规则编号：$n"; else err "删除失败：$n，请确认编号存在"; fi
     done
 }
 
@@ -208,7 +213,15 @@ ensure_fail2ban(){ cmd_exists fail2ban-client || pkg_install fail2ban; }
 f2b_log_path(){
     if [ -f /var/log/ufw.log ]; then echo "/var/log/ufw.log"; return; fi
     if [ -f /var/log/kern.log ]; then echo "/var/log/kern.log"; return; fi
+    if [ -f /var/log/syslog ]; then echo "/var/log/syslog"; return; fi
     echo "/var/log/ufw.log"
+}
+
+f2b_auth_log_path(){
+    if [ -f /var/log/auth.log ]; then echo "/var/log/auth.log"; return; fi
+    if [ -f /var/log/secure ]; then echo "/var/log/secure"; return; fi
+    touch /var/log/auth.log 2>/dev/null
+    echo "/var/log/auth.log"
 }
 
 f2b_write_portscan_filter(){
@@ -222,8 +235,9 @@ EOF
 
 f2b_write_config(){
     local ssh_port="$1" ssh_retry="$2" ssh_ban="$3" findtime="$4" scan_retry="$5" scan_ban="$6" enable_web="$7"
-    local ufw_log; ufw_log=$(f2b_log_path)
-    mkdir -p /etc/fail2ban
+    local ufw_log auth_log; ufw_log=$(f2b_log_path); auth_log=$(f2b_auth_log_path)
+    mkdir -p /etc/fail2ban /var/log
+    touch "$ufw_log" /var/log/fail2ban.log 2>/dev/null
     f2b_write_portscan_filter
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -237,7 +251,7 @@ banaction = iptables-multiport
 enabled = true
 port = ${ssh_port}
 filter = sshd
-logpath = /var/log/auth.log
+logpath = ${auth_log}
 maxretry = ${ssh_retry}
 findtime = ${findtime}
 bantime = ${ssh_ban}
@@ -259,6 +273,8 @@ findtime = 86400
 maxretry = 5
 EOF
     if [ "$enable_web" = "y" ]; then
+        mkdir -p /var/log/nginx /var/log/apache2
+        touch /var/log/nginx/error.log /var/log/apache2/error.log 2>/dev/null
         cat >> /etc/fail2ban/jail.local <<'EOF'
 
 [nginx-http-auth]
@@ -273,7 +289,7 @@ bantime = 3600
 enabled = true
 port = http,https
 filter = apache-auth
-logpath = /var/log/apache*/error.log
+logpath = /var/log/apache2/error.log
 maxretry = 5
 bantime = 3600
 EOF
@@ -299,17 +315,47 @@ f2b_install_basic(){
 
     f2b_write_config "$ssh_port" "$ssh_retry" "$ssh_ban" "$findtime" "$scan_retry" "$scan_ban" "$enable_web"
     svc_enable fail2ban
-    svc restart fail2ban || svc start fail2ban
-    ok "Fail2Ban 已配置完成。"
+
+    if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
+        if svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 || svc start fail2ban >/tmp/fail2ban-start.log 2>&1; then
+            sleep 1
+            if fail2ban-client ping >/dev/null 2>&1; then
+                ok "Fail2Ban 已配置并运行。"
+            else
+                warn "配置已写入，但服务未正常响应。请查看：/tmp/fail2ban-start.log"
+                sed -n '1,8p' /tmp/fail2ban-start.log 2>/dev/null
+            fi
+        else
+            err "Fail2Ban 启动失败，下面是中文提示："
+            echo "可能原因：日志文件路径不存在、系统日志服务未写入auth.log、或Fail2Ban动作不兼容。"
+            sed -n '1,12p' /tmp/fail2ban-start.log 2>/dev/null
+        fi
+    else
+        err "Fail2Ban 配置检测失败，已显示前几行错误："
+        sed -n '1,15p' /tmp/fail2ban-check.log 2>/dev/null
+    fi
     warn "端口扫描防护依赖 UFW 日志，请确保 UFW 已启用且 logging on。"
 }
 
 f2b_status(){
     ensure_fail2ban || return
-    fail2ban-client status || return
+    if ! fail2ban-client ping >/dev/null 2>&1; then
+        err "Fail2Ban 服务未运行，无法读取状态。"
+        echo "处理建议："
+        echo "1. 先选择 1 或 3 重新生成基础配置。"
+        echo "2. 如果仍失败，查看日志：/var/log/fail2ban.log"
+        echo "3. 也可以执行：fail2ban-client -t 检查配置。"
+        return
+    fi
+    echo -e "${CYAN}Fail2Ban 总体状态：${NC}"
+    fail2ban-client status
     echo
     for jail in sshd ufw-port-scan recidive nginx-http-auth apache-auth; do
-        fail2ban-client status "$jail" >/dev/null 2>&1 && { echo -e "${CYAN}[$jail]${NC}"; fail2ban-client status "$jail"; echo; }
+        if fail2ban-client status "$jail" >/dev/null 2>&1; then
+            echo -e "${CYAN}防护模块：$jail${NC}"
+            fail2ban-client status "$jail"
+            echo
+        fi
     done
 }
 
@@ -432,6 +478,10 @@ swap_menu(){
     done
 }
 
+human_bytes(){
+    awk -v b="$1" 'BEGIN{split("B KiB MiB GiB TiB",u); i=1; while(b>=1024&&i<5){b/=1024;i++} printf "%.1f%s", b, u[i]}'
+}
+
 sys_info(){
     header; status_bar; line
     echo -e "${BOLD}系统信息${NC}"
@@ -439,12 +489,37 @@ sys_info(){
     echo "系统：$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$(uname -s)}")"
     echo "内核：$(uname -r)"
     echo "时间：$(date '+%F %T')"
-    echo
-    echo -e "${CYAN}内存：${NC}"; free -h
-    echo
-    echo -e "${CYAN}磁盘：${NC}"; df -h | grep -E '^/dev|Filesystem'
-    echo
-    echo -e "${CYAN}监听端口：${NC}"; ss -tlnp 2>/dev/null | head -20 || true
+    echo "运行：$(uptime -p 2>/dev/null || uptime | awk -F, '{print $1}')"
+    line
+
+    echo -e "${CYAN}内存信息${NC}"
+    if [ -r /proc/meminfo ]; then
+        local mt ma st sf mu su
+        mt=$(awk '/MemTotal/ {print $2*1024}' /proc/meminfo)
+        ma=$(awk '/MemAvailable/ {print $2*1024}' /proc/meminfo)
+        st=$(awk '/SwapTotal/ {print $2*1024}' /proc/meminfo)
+        sf=$(awk '/SwapFree/ {print $2*1024}' /proc/meminfo)
+        mu=$((mt-ma)); su=$((st-sf))
+        echo "总内存：$(human_bytes "$mt")"
+        echo "已使用：$(human_bytes "$mu")"
+        echo "可使用：$(human_bytes "$ma")"
+        echo "Swap总量：$(human_bytes "$st")"
+        echo "Swap已用：$(human_bytes "$su")"
+    else
+        free -h
+    fi
+    line
+
+    echo -e "${CYAN}磁盘信息${NC}"
+    df -hP | awk 'NR==1{next} /^\/dev/ {printf "挂载点：%-12s 总量：%-8s 已用：%-8s 可用：%-8s 使用率：%s\n", $6,$2,$3,$4,$5}'
+    line
+
+    echo -e "${CYAN}监听端口${NC}"
+    if cmd_exists ss; then
+        ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); port=a[length(a)]; proc=$0; sub(/^.*users:\(\(/,"",proc); sub(/\)\).*$/,"",proc); if(port!="") printf "端口：%-6s 地址：%-18s 程序：%s\n", port, $4, proc}' | head -20
+    else
+        netstat -tlnp 2>/dev/null | awk 'NR>2 {printf "端口：%-6s 地址：%-18s 程序：%s\n", $4,$4,$7}' | head -20
+    fi
     pause
 }
 
