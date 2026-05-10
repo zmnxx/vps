@@ -238,8 +238,8 @@ restart_f2b() {
 
 install_basics() {
     clear
-    echo -e "${CYAN}--- 一键安装 UFW / Fail2ban ---${NC}"
-    echo -e "${YELLOW}规则：已安装的组件直接跳过；只有首次安装 UFW 时才交互开放 SSH/80/443。${NC}
+    echo -e "${CYAN}--- 基础安装 ---${NC}"
+    echo -e "${YELLOW}已安装则跳过；仅首次安装 UFW 时开放 SSH/80/443。${NC}
 "
 
     local ufw_exists=0
@@ -431,13 +431,13 @@ manage_fail2ban() {
     while true; do
         clear
         echo -e "${PURPLE}=== Fail2ban 安全管理 ===${NC}"
-        echo -e "1. SSH 登录防护配置/更新"
-        echo -e "2. UFW 端口扫描防护配置/更新"
+        echo -e "1. SSH 防护"
+        echo -e "2. 扫描防护"
         echo -e "3. 运行状态概览"
         echo -e "4. 监狱详情查看"
         echo -e "5. 安全日志查看"
         echo -e "6. 一键清除所有封禁 IP"
-        echo -e "7. 配置检测 + 重启修复"
+        echo -e "7. 检测修复"
         echo -e "0. 返回主菜单"
         echo -e "${PURPLE}=========================${NC}"
         read -r -p "请选择: " f2b_choice
@@ -664,7 +664,7 @@ while true; do
     echo -e "${CYAN}==========================================${NC}"
     echo -e "${BLUE}       VPS 一键综合管理脚本 修正版          ${NC}"
     echo -e "${CYAN}==========================================${NC}"
-    echo -e "${YELLOW} 1. 一键安装 UFW / Fail2ban${NC}"
+    echo -e "${YELLOW} 1. 基础安装${NC}"
     echo -e "${YELLOW} 2. UFW 防火墙管理${NC}"
     echo -e "${YELLOW} 3. Fail2ban 安全管理${NC}"
     echo -e "${YELLOW} 4. BBR 加速管理${NC}"
