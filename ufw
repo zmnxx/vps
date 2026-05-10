@@ -2,7 +2,7 @@
 
 # ==========================================
 # VPS 一键管理脚本 (UFW/Fail2ban/BBR/SWAP)
-# 最终纯净版：修复服务启动，深度汉化 UI
+# 稳定兼容版：增强服务稳定性与跨平台适配
 # ==========================================
 
 # 颜色定义
@@ -57,16 +57,40 @@ translate_mem() {
         -e 's/Mem:/内存:/g' -e 's/Swap:/虚拟内存:/g'
 }
 
-# 辅助函数：重启并检查 Fail2ban
+# 辅助函数：深度修复并检查 Fail2ban
 restart_f2b() {
-    echo -e "${CYAN}正在启动/重启 Fail2ban 服务...${NC}"
+    echo -e "${CYAN}正在应用配置并启动 Fail2ban 服务...${NC}"
+    
+    # 基础目录检查
+    mkdir -p /var/run/fail2ban
+    mkdir -p /var/lib/fail2ban
+    
+    # 尝试启动
     systemctl daemon-reload
     systemctl restart fail2ban
-    sleep 2
-    if ! systemctl is-active --quiet fail2ban; then
-        echo -e "${RED}警告：Fail2ban 服务启动失败！正在尝试强制修复...${NC}"
-        mkdir -p /var/run/fail2ban
-        systemctl restart fail2ban
+    
+    # 等待启动完成
+    local retry=0
+    while [ $retry -lt 5 ]; do
+        if systemctl is-active --quiet fail2ban; then
+            echo -e "${GREEN}Fail2ban 服务已成功启动并运行。${NC}"
+            return 0
+        fi
+        sleep 2
+        retry=$((retry+1))
+    done
+
+    # 如果还是失败，尝试通过日志排查并强制前台测试
+    echo -e "${RED}警告：Fail2ban 服务启动缓慢或失败。${NC}"
+    echo -e "${YELLOW}正在尝试强制重置 socket 文件并重启...${NC}"
+    rm -f /var/run/fail2ban/fail2ban.sock
+    systemctl restart fail2ban
+    sleep 3
+    
+    if systemctl is-active --quiet fail2ban; then
+        echo -e "${GREEN}服务已恢复正常。${NC}"
+    else
+        echo -e "${RED}严重错误：无法启动 Fail2ban。建议检查系统日志: journalctl -u fail2ban${NC}"
     fi
 }
 
@@ -74,39 +98,19 @@ restart_f2b() {
 
 install_basics() {
     clear
-    echo -e "${CYAN}--- 基础组件安装检查 ---${NC}"
+    echo -e "${CYAN}--- 核心组件安装/修复 ---${NC}"
     
-    local ufw_installed=0
-    if ! command -v ufw &> /dev/null; then
-        echo -e "${YELLOW}正在安装 UFW...${NC}"
-        $CMD_INSTALL ufw
-    else
-        echo -e "${GREEN}检测到 UFW 已安装${NC}"
-        ufw_installed=1
-    fi
-
-    if ! command -v fail2ban-client &> /dev/null; then
-        echo -e "${YELLOW}正在安装 Fail2ban...${NC}"
-        $CMD_INSTALL fail2ban
-        systemctl enable fail2ban --now
-    else
-        echo -e "${GREEN}检测到 Fail2ban 已安装${NC}"
-    fi
-
-    if [ $ufw_installed -eq 1 ]; then
-        echo -e "\n${YELLOW}是否需要重新初始化防火墙规则？${NC}"
-        read -p "请输入 [y/N]: " reconfig
-        if [[ "$reconfig" != "y" ]]; then
-            echo -e "${GREEN}已跳过。${NC}"
-            pause
-            return
-        fi
-    fi
-
-    echo -e "\n${CYAN}--- 开始初始化规则 ---${NC}"
-    read -p "设置 SSH 端口 [默认 22]: " ssh_port
-    ssh_port=${ssh_port:-22}
+    # 强制重新安装 Fail2ban 确保二进制文件完整
+    echo -e "${YELLOW}正在检查并安装 UFW...${NC}"
+    $CMD_INSTALL ufw
     
+    echo -e "${YELLOW}正在安装/修复 Fail2ban...${NC}"
+    $CMD_INSTALL fail2ban
+    systemctl enable fail2ban --now
+    
+    read -p "设置 SSH 端口 [默认 22]: " ssh_port; ssh_port=${ssh_port:-22}
+    
+    echo -e "${BLUE}初始化防火墙规则...${NC}"
     ufw disable > /dev/null 2>&1
     ufw --force reset > /dev/null 2>&1
     ufw default deny incoming
@@ -117,7 +121,7 @@ install_basics() {
     sed -i 's/IPV6=no/IPV6=yes/' /etc/default/ufw
     
     echo "y" | ufw enable
-    echo -e "${GREEN}初始化完成！已开放 SSH($ssh_port)、80、443。${NC}"
+    echo -e "${GREEN}基础组件已准备就绪。${NC}"
     pause
 }
 
@@ -217,7 +221,12 @@ ignoreregex =
 EOF
                 fi
                 restart_f2b; pause ;;
-            3) fail2ban-client status | translate_f2b; pause ;;
+            3)
+                if ! systemctl is-active --quiet fail2ban; then
+                    echo -e "${RED}Fail2ban 未运行，正在尝试启动...${NC}"
+                    restart_f2b
+                fi
+                fail2ban-client status | translate_f2b; pause ;;
             4)
                 jails=$(fail2ban-client status | grep "Jail list" | cut -d: -f2 | sed 's/,//g')
                 echo -e "\n当前列表："; i=1
@@ -343,7 +352,7 @@ manage_swap() {
 while true; do
     clear
     echo -e "${CYAN}==========================================${NC}"
-    echo -e "${BLUE}       VPS 一键综合管理脚本 (正式版)       ${NC}"
+    echo -e "${BLUE}       VPS 一键综合管理脚本 (兼容版)       ${NC}"
     echo -e "${CYAN}==========================================${NC}"
     echo -e "${YELLOW} 1. 安装/初始化${NC}"
     echo -e "${YELLOW} 2. UFW 防火墙管理${NC}"
