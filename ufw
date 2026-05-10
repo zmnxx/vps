@@ -350,6 +350,14 @@ f2b_auth_log_path(){
 
 f2b_prepare_dirs(){ mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d /var/log; }
 
+f2b_disable_legacy_scan(){
+    f2b_prepare_dirs
+    cat > /etc/fail2ban/jail.d/zz-vps-disable-legacy-scan.local <<'EOF'
+[ufw-scan-lite]
+enabled = false
+EOF
+}
+
 f2b_verify_jail(){
     local jail="$1"
     if fail2ban-client status "$jail" >/dev/null 2>&1; then
@@ -410,6 +418,7 @@ f2b_config_portscan(){
     findtime=$(ask_duration "统计时间，数字默认分钟" "5" "m"); [ -z "$findtime" ] && return
     bantime=$(ask_duration "封禁时间，数字默认小时" "24" "h"); [ -z "$bantime" ] && return
     logpath=$(f2b_log_path)
+    f2b_disable_legacy_scan
     cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
 [Definition]
 failregex = ^.*\[UFW (?:BLOCK|DENY)\].*SRC=<HOST>.*$
@@ -454,6 +463,9 @@ f2b_status(){
             echo "防护项：$name 未启用"
         fi
     done
+    if fail2ban-client status ufw-scan-lite >/dev/null 2>&1; then
+        warn "检测到旧扫描防护 ufw-scan-lite 仍在启用，建议重新配置 UFW端口扫描防护以自动禁用旧项。"
+    fi
 }
 
 f2b_log_summary(){
@@ -506,6 +518,63 @@ f2b_unban(){
     fail2ban-client unban "$ip" 2>/dev/null && ok "已解封：$ip" || err "解封失败或未被封禁"
 }
 
+f2b_config_files(){
+    ensure_fail2ban || return
+    echo -e "${CYAN}Fail2Ban 配置文件管理${NC}"
+    echo "说明：列出常用配置文件，可按编号删除；不做备份。"
+    echo
+    local list_file="/tmp/vps-f2b-files.$$"
+    : > "$list_file"
+    [ -f /etc/fail2ban/jail.local ] && echo "/etc/fail2ban/jail.local" >> "$list_file"
+    find /etc/fail2ban/jail.d -maxdepth 1 -type f \( -name '*.local' -o -name '*.conf' \) 2>/dev/null | sort >> "$list_file"
+
+    if [ ! -s "$list_file" ]; then
+        warn "没有找到可管理的 jail 配置文件。"
+        rm -f "$list_file"
+        return
+    fi
+
+    local i=1
+    while IFS= read -r f; do
+        local state="未知"
+        if grep -qE '^enabled[[:space:]]*=[[:space:]]*true' "$f" 2>/dev/null; then state="启用"; fi
+        if grep -qE '^enabled[[:space:]]*=[[:space:]]*false' "$f" 2>/dev/null; then state="禁用"; fi
+        printf "%2d. %-6s %s\n" "$i" "$state" "$f"
+        i=$((i+1))
+    done < "$list_file"
+
+    echo
+    echo "输入要删除的编号，支持多个：1 3 5 或 1,3,5"
+    echo "输入 0 取消。"
+    local nums
+    read -r -p "删除编号: " nums
+    [ -z "$nums" ] && { rm -f "$list_file"; return; }
+    [ "$nums" = "0" ] && { warn "已取消。"; rm -f "$list_file"; return; }
+
+    echo "$nums" | tr ' ,，;；' '\n' | grep -E '^[0-9]+$' | sort -rn | while read -r n; do
+        local file
+        file=$(sed -n "${n}p" "$list_file")
+        if [ -n "$file" ] && [ -f "$file" ]; then
+            rm -f "$file" && ok "已删除：$file" || err "删除失败：$file"
+        else
+            err "编号无效：$n"
+        fi
+    done
+    rm -f "$list_file"
+
+    echo
+    info "正在检测删除后的 Fail2Ban 配置..."
+    if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
+        ok "配置检测通过。"
+        if ask_yes_no "是否立即重启 Fail2Ban 使删除生效？" "y"; then
+            svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 && ok "Fail2Ban 已重启。" || { err "重启失败："; sed -n '1,8p' /tmp/fail2ban-start.log; }
+        fi
+    else
+        err "配置检测失败，请查看："
+        sed -n '1,12p' /tmp/fail2ban-check.log 2>/dev/null
+    fi
+}
+
 f2b_menu(){
     while true; do
         header; status_bar; line
@@ -516,6 +585,7 @@ f2b_menu(){
         echo "4. 查看状态"
         echo "5. 日志总结"
         echo "6. 解封IP"
+        echo "7. 配置文件管理"
         echo "0. 返回"
         line
         read -r -p "请选择: " c
@@ -526,6 +596,7 @@ f2b_menu(){
             4) f2b_status ;;
             5) f2b_log_summary ;;
             6) f2b_unban ;;
+            7) f2b_config_files ;;
             0) break ;;
             *) err "无效选择" ;;
         esac
