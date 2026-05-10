@@ -2,7 +2,7 @@
 
 # ==========================================
 # VPS 一键管理脚本 (UFW/Fail2ban/BBR/SWAP)
-# 深度定制优化版：增强交互控制与中文显示
+# 深度定制重构版：完善防护逻辑与管理功能
 # ==========================================
 
 # 颜色定义
@@ -29,7 +29,7 @@ fi
 
 # 辅助函数：暂停
 pause() {
-    echo -e "\n${YELLOW}按回车键返回菜单...${NC}"
+    echo -e "\n${YELLOW}按回车键返回...${NC}"
     read
 }
 
@@ -98,7 +98,7 @@ manage_ufw() {
         echo -e "2. 批量添加端口"
         echo -e "3. 批量删除规则"
         echo -e "4. 防火墙开关/重载"
-        echo -e "5. IPv6 开关 [当前: ${CYAN}${ipv6_status}${NC}]"
+        echo -e "5. IPv6 开关 [状态: ${CYAN}${ipv6_status}${NC}]"
         echo -e "0. 返回主菜单"
         echo -e "${PURPLE}======================${NC}"
         read -p "请选择: " ufw_choice
@@ -110,7 +110,7 @@ manage_ufw() {
                 pause
                 ;;
             2)
-                read -p "端口 (如 80 443 或 400:500): " ports
+                read -p "端口 (空格分隔, 如 80 443 8080 或 400:500): " ports
                 read -p "协议 [1.TCP | 2.UDP, 默认TCP]: " p_choice
                 proto="tcp"
                 [[ "$p_choice" == "2" ]] && proto="udp"
@@ -160,61 +160,92 @@ manage_ufw() {
 manage_fail2ban() {
     while true; do
         clear
-        echo -e "${PURPLE}=== Fail2ban 安全管理 ===${NC}"
-        echo -e "1. 基础防护一键设置 (SSH + 扫描)"
-        echo -e "2. 查看当前防护状态"
-        echo -e "3. 监狱详情查看 (选择式)"
-        echo -e "4. 安全日志查看"
-        echo -e "5. 查看/编辑 监狱配置"
+        echo -e "${PURPLE}=== Fail2ban 安全管理 (重构版) ===${NC}"
+        echo -e "1. SSH 登录防护配置"
+        echo -e "2. 端口扫描防护配置"
+        echo -e "3. 运行状态查看"
+        echo -e "4. 监狱详情查看"
+        echo -e "5. 安全日志查看"
         echo -e "6. 一键清除所有封禁 IP"
         echo -e "0. 返回主菜单"
-        echo -e "${PURPLE}=========================${NC}"
+        echo -e "${PURPLE}==================================${NC}"
         read -p "请选择: " f2b_choice
 
         case $f2b_choice in
             1)
-                echo -e "${CYAN}--- 交互式基础防护设置 ---${NC}"
-                read -p "封禁时长 (如 1h, 12h, 1d, 默认 1h): " bantime
-                bantime=${bantime:-1h}
-                read -p "最大重试次数 (默认 5): " maxretry
-                maxretry=${maxretry:-5}
+                echo -e "\n${CYAN}--- SSH 登录防护交互设置 ---${NC}"
+                read -p "设置封禁时长 (如 12h, 1d, 默认 1h): " ssh_bantime
+                ssh_bantime=${ssh_bantime:-1h}
+                read -p "允许最大尝试次数 (默认 5): " ssh_maxretry
+                ssh_maxretry=${ssh_maxretry:-5}
                 
-                cat > /etc/fail2ban/jail.local <<EOF
-[DEFAULT]
-ignoreip = 127.0.0.1/8 ::1
-bantime  = $bantime
-findtime = 10m
-maxretry = $maxretry
-banaction = ufw
-
+                cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = $ssh_maxretry
+bantime = $ssh_bantime
 EOF
                 systemctl restart fail2ban
-                echo -e "${GREEN}配置已更新并生效！${NC}"
-                echo -e "当前策略: 封禁 $bantime, 失败 $maxretry 次封锁 IP。"
+                echo -e "${GREEN}SSH 防护已启用 (封禁: $ssh_bantime, 重试: $ssh_maxretry)${NC}"
                 pause
                 ;;
             2)
-                echo -e "\n${CYAN}运行概览：${NC}"
-                fail2ban-client status | translate_f2b
+                echo -e "\n${CYAN}--- 端口扫描防护交互设置 (基于 UFW) ---${NC}"
+                echo -e "${YELLOW}说明：此功能会封禁频繁尝试连接未开放端口的 IP。${NC}"
+                read -p "设置封禁时长 (如 1d, 7d, 默认 12h): " scan_bantime
+                scan_bantime=${scan_bantime:-12h}
+                read -p "设置封禁阈值 (尝试次数, 默认 10): " scan_maxretry
+                scan_maxretry=${scan_maxretry:-10}
+                
+                # 检查 UFW 日志是否开启
+                ufw logging on > /dev/null
+                
+                cat > /etc/fail2ban/jail.d/portscan.local <<EOF
+[ufw-port-scan]
+enabled = true
+filter = ufw.syslog
+logpath = /var/log/ufw.log
+maxretry = $scan_maxretry
+bantime = $scan_bantime
+banaction = ufw
+EOF
+                # 确保过滤器存在
+                if [ ! -f /etc/fail2ban/filter.d/ufw.syslog.conf ]; then
+                    cat > /etc/fail2ban/filter.d/ufw.syslog.conf <<EOF
+[Definition]
+failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
+ignoreregex = 
+EOF
+                fi
+                
+                systemctl restart fail2ban
+                echo -e "${GREEN}端口扫描防护已启用 (封禁: $scan_bantime, 阈值: $scan_maxretry)${NC}"
                 pause
                 ;;
             3)
+                echo -e "\n${CYAN}当前运行概览：${NC}"
+                fail2ban-client status | translate_f2b
+                pause
+                ;;
+            4)
                 jails=$(fail2ban-client status | grep "Jail list" | cut -d: -f2 | sed 's/,//g')
                 if [ -z "$jails" ]; then
                     echo -e "${RED}未检测到已运行的监狱。${NC}"
                 else
-                    echo -e "\n${CYAN}请选择要查看的监狱编号：${NC}"
+                    echo -e "\n${CYAN}当前监狱列表：${NC}"
                     i=1
                     for j in $jails; do
                         echo "$i. $j"
                         eval jail_$i=$j
                         i=$((i+1))
                     done
-                    read -p "请输入数字: " j_idx
+                    read -p "请输入要查看的编号: " j_idx
                     target_jail=$(eval echo \$jail_$j_idx)
                     if [ -n "$target_jail" ]; then
+                        echo -e "\n${CYAN}--- $target_jail 详情 ---${NC}"
                         fail2ban-client status $target_jail | translate_f2b
                     else
                         echo -e "${RED}选择无效。${NC}"
@@ -222,25 +253,9 @@ EOF
                 fi
                 pause
                 ;;
-            4)
+            5)
                 echo -e "\n${CYAN}最近 15 条安全日志：${NC}"
                 tail -n 15 /var/log/fail2ban.log | translate_f2b
-                pause
-                ;;
-            5)
-                echo -e "\n${CYAN}当前生效的配置文件内容 (/etc/fail2ban/jail.local):${NC}"
-                if [ -f /etc/fail2ban/jail.local ]; then
-                    cat /etc/fail2ban/jail.local
-                else
-                    echo -e "${YELLOW}未发现自定义 jail.local 配置文件。${NC}"
-                fi
-                echo -e "\n${YELLOW}是否进入编辑模式? [y/n] (需要手动保存): ${NC}"
-                read edit_choice
-                if [[ "$edit_choice" == "y" ]]; then
-                    vi /etc/fail2ban/jail.local
-                    systemctl restart fail2ban
-                    echo -e "${GREEN}配置已重载。${NC}"
-                fi
                 pause
                 ;;
             6)
@@ -306,69 +321,83 @@ EOF
 # ================= SWAP 管理 =================
 
 manage_swap() {
-    clear
-    echo -e "${PURPLE}=== SWAP 虚拟内存管理 ===${NC}"
-    
-    # 获取当前虚拟内存参数
-    local current_swappiness=$(cat /proc/sys/vm/swappiness)
-    echo -e "当前内核调度积极性 (Swappiness): ${CYAN}${current_swappiness}${NC} (0-100)"
-
-    if [ -f /swapfile ]; then
-        echo -e "${YELLOW}检测到 SWAP 已存在${NC}"
-        read -p "重置旧文件? [y/n]: " del_swap
-        if [[ $del_swap == "y" ]]; then
-            swapoff /swapfile 2>/dev/null
-            rm -f /swapfile
-            sed -i '/\/swapfile/d' /etc/fstab
-        else
-            return
-        fi
-    fi
-
-    # 1. 交互式设置大小
     while true; do
-        read -p "请输入大小 (支持 512M, 1G, 2G 等格式): " raw_size
-        # 转换逻辑
-        if [[ "$raw_size" =~ ^([0-9]+)([gG])$ ]]; then
-            swap_size=$((${BASH_REMATCH[1]} * 1024))
-            break
-        elif [[ "$raw_size" =~ ^([0-9]+)([mM])$ ]]; then
-            swap_size=${BASH_REMATCH[1]}
-            break
-        elif [[ "$raw_size" =~ ^([0-9]+)$ ]]; then
-            swap_size=$raw_size
-            break
-        else
-            echo -e "${RED}输入格式错误！例如: 1G 或 1024${NC}"
-        fi
+        clear
+        local swp_active=$(free | grep Swap | awk '{print $2}')
+        local current_swappiness=$(cat /proc/sys/vm/swappiness)
+        echo -e "${PURPLE}=== SWAP 虚拟内存管理 ===${NC}"
+        echo -e "当前状态：$( [ $swp_active -gt 0 ] && echo -e "${GREEN}已开启${NC}" || echo -e "${RED}未开启${NC}" )"
+        echo -e "当前调度积极性 (Swappiness): ${CYAN}${current_swappiness}${NC}"
+        echo -e "-------------------------"
+        echo -e "1. 创建/重置 SWAP"
+        echo -e "2. 查看当前详细配置"
+        echo -e "3. 删除 SWAP 配置"
+        echo -e "0. 返回主菜单"
+        echo -e "${PURPLE}=========================${NC}"
+        read -p "请选择: " swap_choice
+
+        case $swap_choice in
+            1)
+                if [ -f /swapfile ]; then
+                    echo -e "${YELLOW}检测到旧文件，正在清理...${NC}"
+                    swapoff /swapfile 2>/dev/null
+                    rm -f /swapfile
+                    sed -i '/\/swapfile/d' /etc/fstab
+                fi
+                
+                read -p "请输入大小 (如 1G, 2G, 1024M): " raw_size
+                if [[ "$raw_size" =~ ^([0-9]+)([gG])$ ]]; then
+                    swap_size=$((${BASH_REMATCH[1]} * 1024))
+                elif [[ "$raw_size" =~ ^([0-9]+)([mM])$ ]]; then
+                    swap_size=${BASH_REMATCH[1]}
+                else
+                    swap_size=${raw_size:-1024}
+                fi
+
+                read -p "设置调度积极性 [0-100, 默认 60]: " swp_val
+                swp_val=${swp_val:-60}
+
+                echo -e "${CYAN}正在生成 ${swap_size}MB SWAP 文件...${NC}"
+                if command -v fallocate &> /dev/null; then
+                    fallocate -l ${swap_size}M /swapfile
+                else
+                    dd if=/dev/zero of=/swapfile bs=1M count=$swap_size status=progress
+                fi
+                chmod 600 /swapfile
+                mkswap /swapfile > /dev/null
+                swapon /swapfile
+                echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+                
+                sed -i '/vm.swappiness/d' /etc/sysctl.conf
+                echo "vm.swappiness=$swp_val" >> /etc/sysctl.conf
+                sysctl -p > /dev/null
+                echo -e "${GREEN}SWAP 设置成功！${NC}"
+                pause
+                ;;
+            2)
+                echo -e "\n${CYAN}--- 内存使用详情 ---${NC}"
+                free -h
+                echo -e "\n${CYAN}--- 挂载详情 ---${NC}"
+                swapon --show
+                echo -e "\n${CYAN}--- 调度积极性 ---${NC}"
+                echo "vm.swappiness = $(cat /proc/sys/vm/swappiness)"
+                pause
+                ;;
+            3)
+                echo -e "${YELLOW}确定要彻底删除 SWAP 配置吗? [y/n]${NC}"
+                read del_confirm
+                if [[ "$del_confirm" == "y" ]]; then
+                    swapoff /swapfile 2>/dev/null
+                    rm -f /swapfile
+                    sed -i '/\/swapfile/d' /etc/fstab
+                    sed -i '/vm.swappiness/d' /etc/sysctl.conf
+                    echo -e "${GREEN}SWAP 已彻底移除并恢复系统默认参数。${NC}"
+                fi
+                pause
+                ;;
+            0) break ;;
+        esac
     done
-
-    # 2. 交互式设置积极性
-    read -p "设置调度积极性 [0-100, 建议 10-60, 默认 60]: " swp_val
-    swp_val=${swp_val:-60}
-
-    echo -e "${CYAN}正在生成 ${swap_size}MB SWAP 文件...${NC}"
-    if command -v fallocate &> /dev/null; then
-        fallocate -l ${swap_size}M /swapfile
-    else
-        dd if=/dev/zero of=/swapfile bs=1M count=$swap_size status=progress
-    fi
-    
-    chmod 600 /swapfile
-    mkswap /swapfile > /dev/null
-    swapon /swapfile
-    echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-    
-    # 设置积极性
-    sed -i '/vm.swappiness/d' /etc/sysctl.conf
-    echo "vm.swappiness=$swp_val" >> /etc/sysctl.conf
-    sysctl -p > /dev/null
-    
-    echo -e "${GREEN}SWAP 及内核参数设置成功！${NC}"
-    echo -e "当前状态："
-    free -h
-    echo -e "当前 Swappiness: $(cat /proc/sys/vm/swappiness)"
-    pause
 }
 
 # ================= 主菜单 =================
@@ -376,7 +405,7 @@ manage_swap() {
 while true; do
     clear
     echo -e "${CYAN}==========================================${NC}"
-    echo -e "${BLUE}       VPS 一键综合管理脚本 (深度定制)       ${NC}"
+    echo -e "${BLUE}       VPS 一键综合管理脚本 (重构版)       ${NC}"
     echo -e "${CYAN}==========================================${NC}"
     echo -e "${YELLOW} 1. 安装/初始化${NC}"
     echo -e "${YELLOW} 2. UFW 防火墙管理${NC}"
