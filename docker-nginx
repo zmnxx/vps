@@ -850,6 +850,248 @@ EOF
   fi
 }
 
+# =============================================
+# 定时清理任务
+# =============================================
+
+# 安装清理脚本
+install_cleanup_script(){
+  local script_path="/usr/local/bin/docker-cleanup.sh"
+  
+  cat > "$script_path" << 'EOFSCRIPT'
+#!/bin/bash
+# Docker 自动清理脚本
+# 由 Docker Nginx 工具箱生成
+
+DATE=$(date '+%Y-%m-%d %H:%M:%S')
+LOG_FILE="/var/log/docker-cleanup.log"
+
+log(){
+  echo "[$DATE] $1" >> "$LOG_FILE"
+}
+
+log "开始清理任务..."
+
+# 清理容器日志（保留最近7天）
+if [ -d /var/lib/docker/containers ]; then
+  for container_dir in /var/lib/docker/containers/*/; do
+    log_file="${container_dir}*-json.log"
+    if [ -f "$log_file" ]; then
+      find "$container_dir" -name "*.log" -type f -mtime +7 -delete 2>/dev/null
+    fi
+  done
+  log "清理7天前的日志完成"
+fi
+
+# 清理未使用的镜像
+docker image prune -f >> "$LOG_FILE" 2>&1
+
+# 清理构建缓存（每周执行一次）
+if [ "$(date '+%u')" = "1" ]; then
+  docker builder prune -f >> "$LOG_FILE" 2>&1
+  log "清理构建缓存完成"
+fi
+
+# 清理停止的容器
+docker container prune -f >> "$LOG_FILE" 2>&1
+
+# 清理未使用的网络
+docker network prune -f >> "$LOG_FILE" 2>&1
+
+log "清理任务完成"
+EOFSCRIPT
+  
+  chmod +x "$script_path"
+  echo "$script_path"
+}
+
+# 配置定时任务
+setup_auto_cleanup(){
+  echo
+  echo "============================================"
+  echo "⏰ 定时清理任务"
+  echo "============================================"
+  echo
+  echo "定时任务将自动执行以下清理："
+  echo "  - 清理 7 天前的容器日志"
+  echo "  - 清理未使用的镜像"
+  echo "  - 每周一清理构建缓存"
+  echo "  - 清理停止的容器"
+  echo "  - 清理未使用的网络"
+  echo
+  echo "清理日志保存在：/var/log/docker-cleanup.log"
+  echo
+  
+  echo "选择执行频率："
+  echo "  1) 每天凌晨 3 点（推荐）"
+  echo "  2) 每周一凌晨 3 点"
+  echo "  3) 每月 1 号凌晨 3 点"
+  echo "  0) 返回"
+  echo
+  
+  local choice
+  read -rp "选择 [1]: " choice
+  choice="${choice:-1}"
+  
+  case "$choice" in
+    1) local cron_time="0 3 * * *"; local desc="每天凌晨3点" ;;
+    2) local cron_time="0 3 * * 1"; local desc="每周一凌晨3点" ;;
+    3) local cron_time="0 3 1 * *"; local desc="每月1号凌晨3点" ;;
+    0) return 0 ;;
+    *) warn "无效选择"; return 1 ;;
+  esac
+  
+  echo
+  info "将设置定时任务：$desc"
+  
+  # 创建清理脚本
+  local script_path
+  script_path=$(install_cleanup_script)
+  
+  # 检查是否已有定时任务
+  if crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"; then
+    echo
+    warn "已存在定时清理任务"
+    if ! ask_yn "是否覆盖？"; then
+      info "已取消"
+      return 0
+    fi
+    # 删除旧的
+    (crontab -l 2>/dev/null | grep -v "docker-cleanup.sh"; echo "$cron_time $script_path") | crontab -
+  else
+    # 添加新的
+    (crontab -l 2>/dev/null; echo "$cron_time $script_path") | crontab -
+  fi
+  
+  echo
+  log "定时清理任务已设置：$desc"
+  info "清理日志：/var/log/docker-cleanup.log"
+  echo
+  
+  # 询问是否立即执行一次
+  if ask_yn "是否立即执行一次清理？"; then
+    info "正在执行清理..."
+    bash "$script_path"
+    log "手动清理完成"
+  fi
+}
+
+# 查看定时任务
+list_auto_cleanup(){
+  echo
+  echo "============================================"
+  echo "⏰ 定时清理任务"
+  echo "============================================"
+  echo
+  
+  local cron_job
+  cron_job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh")
+  
+  if [ -z "$cron_job" ]; then
+    echo "  未设置定时清理任务"
+    echo
+    echo "  运行 '定时清理' 功能来设置"
+  else
+    echo "  ✓ 定时清理任务已启用"
+    echo "  命令：$cron_job"
+    echo
+    echo "  清理日志：/var/log/docker-cleanup.log"
+    echo
+    echo "  最近清理记录："
+    tail -5 /var/log/docker-cleanup.log 2>/dev/null || echo "  暂无记录"
+  fi
+}
+
+# 删除定时任务
+remove_auto_cleanup(){
+  echo
+  echo "============================================"
+  echo "⏰ 删除定时清理任务"
+  echo "============================================"
+  echo
+  
+  if ! crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"; then
+    warn "没有找到定时清理任务"
+    return 0
+  fi
+  
+  info "当前定时任务："
+  crontab -l 2>/dev/null | grep "docker-cleanup.sh"
+  echo
+  
+  if ! ask_yn "确认删除定时任务？"; then
+    info "已取消"
+    return 0
+  fi
+  
+  # 删除 cron 任务
+  crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -
+  
+  log "定时清理任务已删除"
+  info "清理脚本保留在 /usr/local/bin/docker-cleanup.sh"
+  info "如需删除脚本，执行：rm /usr/local/bin/docker-cleanup.sh"
+}
+
+# 手动执行清理
+run_cleanup_now(){
+  local script_path="/usr/local/bin/docker-cleanup.sh"
+  
+  if [ ! -f "$script_path" ]; then
+    script_path=$(install_cleanup_script)
+  fi
+  
+  echo
+  info "正在执行清理..."
+  echo
+  
+  echo "1) 清理所有日志"
+  echo "2) 清理无用镜像"
+  echo "3) 清理构建缓存"
+  echo "4) 一键全部清理"
+  echo "0) 取消"
+  echo
+  
+  local choice
+  read -rp "选择 [4]: " choice
+  choice="${choice:-4}"
+  
+  case "$choice" in
+    1)
+      info "清理所有容器日志..."
+      local count=0
+      for cid in $(docker ps -aq); do
+        local lp
+        lp=$(docker inspect --format '{{.LogPath}}' "$cid" 2>/dev/null)
+        [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
+      done
+      log "已清空 $count 个容器的日志"
+      ;;
+    2)
+      info "清理无用镜像..."
+      docker image prune -a
+      ;;
+    3)
+      info "清理构建缓存..."
+      docker builder prune -a
+      ;;
+    4)
+      info "一键清理..."
+      docker system prune -a --volumes
+      ;;
+    0)
+      info "已取消"
+      return 0
+      ;;
+    *)
+      warn "无效选择"
+      return 1
+      ;;
+  esac
+  
+  echo
+  log "清理完成"
+}
+
 # Docker 主菜单
 docker_menu(){
   while true; do
@@ -862,7 +1104,8 @@ docker_menu(){
     echo "  3) 📜 日志管理"
     echo "  4) 🧹 空间清理"
     echo "  5) ⚙️  日志全局限制"
-    echo "  6) 🔄 更新项目"
+    echo "  6) ⏰ 定时清理任务"
+    echo "  7) 🔄 更新项目"
     echo "  0) 返回"
     echo
     
@@ -904,7 +1147,8 @@ docker_menu(){
       3) log_menu ;;
       4) cleanup_menu ;;
       5) config_log_rotation; pause ;;
-      6) update_project; pause ;;
+      6) setup_auto_cleanup; pause ;;
+      7) update_project; pause ;;
       0) return ;;
       "") continue ;;
       *) warn "无效选择" ;;
