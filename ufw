@@ -11,108 +11,115 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-NC='\033[0m' # 无颜色
+NC='\033[0m'
 
 # 检查 Root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${NC}" && exit 1
 
-# 操作系统检测 (简单适配 Debian/Ubuntu)
+# 包管理器检测
 CMD_INSTALL=""
 if [ -x "$(command -v apt-get)" ]; then
     CMD_INSTALL="apt-get install -y"
-    apt-get update -qq
 elif [ -x "$(command -v yum)" ]; then
     CMD_INSTALL="yum install -y"
 elif [ -x "$(command -v dnf)" ]; then
     CMD_INSTALL="dnf install -y"
-else
-    echo -e "${RED}错误: 未能识别的包管理器，仅支持 apt/yum/dnf${NC}"
-    exit 1
 fi
 
-# ================= 基础功能 =================
+# 辅助函数：暂停并按回车继续
+pause() {
+    echo -e "\n${YELLOW}按回车键返回菜单...${NC}"
+    read
+}
 
-# 安装基础组件
+# ================= 基础安装 =================
+
 install_basics() {
-    echo -e "${CYAN}正在检查并安装 UFW 和 Fail2ban...${NC}"
+    clear
+    echo -e "${CYAN}--- 正在安装 UFW 和 Fail2ban ---${NC}"
     
-    # 安装 UFW
+    # UFW
     if ! command -v ufw &> /dev/null; then
-        echo -e "${YELLOW}安装 UFW...${NC}"
+        echo -e "${YELLOW}正在安装 UFW...${NC}"
         $CMD_INSTALL ufw
     else
-        echo -e "${GREEN}UFW 已安装，跳过。${NC}"
+        echo -e "${GREEN}UFW 已安装。${NC}"
     fi
 
-    # 安装 Fail2ban
+    # Fail2ban
     if ! command -v fail2ban-client &> /dev/null; then
-        echo -e "${YELLOW}安装 Fail2ban...${NC}"
+        echo -e "${YELLOW}正在安装 Fail2ban...${NC}"
         $CMD_INSTALL fail2ban
-        systemctl enable fail2ban
-        systemctl start fail2ban
+        systemctl enable fail2ban --now
     else
-        echo -e "${GREEN}Fail2ban 已安装，跳过。${NC}"
+        echo -e "${GREEN}Fail2ban 已安装。${NC}"
     fi
 
-    # 交互式设置 SSH 端口
-    read -p "请输入您的 SSH 端口 [默认 22]: " ssh_port
+    read -p "设置 SSH 端口 [默认 22]: " ssh_port
     ssh_port=${ssh_port:-22}
     
-    echo -e "${BLUE}配置防火墙规则...${NC}"
+    echo -e "${BLUE}初始化规则...${NC}"
+    ufw disable > /dev/null 2>&1
     ufw default deny incoming
     ufw default allow outgoing
     ufw allow $ssh_port/tcp
     ufw allow 80/tcp
     ufw allow 443/tcp
     
-    echo -e "${YELLOW}正在启用 UFW...${NC}"
     echo "y" | ufw enable
-    echo -e "${GREEN}初始化成功！当前 SSH 端口: $ssh_port, 已开放 80/443。${NC}"
+    echo -e "${GREEN}安装完成！当前 SSH 端口: $ssh_port，已开放 80/443。${NC}"
+    pause
 }
 
 # ================= UFW 管理 =================
 
 manage_ufw() {
     while true; do
-        echo -e "\n${PURPLE}--- UFW 防火墙管理 ---${NC}"
-        echo -e "1. 查看当前规则 (带编号)"
+        clear
+        echo -e "${PURPLE}=== UFW 防火墙管理 ===${NC}"
+        echo -e "1. 查看当前规则"
         echo -e "2. 批量添加端口"
-        echo -e "3. 批量删除规则 (按编号)"
-        echo -e "4. 开启/关闭/重载 UFW"
+        echo -e "3. 批量删除规则"
+        echo -e "4. 开启防火墙"
+        echo -e "5. 关闭防火墙"
+        echo -e "6. 重载防火墙"
         echo -e "0. 返回主菜单"
-        read -p "请选择 [0-4]: " ufw_choice
+        echo -e "${PURPLE}======================${NC}"
+        read -p "选择操作: " ufw_choice
 
         case $ufw_choice in
-            1) ufw status numbered ;;
+            1)
+                echo -e "\n${CYAN}当前防火墙规则列表：${NC}"
+                ufw status numbered
+                pause
+                ;;
             2)
-                read -p "请输入要开放的端口 (空格分隔, 支持范围如 400:500): " ports
-                read -p "协议 [tcp/udp, 默认 tcp]: " proto
-                proto=${proto:-tcp}
+                read -p "输入端口 (例如: 80 443 8080 或 400:500): " ports
+                read -p "选择协议 [1. TCP (默认) | 2. UDP]: " p_choice
+                proto="tcp"
+                [[ "$p_choice" == "2" ]] && proto="udp"
+                
                 for p in $ports; do
                     ufw allow $p/$proto
-                    echo -e "${GREEN}已允许 $p/$proto${NC}"
+                    echo -e "${GREEN}已添加规则: $p/$proto${NC}"
                 done
+                pause
                 ;;
             3)
                 ufw status numbered
-                echo -e "${YELLOW}提示: 删除多个规则时，建议从大到小输入编号 (例如: 10 8 7)，以免编号移位。${NC}"
-                read -p "请输入要删除的规则编号 (空格分隔): " ids
-                # 将编号按降序排序，防止删除前面导致后面编号变化
+                echo -e "\n${YELLOW}提示: 删除多个规则时，请从大到小输入编号 (例如: 10 8 7)。${NC}"
+                read -p "请输入要删除的编号 (空格分隔): " ids
                 sorted_ids=$(echo $ids | tr ' ' '\n' | sort -rn)
                 for id in $sorted_ids; do
                     echo "y" | ufw delete $id
                 done
-                echo -e "${GREEN}批量删除完成。${NC}"
+                echo -e "${GREEN}删除操作完成。${NC}"
+                pause
                 ;;
-            4)
-                echo -e "1. 开启 | 2. 关闭 | 3. 重载"
-                read -p "选择操作: " op
-                [[ $op == "1" ]] && ufw enable
-                [[ $op == "2" ]] && ufw disable
-                [[ $op == "3" ]] && ufw reload
-                ;;
+            4) ufw enable && pause ;;
+            5) ufw disable && pause ;;
+            6) ufw reload && pause ;;
             0) break ;;
-            *) echo -e "${RED}无效输入${NC}" ;;
         esac
     done
 }
@@ -121,19 +128,23 @@ manage_ufw() {
 
 manage_fail2ban() {
     while true; do
-        echo -e "\n${PURPLE}--- Fail2ban 防护管理 ---${NC}"
-        echo -e "1. 基础 SSH 防护设置 (默认配置)"
-        echo -e "2. 整体防护配置 (扫描封禁)"
-        echo -e "3. 查看封禁状态 (Jails)"
+        clear
+        echo -e "${PURPLE}=== Fail2ban 防护管理 ===${NC}"
+        echo -e "1. 开启基础 SSH 防护"
+        echo -e "2. 开启全局扫描封禁"
+        echo -e "3. 查看当前封禁状态"
         echo -e "4. 查看 SSH 封禁详情"
+        echo -e "5. 查看最近封禁日志"
+        echo -e "6. 清除所有封禁记录"
         echo -e "0. 返回主菜单"
-        read -p "请选择 [0-4]: " f2b_choice
+        echo -e "${PURPLE}=========================${NC}"
+        read -p "选择操作: " f2b_choice
 
         case $f2b_choice in
             1)
-                read -p "设置 SSH 封禁时长 (秒) [默认 3600]: " bantime
+                read -p "设置封禁时长 (秒) [默认 3600]: " bantime
                 bantime=${bantime:-3600}
-                read -p "设置最大尝试次数 [默认 5]: " maxretry
+                read -p "最大尝试次数 [默认 5]: " maxretry
                 maxretry=${maxretry:-5}
                 
                 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
@@ -146,11 +157,10 @@ maxretry = $maxretry
 bantime = $bantime
 EOF
                 systemctl restart fail2ban
-                echo -e "${GREEN}SSH 防护已更新。${NC}"
+                echo -e "${GREEN}SSH 防护配置成功！${NC}"
+                pause
                 ;;
             2)
-                echo -e "${BLUE}应用全局基础防护配置...${NC}"
-                # 创建全局配置
                 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
@@ -163,37 +173,61 @@ banaction = ufw
 enabled = true
 EOF
                 systemctl restart fail2ban
-                echo -e "${GREEN}全局防护已启用 (1小时封禁, 10分钟内5次尝试)。${NC}"
+                echo -e "${GREEN}全局防护配置成功 (1小时封禁, 10分钟内5次尝试)。${NC}"
+                pause
                 ;;
-            3) fail2ban-client status ;;
-            4) fail2ban-client status sshd ;;
+            3)
+                echo -e "\n${CYAN}当前运行中的 Jail 列表：${NC}"
+                fail2ban-client status
+                pause
+                ;;
+            4)
+                echo -e "\n${CYAN}SSH 封禁详情：${NC}"
+                fail2ban-client status sshd
+                pause
+                ;;
+            5)
+                echo -e "\n${CYAN}最近 20 条 Fail2ban 日志：${NC}"
+                tail -n 20 /var/log/fail2ban.log
+                pause
+                ;;
+            6)
+                fail2ban-client unban --all
+                echo -e "${GREEN}已解除所有封禁记录。${NC}"
+                pause
+                ;;
             0) break ;;
         esac
     done
 }
 
-# ================= BBR 管理 =================
+# ================= BBR 加速管理 =================
 
 manage_bbr() {
-    echo -e "\n${PURPLE}--- BBR 加速管理 ---${NC}"
-    echo -e "1. 开启标准 BBR (内核自带)"
-    echo -e "2. 开启魔改版 BBR 优化参数 (sysctl 调优)"
-    echo -e "3. 查看当前加速状态"
-    echo -e "0. 返回主菜单"
-    read -p "请选择 [0-3]: " bbr_choice
+    while true; do
+        clear
+        echo -e "${PURPLE}=== BBR 加速管理 ===${NC}"
+        echo -e "1. 开启标准 BBR (内核自带)"
+        echo -e "2. 开启魔改版优化参数"
+        echo -e "3. 查看当前加速状态"
+        echo -e "0. 返回主菜单"
+        echo -e "${PURPLE}====================${NC}"
+        read -p "选择操作: " bbr_choice
 
-    case $bbr_choice in
-        1)
-            sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-            sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-            echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-            echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-            sysctl -p
-            echo -e "${GREEN}标准 BBR 已开启！${NC}"
-            ;;
-        2)
-            # 魔改版通常涉及更激进的内核参数
-            cat >> /etc/sysctl.conf <<EOF
+        case $bbr_choice in
+            1)
+                sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+                sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+                echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+                echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+                sysctl -p
+                echo -e "${GREEN}标准 BBR 已成功开启！${NC}"
+                pause
+                ;;
+            2)
+                sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+                sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+                cat >> /etc/sysctl.conf <<EOF
 # BBR Optimization
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -211,26 +245,32 @@ net.ipv4.tcp_adv_win_scale=1
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
 EOF
-            sysctl -p
-            echo -e "${GREEN}魔改优化参数应用成功！${NC}"
-            ;;
-        3)
-            lsmod | grep bbr
-            sysctl net.ipv4.tcp_congestion_control
-            ;;
-        0) return ;;
-    esac
+                sysctl -p
+                echo -e "${GREEN}魔改优化参数应用成功！${NC}"
+                pause
+                ;;
+            3)
+                echo -e "\n${CYAN}BBR 状态：${NC}"
+                lsmod | grep bbr || echo -e "${RED}未检测到 BBR 模块加载${NC}"
+                echo -n "拥塞控制算法: "
+                sysctl net.ipv4.tcp_congestion_control
+                pause
+                ;;
+            0) break ;;
+        esac
+    done
 }
 
 # ================= SWAP 管理 =================
 
 manage_swap() {
-    echo -e "\n${PURPLE}--- SWAP 虚拟内存管理 ---${NC}"
+    clear
+    echo -e "${PURPLE}=== SWAP 虚拟内存管理 ===${NC}"
     if [ -f /swapfile ]; then
-        echo -e "${YELLOW}检测到已存在 /swapfile${NC}"
-        read -p "是否删除旧 SWAP 重新创建? [y/n]: " del_swap
+        echo -e "${YELLOW}检测到已存在 SWAP 文件。${NC}"
+        read -p "是否重建? [y/n]: " del_swap
         if [[ $del_swap == "y" ]]; then
-            swapoff /swapfile
+            swapoff /swapfile 2>/dev/null
             rm -f /swapfile
             sed -i '/\/swapfile/d' /etc/fstab
         else
@@ -238,7 +278,7 @@ manage_swap() {
         fi
     fi
 
-    read -p "请输入 SWAP 大小 (单位 MB, 建议内存的 1-2 倍): " swap_size
+    read -p "设置 SWAP 大小 (单位 MB): " swap_size
     echo -e "${CYAN}正在创建 ${swap_size}MB SWAP 文件...${NC}"
     
     dd if=/dev/zero of=/swapfile bs=1M count=$swap_size
@@ -247,25 +287,26 @@ manage_swap() {
     swapon /swapfile
     echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
     
-    echo -e "${GREEN}SWAP 设置成功！${NC}"
-    free -m
+    echo -e "${GREEN}SWAP 设置成功！当前内存状态：${NC}"
+    free -h
+    pause
 }
 
-# ================= 主菜单 =================
+# ================= 主界面 =================
 
-main_menu() {
+while true; do
     clear
     echo -e "${CYAN}==========================================${NC}"
-    echo -e "${BLUE}       VPS 一键综合管理脚本 (中文版)       ${NC}"
+    echo -e "${BLUE}       VPS 一键综合管理脚本 (优化版)       ${NC}"
     echo -e "${CYAN}==========================================${NC}"
     echo -e "${YELLOW} 1. 安装/初始化 (UFW + Fail2ban)${NC}"
-    echo -e "${YELLOW} 2. UFW 防火墙管理 (批量端口/删除)${NC}"
-    echo -e "${YELLOW} 3. Fail2ban 防护管理 (SSH/基础防护)${NC}"
-    echo -e "${YELLOW} 4. BBR 加速开启 (标准/魔改)${NC}"
+    echo -e "${YELLOW} 2. UFW 防火墙管理${NC}"
+    echo -e "${YELLOW} 3. Fail2ban 防护管理${NC}"
+    echo -e "${YELLOW} 4. BBR 加速开启${NC}"
     echo -e "${YELLOW} 5. SWAP 虚拟内存管理${NC}"
     echo -e "${RED} 0. 退出脚本${NC}"
     echo -e "${CYAN}==========================================${NC}"
-    read -p "请输入选项 [0-5]: " main_choice
+    read -p "请选择: " main_choice
 
     case $main_choice in
         1) install_basics ;;
@@ -274,11 +315,6 @@ main_menu() {
         4) manage_bbr ;;
         5) manage_swap ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${NC}" && sleep 1 ;;
+        *) echo -e "${RED}无效选项${NC}" && sleep 1 ;;
     esac
-}
-
-# 循环运行主菜单
-while true; do
-    main_menu
 done
