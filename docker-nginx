@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v22
-# 优化：删除项目目录、空输入返回、证书编号删除、全局默认提示
+# Docker + Nginx + HTTPS 工具箱 v23
+# 优化：精简提示、全局默认值提示、空输入返回
 # ============================================================
 
 set -o pipefail
@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v22"
+VERSION="v23"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -81,13 +81,13 @@ ask_yn(){
   local q="$1" d="${2:-y}" a prompt
   while true; do
     if [ "$d" = "y" ]; then
-      prompt="[Y/n]"
+      prompt="[Y/n 默认Y]"
     else
-      prompt="[y/N]"
+      prompt="[y/N 默认N]"
     fi
     read -rp "  $q $prompt: " a
     [ -z "$a" ] && a="$d"
-    case "$a" in y|Y) return 0 ;; n|N) return 1 ;; *) warn "请输入 y 或 n，直接回车使用默认值" ;; esac
+    case "$a" in y|Y) return 0 ;; n|N) return 1 ;; *) warn "请输入 y 或 n" ;; esac
   done
 }
 
@@ -224,12 +224,12 @@ create_docker_project(){
   echo
   
   local name
-  read -rp "  项目名称（留空返回）: " name
+  read -rp "  项目名称: " name
   [ -z "$name" ] && { info "已取消创建项目"; return 0; }
   
   while ! safe_name "$name"; do
     err "只能用字母、数字、横杠、下划线"
-    read -rp "  项目名称（留空返回）: " name
+    read -rp "  项目名称: " name
     [ -z "$name" ] && { info "已取消创建项目"; return 0; }
   done
   
@@ -254,7 +254,7 @@ create_docker_project(){
   echo "    [2] 空模板（完全空白）"
   echo
   local t
-  read -rp "  请选择 [1，回车默认]: " t
+  read -rp "  请选择 [1]: " t
   [ -z "$t" ] && t="1"
   
   if [ "$t" = "2" ]; then
@@ -320,7 +320,7 @@ restart_project(){
   echo "    [2] 仅重启容器（不改配置）"
   echo
   local t
-  read -rp "  请选择 [1，回车默认]: " t
+  read -rp "  请选择 [1]: " t
   [ -z "$t" ] && t="1"
   
   if [ "$t" = "1" ]; then
@@ -644,28 +644,26 @@ create_nginx_proxy(){
     read -rp "  配置名称 [$default_name]: " name
     [ -z "$name" ] && name="$default_name"
   else
-    read -rp "  配置名称（如 myapp）: " name
-  fi
-  while [ -z "$name" ]; do
-    err "名称不能为空"
     read -rp "  配置名称: " name
-  done
+    [ -z "$name" ] && { info "已取消"; return 0; }
+  fi
   
   while ! safe_name "$name"; do
     err "只能用字母、数字、横杠、下划线"
     read -rp "  配置名称: " name
-    [ -z "$name" ] && return 0
+    [ -z "$name" ] && { info "已取消"; return 0; }
   done
   
   read -rp "  域名: " domain
+  [ -z "$domain" ] && { info "已取消"; return 0; }
   while ! valid_domain "$domain"; do
     err "域名格式不正确"
     read -rp "  域名: " domain
-    [ -z "$domain" ] && return 0
+    [ -z "$domain" ] && { info "已取消"; return 0; }
   done
   
   if [ -n "$default_port" ]; then
-    read -rp "  本地端口 [$default_port，可直接回车使用]: " port
+    read -rp "  本地端口 [$default_port]: " port
     [ -z "$port" ] && port="$default_port"
   else
     read -rp "  本地端口: " port
@@ -673,7 +671,7 @@ create_nginx_proxy(){
   while ! valid_port "$port"; do
     err "端口必须为 1-65535"
     read -rp "  本地端口: " port
-    [ -z "$port" ] && return 0
+    [ -z "$port" ] && { info "已取消"; return 0; }
   done
   
   local file="/etc/nginx/sites-available/$name"
@@ -689,7 +687,7 @@ create_nginx_proxy(){
   echo "    [2] 空模板（完全空白）"
   echo
   local t
-  read -rp "  请选择 [1，回车默认]: " t
+  read -rp "  请选择 [1]: " t
   [ -z "$t" ] && t="1"
   
   if [ "$t" = "2" ]; then
@@ -895,7 +893,7 @@ certbot_menu(){
     echo "  [2] 查看证书列表"
     echo "  [3] 测试续期"
     echo "  [4] 强制续期"
-    echo "  [5] 删除证书（编号选择）"
+    echo "  [5] 删除证书"
     echo "  [0] 返回"
     echo
     read -rp "  请选择 [0-5]: " c
@@ -903,10 +901,13 @@ certbot_menu(){
     case "$c" in
       1)
         read -rp "  域名: " domain
+        [ -z "$domain" ] && { info "已取消"; continue; }
         while ! valid_domain "$domain"; do
           err "域名格式不正确"
           read -rp "  域名: " domain
+          [ -z "$domain" ] && { info "已取消"; break; }
         done
+        [ -z "$domain" ] && continue
         certbot --nginx -d "$domain" && ok "证书申请完成" || err "申请失败"
         pause
         ;;
