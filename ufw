@@ -350,6 +350,15 @@ f2b_auth_log_path(){
 
 f2b_prepare_dirs(){ mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d /var/log; }
 
+f2b_fix_sshd_logpath(){
+    f2b_prepare_dirs
+    local auth_log; auth_log=$(f2b_auth_log_path)
+    cat > /etc/fail2ban/jail.d/00-vps-sshd-logpath.local <<EOF
+[sshd]
+logpath = ${auth_log}
+EOF
+}
+
 f2b_disable_legacy_scan(){
     f2b_prepare_dirs
     cat > /etc/fail2ban/jail.d/zz-vps-disable-legacy-scan.local <<'EOF'
@@ -521,73 +530,79 @@ f2b_unban(){
 f2b_file_label(){
     local f="$1"
     case "$f" in
-        /etc/fail2ban/jail.conf) echo "系统主配置|保留" ;;
         /etc/fail2ban/jail.local) echo "用户主配置|谨慎" ;;
         *defaults-debian.conf) echo "Debian默认|保留" ;;
+        *00-vps-sshd-logpath.local) echo "SSH日志修复|保留" ;;
         *vps-ssh.local) echo "SSH防护|按需" ;;
         *vps-ufw-port-scan.local) echo "端口扫描|按需" ;;
         *disable-legacy-scan.local) echo "禁用旧项|保留" ;;
         *ufw-scan-lite*) echo "旧扫描|可删" ;;
-        *) echo "其他|谨慎" ;;
+        *) echo "其他配置|谨慎" ;;
     esac
+}
+
+f2b_file_jails(){
+    local f="$1"
+    awk '
+    /^\[[^]]+\]/ {
+        sec=$0; gsub(/^\[/,"",sec); gsub(/\].*$/,"",sec);
+        if (sec !~ /^(DEFAULT|Definition|Init|INCLUDES)$/) printf "%s ",sec
+    }' "$f" 2>/dev/null | xargs
+}
+
+f2b_file_enabled(){
+    local f="$1"
+    awk '
+    /^enabled[[:space:]]*=/ {
+        gsub(/[[:space:]]/,"",$0); split($0,a,"="); print a[2]; found=1; exit
+    }
+    END{if(!found) print "未写明"}' "$f" 2>/dev/null
 }
 
 f2b_config_files(){
     ensure_fail2ban || return
-    echo -e "${CYAN}Fail2Ban 配置对应表${NC}"
-    echo "显示：文件 -> 里面定义的防护项。"
+    echo -e "${CYAN}Fail2Ban 实际配置文件${NC}"
+    echo "只显示 jail.local 和 jail.d，隐藏系统模板 jail.conf。"
     echo
 
     local list_file="/tmp/vps-f2b-files.$$"
     : > "$list_file"
-    [ -f /etc/fail2ban/jail.conf ] && echo "/etc/fail2ban/jail.conf" >> "$list_file"
     [ -f /etc/fail2ban/jail.local ] && echo "/etc/fail2ban/jail.local" >> "$list_file"
-    find /etc/fail2ban/jail.d -maxdepth 1 -type f 2>/dev/null | sort >> "$list_file"
+    find /etc/fail2ban/jail.d -maxdepth 1 -type f \( -name '*.local' -o -name '*.conf' \) 2>/dev/null | sort >> "$list_file"
 
     if [ ! -s "$list_file" ]; then
-        warn "没有找到配置文件。"
+        warn "没有找到实际配置文件。"
         rm -f "$list_file"
         return
     fi
 
     local i=1
     while IFS= read -r f; do
-        local label typ sug jails enabled_state base
+        local label typ sug base jails en
         label=$(f2b_file_label "$f")
         typ=${label%%|*}; sug=${label##*|}; base=$(basename "$f")
-        jails=$(awk '
-            /^\[[^]]+\]/ {
-                gsub(/^\[/,"",$0); gsub(/\].*$/,"",$0);
-                if ($0 !~ /^(DEFAULT|Definition|Init)$/) printf "%s ",$0
-            }' "$f" 2>/dev/null | xargs)
-        enabled_state=$(awk '
-            /^enabled[[:space:]]*=/ {
-                gsub(/[[:space:]]/,"",$0);
-                split($0,a,"="); print a[2]; exit
-            }' "$f" 2>/dev/null)
-        [ -z "$jails" ] && jails="无防护项"
-        [ -z "$enabled_state" ] && enabled_state="未写明"
-        printf "%2d. %-8s %-6s %s\n" "$i" "$typ" "$sug" "$base"
+        jails=$(f2b_file_jails "$f"); [ -z "$jails" ] && jails="无"
+        en=$(f2b_file_enabled "$f")
+        printf "%2d. %-10s %-6s %s\n" "$i" "$typ" "$sug" "$base"
         echo "    防护项：$jails"
-        echo "    enabled：$enabled_state"
+        echo "    enabled：$en"
         i=$((i+1))
     done < "$list_file"
 
     echo
-    echo -e "${CYAN}当前运行中的防护项${NC}"
+    echo -e "${CYAN}当前运行项${NC}"
     if fail2ban-client ping >/dev/null 2>&1; then
         local running
         running=$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {print $2}' | xargs)
         echo "运行项：${running:-无}"
-        echo "说明：如果运行项已不在上表，说明文件已删但 Fail2Ban 尚未成功重启。"
     else
-        echo "Fail2Ban 未运行，无法读取运行项。"
+        echo "Fail2Ban 未运行"
     fi
 
     echo
-    echo "删除的是配置文件编号，不是防护项编号。"
-    echo "建议：系统主配置/Debian默认不要删；旧扫描可删。"
-    echo "输入编号删除，如：3 或 2 3；0取消"
+    echo "删文件编号，不是删运行项名称。"
+    echo "系统默认保留；旧扫描可删。"
+    echo "输入编号，如：3 或 2 3；0取消"
     local nums
     read -r -p "编号: " nums
     [ -z "$nums" ] && { rm -f "$list_file"; return; }
@@ -597,37 +612,26 @@ f2b_config_files(){
         local file base
         file=$(sed -n "${n}p" "$list_file")
         base=$(basename "$file")
-        if [ -z "$file" ] || [ ! -f "$file" ]; then
-            err "编号无效：$n"
-            continue
-        fi
+        if [ -z "$file" ] || [ ! -f "$file" ]; then err "编号无效：$n"; continue; fi
         case "$file" in
-            /etc/fail2ban/jail.conf|*defaults-debian.conf)
-                warn "已跳过系统配置：$base"
-                ;;
-            *)
-                rm -f "$file" && ok "已删除：$base" || err "删除失败：$base"
-                ;;
+            *defaults-debian.conf|*00-vps-sshd-logpath.local)
+                warn "已跳过保留项：$base" ;;
+            *) rm -f "$file" && ok "已删除：$base" || err "删除失败：$base" ;;
         esac
     done
     rm -f "$list_file"
 
-    # 避免因系统没有 auth.log 导致 defaults-debian 的 sshd 检测失败
-    f2b_auth_log_path >/dev/null 2>&1
+    # 修复部分系统默认 sshd 找不到 auth.log 的问题
+    f2b_fix_sshd_logpath
     touch /var/log/fail2ban.log 2>/dev/null
 
     if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
         ok "配置检测通过"
         if ask_yes_no "重启生效？" "y"; then
-            if svc restart fail2ban >/tmp/fail2ban-start.log 2>&1; then
-                ok "已重启，运行项已刷新。"
-            else
-                err "重启失败"
-                sed -n '1,6p' /tmp/fail2ban-start.log
-            fi
+            if svc restart fail2ban >/tmp/fail2ban-start.log 2>&1; then ok "已重启"; else err "重启失败"; sed -n '1,6p' /tmp/fail2ban-start.log; fi
         fi
     else
-        err "配置检测失败，运行项可能仍是旧的。"
+        err "配置检测失败"
         sed -n '1,8p' /tmp/fail2ban-check.log 2>/dev/null
     fi
 }
