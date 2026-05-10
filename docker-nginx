@@ -342,7 +342,7 @@ install_certbot(){
 install_all(){
   echo
   echo "============================================"
-  echo "🚀 一键安装向导"
+  echo "一键安装向导"
   echo "============================================"
   echo
   
@@ -369,7 +369,7 @@ install_all(){
 create_docker_project(){
   echo
   echo "============================================"
-  echo "📦 创建新项目"
+  echo "创建新项目"
   echo "============================================"
   
   # 输入项目名称
@@ -592,7 +592,7 @@ container_menu(){
   while true; do
     clear
     echo "============================================"
-    echo "🐳 容器管理"
+    echo "容器管理"
     echo "============================================"
     echo "  1) 查看容器"
     echo "  2) 查看日志"
@@ -686,7 +686,7 @@ log_menu(){
   while true; do
     clear
     echo "============================================"
-    echo "📜 日志管理"
+    echo "日志管理"
     echo "============================================"
     echo "  1) 清理单个容器日志"
     echo "  2) 清理所有容器日志"
@@ -747,7 +747,7 @@ cleanup_menu(){
   while true; do
     clear
     echo "============================================"
-    echo "🧹 空间清理"
+    echo "空间清理"
     echo "============================================"
     echo "  1) 查看空间占用"
     echo "  2) 清理无用镜像"
@@ -797,7 +797,7 @@ cleanup_menu(){
 config_log_rotation(){
   echo
   echo "============================================"
-  echo "⚙️  Docker 日志全局限制"
+  echo "Docker 日志全局限制"
   echo "============================================"
   echo
   echo "说明：限制所有新创建容器的日志大小"
@@ -909,7 +909,7 @@ EOFSCRIPT
 setup_auto_cleanup(){
   echo
   echo "============================================"
-  echo "⏰ 定时清理任务"
+  echo "定时清理任务"
   echo "============================================"
   echo
   echo "定时任务将自动执行以下清理："
@@ -980,7 +980,7 @@ setup_auto_cleanup(){
 list_auto_cleanup(){
   echo
   echo "============================================"
-  echo "⏰ 定时清理任务"
+  echo "定时清理任务"
   echo "============================================"
   echo
   
@@ -1006,7 +1006,7 @@ list_auto_cleanup(){
 remove_auto_cleanup(){
   echo
   echo "============================================"
-  echo "⏰ 删除定时清理任务"
+  echo "删除定时清理任务"
   echo "============================================"
   echo
   
@@ -1097,15 +1097,13 @@ docker_menu(){
   while true; do
     clear
     echo "============================================"
-    echo "🐳 Docker 管理"
+    echo "Docker 管理"
     echo "============================================"
-    echo "  1) 📦 项目管理"
-    echo "  2) 🐳 容器管理"
-    echo "  3) 📜 日志管理"
-    echo "  4) 🧹 空间清理"
-    echo "  5) ⚙️  日志全局限制"
-    echo "  6) ⏰ 定时清理任务"
-    echo "  7) 🔄 更新项目"
+    echo "  1) 项目管理"
+    echo "  2) 容器管理"
+    echo "  3) 日志管理"
+    echo "  4) 空间清理"
+    echo "  5) 更新项目"
     echo "  0) 返回"
     echo
     
@@ -1117,7 +1115,7 @@ docker_menu(){
         while true; do
           clear
           echo "============================================"
-          echo "📦 项目管理"
+          echo "项目管理"
           echo "============================================"
           echo "  1) 创建新项目"
           echo "  2) 查看项目列表"
@@ -1146,9 +1144,7 @@ docker_menu(){
       2) container_menu ;;
       3) log_menu ;;
       4) cleanup_menu ;;
-      5) config_log_rotation; pause ;;
-      6) setup_auto_cleanup; pause ;;
-      7) update_project; pause ;;
+      5) update_project; pause ;;
       0) return ;;
       "") continue ;;
       *) warn "无效选择" ;;
@@ -1169,7 +1165,7 @@ nginx_config_test(){
 create_nginx_proxy(){
   echo
   echo "============================================"
-  echo "🌐 创建反向代理"
+  echo "创建反向代理"
   echo "============================================"
   
   # 配置名称
@@ -1288,7 +1284,7 @@ nginx_menu(){
   while true; do
     clear
     echo "============================================"
-    echo "🌐 Nginx 管理"
+    echo "Nginx 管理"
     echo "============================================"
     echo "  1) 创建反向代理"
     echo "  2) 查看站点列表"
@@ -1440,7 +1436,7 @@ certbot_menu(){
   while true; do
     clear
     echo "============================================"
-    echo "🔒 HTTPS 证书"
+    echo "HTTPS 证书"
     echo "============================================"
     echo "  1) 申请新证书"
     echo "  2) 查看证书列表"
@@ -1512,13 +1508,13 @@ certbot_menu(){
 show_status(){
   echo
   echo "============================================"
-  echo "📊 系统状态"
+  echo "系统状态"
   echo "============================================"
   echo
   echo "系统：$OS_NAME"
   echo
   
-  echo "🐳 Docker"
+  echo "Docker"
   if command -v docker >/dev/null 2>&1; then
     echo "  版本：$(docker --version | cut -d' ' -f3 | tr -d ',')"
     echo "  状态：$(get_docker_status)"
@@ -1528,7 +1524,7 @@ show_status(){
   fi
   echo
   
-  echo "🌐 Nginx"
+  echo "Nginx"
   if command -v nginx >/dev/null 2>&1; then
     echo "  状态：$(get_nginx_status)"
     if nginx_config_test; then
@@ -1544,7 +1540,7 @@ show_status(){
   fi
   echo
   
-  echo "🔒 HTTPS"
+  echo "HTTPS"
   if command -v certbot >/dev/null 2>&1; then
     local cert_count
     cert_count=$(certbot certificates 2>/dev/null | grep -c "Certificate Name" || echo 0)
@@ -1554,7 +1550,7 @@ show_status(){
   fi
   echo
   
-  echo "💾 磁盘"
+  echo "磁盘"
   echo "  $(get_disk_info)"
   echo
   
@@ -1568,14 +1564,14 @@ show_status(){
 health_check(){
   echo
   echo "============================================"
-  echo "🔍 系统健康检查"
+  echo "系统健康检查"
   echo "============================================"
   echo
   
   local issues=0
   
   # Docker 检查
-  echo "🐳 Docker"
+  echo "Docker"
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     local stopped
     stopped=$(docker ps -a --filter "status=exited" -q 2>/dev/null | wc -l)
@@ -1592,7 +1588,7 @@ health_check(){
   echo
   
   # Nginx 检查
-  echo "🌐 Nginx"
+  echo "Nginx"
   if command -v nginx >/dev/null 2>&1; then
     if systemctl is-active --quiet nginx; then
       echo "  ✓ 服务运行中"
@@ -1613,7 +1609,7 @@ health_check(){
   echo
   
   # 磁盘检查
-  echo "💾 磁盘空间"
+  echo "磁盘空间"
   local disk_pct
   disk_pct=$(get_disk_percent)
   if [ "$disk_pct" -gt 90 ]; then
@@ -1628,7 +1624,7 @@ health_check(){
   echo
   
   # 证书检查
-  echo "🔒 SSL 证书"
+  echo "SSL 证书"
   if [ -d /etc/letsencrypt/live ]; then
     local cert_issues=0
     for cert_dir in /etc/letsencrypt/live/*/; do
@@ -1684,29 +1680,20 @@ main_menu(){
   while true; do
     clear
     echo
-    echo "╔════════════════════════════════════════════╗"
-    echo "║    Docker + Nginx 工具箱  $VERSION       ║"
-    echo "╠════════════════════════════════════════════╣"
-    echo "║  1) 🚀 一键安装                           ║"
-    echo "║  2) 🐳 Docker 管理                       ║"
-    echo "║  3) 🌐 Nginx 管理                        ║"
-    echo "║  4) 🔒 HTTPS 证书                        ║"
-    echo "║  5) 📊 系统状态                           ║"
-    echo "║  6) 🔍 健康检查                           ║"
-    echo "╠════════════════════════════════════════════╣"
+    echo "============================================"
+    echo "    Docker + Nginx 工具箱  v13"
+    echo "============================================"
+    echo "  1) 一键安装"
+    echo "  2) Docker 管理"
+    echo "  3) Nginx 管理"
+    echo "  4) HTTPS 证书"
+    echo "  5) 系统状态"
+    echo "  6) 健康检查"
+    echo "============================================"
     
     # 在线状态栏
-    echo -n "║  🐳 Docker: $(get_docker_status)  "
-    echo "🌐 Nginx: $(get_nginx_status)  ║"
-    echo -n "║  💾 磁盘: $(get_disk_info)  "
-    local disk_pct
-    disk_pct=$(get_disk_percent)
-    if [ "$disk_pct" -gt 80 ]; then
-      echo "⚠️  ║"
-    else
-      echo "✓  ║"
-    fi
-    echo "╚════════════════════════════════════════════╝"
+    echo "  Docker: $(get_docker_status)  |  Nginx: $(get_nginx_status)"
+    echo "  磁盘: $(get_disk_info)"
     echo
     
     read -rp "选择 [0-6]: " c
