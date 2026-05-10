@@ -350,6 +350,17 @@ f2b_auth_log_path(){
 
 f2b_prepare_dirs(){ mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d /var/log; }
 
+f2b_verify_jail(){
+    local jail="$1"
+    if fail2ban-client status "$jail" >/dev/null 2>&1; then
+        ok "已确认防护生效：$jail"
+        return 0
+    else
+        err "防护未生效：$jail。请运行 fail2ban-client -t 查看原因。"
+        return 1
+    fi
+}
+
 f2b_apply_restart(){
     ensure_fail2ban || return 1
     svc_enable fail2ban
@@ -387,6 +398,7 @@ bantime = ${bantime}
 EOF
     ok "SSH防护：失败${retry}次 / $(fmt_duration "$findtime") 内，封禁 $(fmt_duration "$bantime")。"
     f2b_apply_restart
+    fail2ban-client ping >/dev/null 2>&1 && f2b_verify_jail sshd
 }
 
 f2b_config_portscan(){
@@ -416,6 +428,7 @@ EOF
     ufw logging on >/dev/null 2>&1 || true
     ok "扫描防护：触发${retry}次 / $(fmt_duration "$findtime") 内，封禁 $(fmt_duration "$bantime")。"
     f2b_apply_restart
+    fail2ban-client ping >/dev/null 2>&1 && f2b_verify_jail ufw-port-scan
 }
 
 f2b_status(){
@@ -431,23 +444,59 @@ f2b_status(){
             cur=$(fail2ban-client status "$jail" | awk -F: '/Currently banned/ {print $2}' | xargs)
             total=$(fail2ban-client status "$jail" | awk -F: '/Total banned/ {print $2}' | xargs)
             ips=$(fail2ban-client status "$jail" | awk -F: '/Banned IP list/ {print $2}' | xargs)
-            echo "防护项：$jail"
+            [ "$jail" = "sshd" ] && name="SSH爆破" || name="UFW端口扫描"
+            echo "防护项：$name ($jail)"
             echo "  当前封禁：${cur:-0} 个"
             echo "  累计封禁：${total:-0} 次"
             echo "  封禁IP：${ips:-无}"
+        else
+            [ "$jail" = "sshd" ] && name="SSH爆破" || name="UFW端口扫描"
+            echo "防护项：$name 未启用"
         fi
     done
 }
 
 f2b_log_summary(){
-    local log=/var/log/fail2ban.log
-    [ -f "$log" ] || { warn "暂无 Fail2Ban 日志。"; return; }
+    local log=/var/log/fail2ban.log ufwlog
     echo -e "${CYAN}Fail2Ban 日志总结${NC}"
-    echo "最近启动：$(grep -i 'Server ready' "$log" | tail -1 | cut -d',' -f1-2 | xargs || echo 无)"
+    if [ ! -f "$log" ]; then warn "暂无 Fail2Ban 日志。"; return; fi
+    echo "说明：这里统计的是 Fail2Ban 真正执行的封禁/解封。"
+    local ban_count unban_count
+    ban_count=$(grep -E 'fail2ban\.actions.*NOTICE.*\[.*\] Ban ' "$log" 2>/dev/null | wc -l | xargs)
+    unban_count=$(grep -E 'fail2ban\.actions.*NOTICE.*\[.*\] Unban ' "$log" 2>/dev/null | wc -l | xargs)
+    echo "累计封禁：${ban_count:-0} 次"
+    echo "累计解封：${unban_count:-0} 次"
+    echo
     echo "最近封禁："
-    grep -i 'Ban ' "$log" | tail -10 | sed 's/.*fail2ban.actions.*\[//; s/\].*Ban / 防护封禁 IP：/' || true
+    local recent_ban
+    recent_ban=$(grep -E 'fail2ban\.actions.*NOTICE.*\[.*\] Ban ' "$log" 2>/dev/null | tail -8)
+    if [ -n "$recent_ban" ]; then
+        echo "$recent_ban" | sed -E 's/^([^ ]+ [^ ]+).*\[([^]]+)\] Ban ([0-9a-fA-F:.]+).*/时间：\1  防护：\2  IP：\3/'
+    else
+        echo "无"
+    fi
+    echo
     echo "最近解封："
-    grep -i 'Unban ' "$log" | tail -10 | sed 's/.*fail2ban.actions.*\[//; s/\].*Unban / 防护解封 IP：/' || true
+    local recent_unban
+    recent_unban=$(grep -E 'fail2ban\.actions.*NOTICE.*\[.*\] Unban ' "$log" 2>/dev/null | tail -8)
+    if [ -n "$recent_unban" ]; then
+        echo "$recent_unban" | sed -E 's/^([^ ]+ [^ ]+).*\[([^]]+)\] Unban ([0-9a-fA-F:.]+).*/时间：\1  防护：\2  IP：\3/'
+    else
+        echo "无"
+    fi
+    echo
+    echo -e "${CYAN}UFW 拦截摘要${NC}"
+    ufwlog=$(f2b_log_path)
+    echo "说明：UFW拦截不等于Fail2Ban封禁；达到阈值后才会封禁。"
+    if [ -f "$ufwlog" ]; then
+        local blocks
+        blocks=$(grep -E '\[UFW (BLOCK|DENY)\]' "$ufwlog" 2>/dev/null | wc -l | xargs)
+        echo "UFW累计拦截：${blocks:-0} 条"
+        echo "最近来源IP："
+        grep -E '\[UFW (BLOCK|DENY)\]' "$ufwlog" 2>/dev/null | tail -20 | sed -n 's/.*SRC=\([^ ]*\).*/\1/p' | sort | uniq -c | sort -rn | head -8 | awk '{printf "  IP：%-18s 次数：%s\n", $2,$1}'
+    else
+        echo "暂无UFW日志：$ufwlog"
+    fi
 }
 
 f2b_unban(){
