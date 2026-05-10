@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v20
-# 优化：连续部署向导、Nginx通用模板免编辑、首页UI
+# Docker + Nginx + HTTPS 工具箱 v21
+# 优化：确认默认值、安装流程去重、简洁UI
 # ============================================================
 
 set -o pipefail
@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v20"
+VERSION="v21"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -30,12 +30,12 @@ info(){ echo -e "  ${BLUE}[INFO]${NC} $1"; }
 warn(){ echo -e "  ${YELLOW}[WARN]${NC} $1"; }
 err(){ echo -e "  ${RED}[ERROR]${NC} $1"; }
 
-ui_line(){ echo -e "${CYAN}────────────────────────────────────────────────────────────${NC}"; }
+ui_line(){ echo -e "${CYAN}----------------------------------------${NC}"; }
 ui_box(){
   local text="$1"
-  echo -e "${CYAN}┌──────────────────────────────────────────────────────────┐${NC}"
-  printf "${CYAN}│${NC}        ${GREEN}%-46s${NC}${CYAN}│${NC}\n" "$text"
-  echo -e "${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
+  ui_line
+  echo -e "  ${GREEN}${BOLD}$text${NC}"
+  ui_line
 }
 ui_header(){
   echo
@@ -86,7 +86,7 @@ ask_yn(){
     fi
     read -rp "  $q $prompt: " a
     [ -z "$a" ] && a="$d"
-    case "$a" in y|Y) return 0 ;; n|N) return 1 ;; *) warn "请输入 y 或 n" ;; esac
+    case "$a" in y|Y) return 0 ;; n|N) return 1 ;; *) warn "请输入 y 或 n，直接回车使用默认值" ;; esac
   done
 }
 
@@ -145,6 +145,10 @@ extract_first_host_port(){
   grep -E '^[[:space:]]*-[[:space:]]*"?[0-9.:]+:[0-9]+' "$file" 2>/dev/null | head -1 | sed -E 's/.*:([0-9]+)"?$/\1/'
 }
 
+has_auto_cleanup(){
+  crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"
+}
+
 ask_create_nginx_after_project(){
   local default_name="$1"
   local default_port="$2"
@@ -197,11 +201,13 @@ install_all(){
   echo
   ok "基础环境安装完成"
   echo
-  if ask_yn "设置定时自动清理日志？"; then
+  if has_auto_cleanup; then
+    ok "已存在 Docker 日志定时清理任务，跳过重复设置"
+  elif ask_yn "设置定时自动清理日志？" "y"; then
     setup_auto_cleanup
   fi
   echo
-  if ask_yn "创建第一个项目？"; then
+  if ask_yn "创建第一个项目？" "y"; then
     create_docker_project
   fi
   echo
@@ -284,7 +290,7 @@ EOF
   local guessed_port
   guessed_port=$(extract_first_host_port "$file")
   [ -z "$guessed_port" ] && guessed_port="8080"
-  if ask_yn "现在启动/应用这个项目？" "n"; then
+  if ask_yn "现在启动/应用这个项目？" "y"; then
     if (cd "$dir" && docker compose up -d); then
       ok "项目已启动"
       ask_create_nginx_after_project "$name" "$guessed_port"
@@ -666,7 +672,7 @@ create_nginx_proxy(){
   done
   
   if [ -n "$default_port" ]; then
-    read -rp "  本地端口 [$default_port]: " port
+    read -rp "  本地端口 [$default_port，可直接回车使用]: " port
     [ -z "$port" ] && port="$default_port"
   else
     read -rp "  本地端口: " port
@@ -730,7 +736,7 @@ EOF
   else
     echo
     info "通用模板已根据域名和端口生成，默认不进入编辑。"
-    ask_yn "是否需要手动编辑 Nginx 配置？" "n" && edit_file "$file"
+    ask_yn "是否手动编辑 Nginx 配置？" "n" && edit_file "$file"
   fi
   if [ ! -s "$file" ]; then
     warn "配置文件为空，已创建但不启用。"
@@ -966,7 +972,7 @@ main_menu(){
     local docker_s nginx_s
     docker info >/dev/null 2>&1 && docker_s="${GREEN}运行中${NC}" || docker_s="${YELLOW}未运行${NC}"
     systemctl is-active --quiet nginx 2>/dev/null && nginx_s="${GREEN}运行中${NC}" || nginx_s="${YELLOW}未运行${NC}"
-    echo -e "Docker:${docker_s}    Nginx:${nginx_s}"
+    echo -e "  Docker: ${docker_s}    Nginx: ${nginx_s}"
     ui_line
     echo "  [1] 一键安装"
     echo "  [2] Docker 管理"
