@@ -518,10 +518,23 @@ f2b_unban(){
     fail2ban-client unban "$ip" 2>/dev/null && ok "已解封：$ip" || err "解封失败或未被封禁"
 }
 
+f2b_file_label(){
+    local f="$1"
+    case "$f" in
+        /etc/fail2ban/jail.local) echo "用户主配置|谨慎删除" ;;
+        *defaults-debian.conf) echo "系统默认|建议保留" ;;
+        *vps-ssh.local) echo "SSH防护|按需删除" ;;
+        *vps-ufw-port-scan.local) echo "端口扫描|按需删除" ;;
+        *disable-legacy-scan.local) echo "禁用旧扫描|建议保留" ;;
+        *ufw-scan-lite*) echo "旧扫描配置|建议删除" ;;
+        *) echo "其他配置|谨慎删除" ;;
+    esac
+}
+
 f2b_config_files(){
     ensure_fail2ban || return
-    echo -e "${CYAN}Fail2Ban 配置文件管理${NC}"
-    echo "说明：列出常用配置文件，可按编号删除；不做备份。"
+    echo -e "${CYAN}配置文件管理${NC}"
+    echo "看建议删，不懂就别删。"
     echo
     local list_file="/tmp/vps-f2b-files.$$"
     : > "$list_file"
@@ -529,49 +542,49 @@ f2b_config_files(){
     find /etc/fail2ban/jail.d -maxdepth 1 -type f \( -name '*.local' -o -name '*.conf' \) 2>/dev/null | sort >> "$list_file"
 
     if [ ! -s "$list_file" ]; then
-        warn "没有找到可管理的 jail 配置文件。"
+        warn "没有配置文件。"
         rm -f "$list_file"
         return
     fi
 
     local i=1
+    printf "%s\n" "编号  类型        建议        文件"
     while IFS= read -r f; do
-        local state="未知"
-        if grep -qE '^enabled[[:space:]]*=[[:space:]]*true' "$f" 2>/dev/null; then state="启用"; fi
-        if grep -qE '^enabled[[:space:]]*=[[:space:]]*false' "$f" 2>/dev/null; then state="禁用"; fi
-        printf "%2d. %-6s %s\n" "$i" "$state" "$f"
+        local state="未知" typ sug label
+        grep -qE '^enabled[[:space:]]*=[[:space:]]*true' "$f" 2>/dev/null && state="启用"
+        grep -qE '^enabled[[:space:]]*=[[:space:]]*false' "$f" 2>/dev/null && state="禁用"
+        label=$(f2b_file_label "$f")
+        typ=${label%%|*}; sug=${label##*|}
+        printf "%2d.  %-10s %-10s %s [%s]\n" "$i" "$typ" "$sug" "$(basename "$f")" "$state"
         i=$((i+1))
     done < "$list_file"
 
     echo
-    echo "输入要删除的编号，支持多个：1 3 5 或 1,3,5"
-    echo "输入 0 取消。"
+    echo "输入编号删除，如：3 或 2 3；0取消"
     local nums
-    read -r -p "删除编号: " nums
+    read -r -p "编号: " nums
     [ -z "$nums" ] && { rm -f "$list_file"; return; }
-    [ "$nums" = "0" ] && { warn "已取消。"; rm -f "$list_file"; return; }
+    [ "$nums" = "0" ] && { rm -f "$list_file"; warn "已取消"; return; }
 
     echo "$nums" | tr ' ,，;；' '\n' | grep -E '^[0-9]+$' | sort -rn | while read -r n; do
         local file
         file=$(sed -n "${n}p" "$list_file")
         if [ -n "$file" ] && [ -f "$file" ]; then
-            rm -f "$file" && ok "已删除：$file" || err "删除失败：$file"
+            rm -f "$file" && ok "已删除：$(basename "$file")" || err "删除失败：$(basename "$file")"
         else
             err "编号无效：$n"
         fi
     done
     rm -f "$list_file"
 
-    echo
-    info "正在检测删除后的 Fail2Ban 配置..."
     if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
-        ok "配置检测通过。"
-        if ask_yes_no "是否立即重启 Fail2Ban 使删除生效？" "y"; then
-            svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 && ok "Fail2Ban 已重启。" || { err "重启失败："; sed -n '1,8p' /tmp/fail2ban-start.log; }
+        ok "配置正常"
+        if ask_yes_no "重启生效？" "y"; then
+            svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 && ok "已重启" || { err "重启失败"; sed -n '1,6p' /tmp/fail2ban-start.log; }
         fi
     else
-        err "配置检测失败，请查看："
-        sed -n '1,12p' /tmp/fail2ban-check.log 2>/dev/null
+        err "配置有误"
+        sed -n '1,8p' /tmp/fail2ban-check.log 2>/dev/null
     fi
 }
 
