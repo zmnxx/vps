@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v19
-# 修复：创建流程、重复项目、删除配置、UI流畅性
+# Docker + Nginx + HTTPS 工具箱 v20
+# 优化：连续部署向导、Nginx通用模板免编辑、首页UI
 # ============================================================
 
 set -o pipefail
@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v19"
+VERSION="v20"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -30,13 +30,12 @@ info(){ echo -e "  ${BLUE}[INFO]${NC} $1"; }
 warn(){ echo -e "  ${YELLOW}[WARN]${NC} $1"; }
 err(){ echo -e "  ${RED}[ERROR]${NC} $1"; }
 
-ui_line(){ echo -e "${CYAN}────────────────────────────────────────${NC}"; }
+ui_line(){ echo -e "${CYAN}────────────────────────────────────────────────────────────${NC}"; }
 ui_box(){
   local text="$1"
-  echo -e "${CYAN}┌──────────────────────────────────────┐${NC}"
-  printf "${CYAN}│${NC}        ${GREEN}%s${NC}
-" "$text"
-  echo -e "${CYAN}└──────────────────────────────────────┘${NC}"
+  echo -e "${CYAN}┌──────────────────────────────────────────────────────────┐${NC}"
+  printf "${CYAN}│${NC}        ${GREEN}%-46s${NC}${CYAN}│${NC}\n" "$text"
+  echo -e "${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
 }
 ui_header(){
   echo
@@ -135,6 +134,26 @@ select_compose_dir(){
   local idx=$((n-1))
   [ "$idx" -lt 0 ] || [ "$idx" -ge ${#files[@]} ] && { err "选择无效"; return 1; }
   SELECTED_DIR="$(dirname "${files[$idx]}")"
+}
+
+
+# =============================================
+# 部署向导辅助
+# =============================================
+extract_first_host_port(){
+  local file="$1"
+  grep -E '^[[:space:]]*-[[:space:]]*"?[0-9.:]+:[0-9]+' "$file" 2>/dev/null | head -1 | sed -E 's/.*:([0-9]+)"?$/\1/'
+}
+
+ask_create_nginx_after_project(){
+  local default_name="$1"
+  local default_port="$2"
+  echo
+  if ask_yn "是否继续创建 Nginx 反向代理？" "y"; then
+    create_nginx_proxy "$default_name" "$default_port" "wizard"
+  else
+    info "已完成 Docker 项目创建。后续可在 Nginx 管理中创建反向代理。"
+  fi
 }
 
 # =============================================
@@ -262,11 +281,19 @@ EOF
     warn "配置文件为空，已跳过启动。"
     return 0
   fi
+  local guessed_port
+  guessed_port=$(extract_first_host_port "$file")
+  [ -z "$guessed_port" ] && guessed_port="8080"
   if ask_yn "现在启动/应用这个项目？" "n"; then
-    cd "$dir" && docker compose up -d
-    ok "项目已启动"
+    if (cd "$dir" && docker compose up -d); then
+      ok "项目已启动"
+      ask_create_nginx_after_project "$name" "$guessed_port"
+    else
+      err "项目启动失败，请检查 docker-compose.yml 后重试。"
+    fi
   else
     info "已保存配置，稍后可在 项目管理 -> 启动/重启 中启动。"
+    ask_create_nginx_after_project "$name" "$guessed_port"
   fi
 }
 
@@ -610,8 +637,16 @@ create_nginx_proxy(){
   ui_header "创建反向代理"
   echo
   
+  local default_name="${1:-}"
+  local default_port="${2:-}"
+  local mode="${3:-manual}"
   local name domain port
-  read -rp "  配置名称（如 myapp）: " name
+  if [ -n "$default_name" ]; then
+    read -rp "  配置名称 [$default_name]: " name
+    [ -z "$name" ] && name="$default_name"
+  else
+    read -rp "  配置名称（如 myapp）: " name
+  fi
   while [ -z "$name" ]; do
     err "名称不能为空"
     read -rp "  配置名称: " name
@@ -630,7 +665,12 @@ create_nginx_proxy(){
     [ -z "$domain" ] && return 0
   done
   
-  read -rp "  本地端口: " port
+  if [ -n "$default_port" ]; then
+    read -rp "  本地端口 [$default_port]: " port
+    [ -z "$port" ] && port="$default_port"
+  else
+    read -rp "  本地端口: " port
+  fi
   while ! valid_port "$port"; do
     err "端口必须为 1-65535"
     read -rp "  本地端口: " port
@@ -682,10 +722,16 @@ EOF
     ok "已创建配置: $file"
   fi
   
-  echo
-  info "接下来进入编辑器，请检查/填写 Nginx 配置后保存退出。"
-  pause
-  edit_file "$file"
+  if [ "$t" = "2" ]; then
+    echo
+    info "空模板需要手动填写，接下来进入编辑器。"
+    pause
+    edit_file "$file"
+  else
+    echo
+    info "通用模板已根据域名和端口生成，默认不进入编辑。"
+    ask_yn "是否需要手动编辑 Nginx 配置？" "n" && edit_file "$file"
+  fi
   if [ ! -s "$file" ]; then
     warn "配置文件为空，已创建但不启用。"
     return 0
