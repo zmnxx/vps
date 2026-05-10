@@ -546,7 +546,7 @@ f2b_all_jails_simple(){
         find /etc/fail2ban/jail.d -maxdepth 1 -type f \( -name '*.local' -o -name '*.conf' \) -print 2>/dev/null | while read -r f; do
             awk '/^\[[^]]+\]/ {gsub(/^\[/,"",$0); gsub(/\].*/,"",$0); if($0!~"^(DEFAULT|Definition|Init)$") print $0}' "$f"
         done
-    } | tr ' ' '\n' | sed '/^$/d' | sort -u
+    } | tr ', ' '\n' | sed '/^$/d' | sort -u
 }
 
 f2b_jail_state(){
@@ -573,28 +573,33 @@ f2b_disable_jail(){
 [$jail]
 enabled = false
 EOF
-    ok "已禁用防护项：$jail"
+    ok "已禁用：$jail"
 }
 
 f2b_delete_jail_configs(){
-    local jail="$1" f base deleted=0
-    f2b_jail_sources "$jail" | while read -r f; do
+    local jail="$1" f base any=0 skipped=0
+    while read -r f; do
+        [ -z "$f" ] && continue
         base=$(basename "$f")
         case "$f" in
             *defaults-debian.conf|/etc/fail2ban/jail.conf)
-                warn "跳过系统默认：$base"
+                warn "系统默认不删除：$base，请用禁用。"
+                skipped=1
                 ;;
             *)
-                rm -f "$f" && ok "已删除配置：$base" || err "删除失败：$base"
+                rm -f "$f" && { ok "已删除：$base"; any=1; } || err "删除失败：$base"
                 ;;
         esac
-    done
+    done <<EOF
+$(f2b_jail_sources "$jail")
+EOF
+    [ "$any" = "0" ] && [ "$skipped" = "1" ] && warn "没有可删除的用户配置；系统项只能禁用。"
 }
 
 f2b_config_files(){
     ensure_fail2ban || return
     echo -e "${CYAN}Fail2Ban 防护项管理${NC}"
-    echo "选择防护项，可禁用或删除它的配置。"
+    echo "管理运行项：禁用或删除用户配置。"
     echo
 
     local list_file="/tmp/vps-f2b-jails.$$"
@@ -605,10 +610,10 @@ f2b_config_files(){
         return
     fi
 
-    local i=1 jail state srcs shortsrc
+    local i=1 jail state srcs
     while read -r jail; do
         state=$(f2b_jail_state "$jail")
-        srcs=$(f2b_jail_sources "$jail" | xargs -n1 basename 2>/dev/null | paste -sd',' -)
+        srcs=$(f2b_jail_sources "$jail" | xargs -n1 basename 2>/dev/null | sort -u | paste -sd',' -)
         [ -z "$srcs" ] && srcs="系统默认或未知"
         printf "%2d. %-18s %-8s 来源：%s\n" "$i" "$jail" "$state" "$srcs"
         i=$((i+1))
@@ -616,18 +621,20 @@ f2b_config_files(){
 
     echo
     echo "输入编号选择；0返回"
-    local n jail
+    local n jail srcs
     read -r -p "编号: " n
     [ -z "$n" ] && { rm -f "$list_file"; return; }
     [ "$n" = "0" ] && { rm -f "$list_file"; return; }
     jail=$(sed -n "${n}p" "$list_file")
     rm -f "$list_file"
     [ -z "$jail" ] && { err "编号无效"; return; }
+    srcs=$(f2b_jail_sources "$jail" | xargs -n1 basename 2>/dev/null | sort -u | paste -sd',' -)
 
     echo
     echo "已选择：$jail"
-    echo "1. 禁用此防护项（推荐）"
-    echo "2. 删除此防护项配置"
+    echo "来源：${srcs:-系统默认或未知}"
+    echo "1. 禁用（推荐，立即停止运行）"
+    echo "2. 删除用户配置（系统默认不会删）"
     echo "0. 取消"
     local op
     read -r -p "操作: " op
@@ -643,7 +650,16 @@ f2b_config_files(){
     if fail2ban-client -t >/tmp/fail2ban-check.log 2>&1; then
         ok "配置检测通过"
         if ask_yes_no "重启生效？" "y"; then
-            svc restart fail2ban >/tmp/fail2ban-start.log 2>&1 && ok "已重启" || { err "重启失败"; sed -n '1,6p' /tmp/fail2ban-start.log; }
+            if svc restart fail2ban >/tmp/fail2ban-start.log 2>&1; then
+                ok "已重启"
+                if fail2ban-client status "$jail" >/dev/null 2>&1; then
+                    warn "$jail 仍在运行；如果是系统默认项，请选择禁用。"
+                else
+                    ok "$jail 当前未运行。"
+                fi
+            else
+                err "重启失败"; sed -n '1,6p' /tmp/fail2ban-start.log
+            fi
         fi
     else
         err "配置检测失败"
