@@ -77,7 +77,43 @@ ensure_ufw(){
 ufw_set_ipv6(){
     local val="$1"
     if [ -f /etc/default/ufw ]; then
-        sed -i "s/^IPV6=.*/IPV6=$val/" /etc/default/ufw
+        if grep -q '^IPV6=' /etc/default/ufw; then
+            sed -i "s/^IPV6=.*/IPV6=$val/" /etc/default/ufw
+        else
+            echo "IPV6=$val" >> /etc/default/ufw
+        fi
+    fi
+}
+
+ufw_ipv6_enabled(){
+    [ -f /etc/default/ufw ] && grep -q '^IPV6=yes' /etc/default/ufw
+}
+
+ufw_ipv6_menu(){
+    ensure_ufw || return
+    if ufw_ipv6_enabled; then echo "当前 IPv6：已启用"; else echo "当前 IPv6：未启用"; fi
+    echo "说明：如果这里是未启用，即使批量放行选择 all，也不会生成 v6 规则。"
+    local v; v=$(ask_default "设置 IPv6 规则 yes/no" "yes")
+    case "$v" in
+        yes|y|Y|是) ufw_set_ipv6 yes; ok "已启用 IPv6 规则。需要 reload 后生效。" ;;
+        no|n|N|否) ufw_set_ipv6 no; warn "已关闭 IPv6 规则。后续不会生成 v6 规则。" ;;
+        *) err "输入无效"; return ;;
+    esac
+    ufw reload >/dev/null 2>&1 && ok "UFW 已重载。"
+}
+
+ufw_check_ipv6_for_scope(){
+    local scope="$1"
+    [ "$scope" = "4" ] && return 0
+    if ! ufw_ipv6_enabled; then
+        warn "检测到 UFW IPv6 当前关闭。选择 all/6 时不会生成 IPv6 规则。"
+        if ask_yes_no "是否现在启用 IPv6 规则？" "y"; then
+            ufw_set_ipv6 yes
+            ufw reload >/dev/null 2>&1 || true
+            ok "IPv6 规则已启用。"
+        else
+            warn "继续仅会生成 IPv4 规则。"
+        fi
     fi
 }
 
@@ -96,26 +132,10 @@ ufw_install_basic(){
     detected_port=${detected_port:-22}
 
     if [ "$active" = "y" ]; then
-        warn "检测到 UFW 已经启用。"
-        echo "为避免 SSH 失联，本功能不会重置防火墙、不会修改默认策略、不会重复安装。"
-        echo "如果只想加端口，请返回菜单选择：3. 批量放行端口。"
-        echo
-        echo "当前检测到的 SSH 端口：$detected_port"
-        if ! ask_yes_no "是否只检查并补充 SSH 端口放行规则？" "y"; then
-            warn "已取消。"
-            return
-        fi
-        local ssh_port
-        ssh_port=$(ask_default "请输入当前 SSH 连接端口，必须正确" "$detected_port")
-        if ! echo "$ssh_port" | grep -Eq '^[0-9]+$'; then err "SSH端口格式错误，已取消。"; return; fi
-        if ufw status numbered 2>/dev/null | grep -qE "^[[] *[0-9]+[]].*${ssh_port}(/tcp)?"; then
-            ok "SSH端口 $ssh_port/tcp 已存在放行规则，未重复添加。"
-        else
-            ufw allow "$ssh_port/tcp" comment "SSH远程连接端口" >/dev/null 2>&1 && ok "已补充放行 SSH 端口：$ssh_port/tcp"
-        fi
-        ufw logging on >/dev/null 2>&1
-        ufw reload >/dev/null 2>&1
-        ok "UFW 已安全重载，原有规则已保留。"
+        ok "检测到 UFW 已启用，跳过安装和基础配置。"
+        echo "为避免 SSH 失联，不会重置规则、不会修改默认策略、不会追问端口。"
+        echo "如需开放端口，请使用：3. 批量放行端口。"
+        echo "如需管理 IPv6，请使用：9. IPv6 开关。"
         return
     fi
 
@@ -180,6 +200,7 @@ ufw_batch_rule(){
     [ -z "$ports" ] && { err "端口列表不能为空"; return; }
     proto=$(ask_default "请选择协议 tcp/udp/both" "tcp")
     scope=$(ask_default "请选择IP版本 all/4/6" "all")
+    ufw_check_ipv6_for_scope "$scope"
 
     echo "$ports" | tr ' ,，;；' '\n' | while read -r p; do
         p=$(echo "$p" | xargs)
@@ -253,6 +274,7 @@ ufw_menu(){
         echo "6. 屏蔽IP黑名单"
         echo "7. 删除规则"
         echo "8. 重载防火墙"
+        echo "9. IPv6 开关"
         echo "0. 返回"
         line
         read -r -p "请选择: " c
@@ -265,6 +287,7 @@ ufw_menu(){
             6) ufw_ip_rule deny ;;
             7) ufw_delete_rules ;;
             8) ufw reload && ok "UFW 已重载" ;;
+            9) ufw_ipv6_menu ;;
             0) break ;;
             *) err "无效选择" ;;
         esac
@@ -504,17 +527,17 @@ one_key_install(){
     header; status_bar; line
     echo -e "${BOLD}一键安装 UFW + Fail2Ban${NC}"
     echo "安全说明："
-    echo "1. UFW：只做安全检查。已启用则不重置、不改默认策略。"
-    echo "2. Fail2Ban：只安装软件，不进入防护配置交互。"
-    echo "3. 安装完成后，请到 Fail2Ban 菜单选择具体防护项目配置。"
+    echo "1. 只安装缺失的软件，不进入防护配置交互。"
+    echo "2. 如果 UFW 已安装，会直接跳过，不追问端口。"
+    echo "3. 安装完成后，请分别进入 UFW / Fail2Ban 菜单配置。"
     line
     read -r -p "是否继续？输入 yes 继续: " okv
     [ "$okv" = "yes" ] || { warn "已取消"; pause; return; }
-    ufw_install_basic
+    if cmd_exists ufw; then ok "UFW 已安装，跳过安装。"; else ensure_ufw && ok "UFW 安装完成。"; fi
     echo
     f2b_install_only
     echo
-    ok "一键安装完成。防护规则请进入 Fail2Ban 菜单单独配置。"
+    ok "一键安装完成。未修改现有防火墙规则。"
     pause
 }
 
