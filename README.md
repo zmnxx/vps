@@ -1,3 +1,6 @@
+
+
+
 在线管理 ufw
 
 
@@ -16,3 +19,14 @@ curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh 
 bash reinstall.sh debian 12 \
 --ssh-key "" \
 --ssh-port 22
+
+重启指令
+
+reboot
+
+重装完运行必要软件指令
+
+apt update
+apt upgrade -y
+
+apt install -y vim htop unzip zip tar net-tools curl wget git nano ca-certificates gnupg lsb-release bash-completion
