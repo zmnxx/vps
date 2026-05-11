@@ -29,10 +29,25 @@ pause() {
 }
 
 confirm() {
+    # 用法: confirm "提示信息" [y|n]
+    # 第二个参数指定默认值，大写即为回车默认
     local msg="${1:-确认执行此操作?}"
-    read -r -p "$msg [Y/n]: " yn
-    [[ "$yn" =~ ^[Nn]$ ]] && return 1
-    return 0
+    local default="${2:-y}"
+    local hint prompt
+    if [ "$default" = "y" ]; then
+        hint="${GREEN}Y${NC}/n"
+        prompt="[回车=Y]"
+    else
+        hint="y/${RED}N${NC}"
+        prompt="[回车=N]"
+    fi
+    echo -en "$msg "
+    echo -e "$hint $prompt"
+    read -r -p "> " yn
+    if [ -z "$yn" ]; then
+        [ "$default" = "y" ] && return 0 || return 1
+    fi
+    [[ "$yn" =~ ^[Yy]$ ]] && return 0 || return 1
 }
 
 has_cmd() {
@@ -393,7 +408,7 @@ manage_ufw() {
                 read -r -p "输入要删除的规则编号 (空格分隔): " ids
                 [ -z "$ids" ] && continue
                 
-                confirm "确认删除这些规则" || { pause; continue; }
+                confirm "确认删除这些规则" "n" || { pause; continue; }
                 
                 for id in $(echo "$ids" | tr ' ' '\n' | sort -rn); do
                     [[ "$id" =~ ^[0-9]+$ ]] && echo "y" | ufw delete "$id" 2>/dev/null
@@ -408,8 +423,14 @@ manage_ufw() {
                 echo -e "  3. 重载规则"
                 read -r -p "操作: " op
                 case $op in
-                    1) confirm "开启防火墙将拦截未允许的入站连接" && ufw enable ;;
-                    2) confirm "关闭防火墙将移除所有入站限制" && ufw disable ;;
+                    1) 
+                        confirm "开启防火墙将拦截未允许的入站连接" "n" && \
+                        echo "y" | ufw enable && echo -e "${GREEN}防火墙已开启${NC}"
+                        ;;
+                    2) 
+                        confirm "关闭防火墙将移除所有入站限制" "n" && \
+                        echo "y" | ufw disable && echo -e "${YELLOW}防火墙已关闭${NC}"
+                        ;;
                     3) ufw reload && echo -e "${GREEN}已重载${NC}" ;;
                 esac
                 pause 
@@ -418,7 +439,7 @@ manage_ufw() {
                 local current
                 current=$(get_ufw_ipv6)
                 echo -e "当前 IPv6: ${current}"
-                if confirm "切换 IPv6 支持状态"; then
+                if confirm "切换 IPv6 支持状态" "n"; then
                     if [ "$current" = "yes" ]; then
                         sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
                     else
@@ -534,7 +555,7 @@ manage_fail2ban() {
                 
                 echo -e "\n配置摘要: 端口=${CYAN}${ssh_port}${NC} 时长=${CYAN}${ssh_bantime}${NC} 重试=${CYAN}${ssh_maxretry}${NC}"
                 
-                if confirm "确认应用此配置"; then
+                if confirm "确认应用此配置" "y"; then
                     write_sshd_jail "$ssh_bantime" "$ssh_maxretry" "$ssh_port" "$ssh_logpath"
                     restart_f2b
                 fi
@@ -554,7 +575,7 @@ manage_fail2ban() {
                 read -r -p "触发阈值    [默认: 10]: " scan_maxretry
                 scan_maxretry=${scan_maxretry:-10}
                 
-                if confirm "确认应用此配置"; then
+                if confirm "确认应用此配置" "y"; then
                     mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
                     ufw logging on >/dev/null 2>&1
                     write_portscan_filter
@@ -619,7 +640,7 @@ manage_fail2ban() {
                 ;;
             6)
                 if f2b_ping; then
-                    if confirm "这将解封所有被 ban 的 IP"; then
+                if confirm "确认解封所有被封禁的 IP" "n"; then
                         fail2ban-client unban --all
                         echo -e "${GREEN}已解封所有 IP${NC}"
                     fi
@@ -658,7 +679,7 @@ manage_bbr() {
 
         case $bbr_choice in
             1)
-                if confirm "开启标准 BBR 加速"; then
+                if confirm "开启标准 BBR 加速" "n"; then
                     sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
                     echo -e "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
                     sysctl -p >/dev/null
@@ -668,7 +689,7 @@ manage_bbr() {
                 ;;
             2)
                 echo -e "${YELLOW}高性能方案将调整多个 TCP 参数${NC}"
-                if confirm "确认开启高性能 BBR 方案"; then
+                if confirm "确认开启高性能 BBR 方案" "n"; then
                     sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
                     cat >> /etc/sysctl.conf <<'EOF'
 net.core.default_qdisc=fq
@@ -694,7 +715,7 @@ EOF
                 pause 
                 ;;
             4)
-                if confirm "恢复默认 TCP 设置"; then
+                if confirm "恢复默认 TCP 设置" "n"; then
                     sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
                     echo -e "net.core.default_qdisc=pfifo_fast\nnet.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
                     sysctl -p >/dev/null
@@ -731,7 +752,7 @@ manage_swap() {
                 echo -e "\n${CYAN}--- 创建 SWAP ---${NC}"
                 if [ "$(get_swap_status_text)" = "已启用" ]; then
                     echo -e "${YELLOW}检测到已有 SWAP，继续将删除旧配置${NC}"
-                    confirm "确认重新配置" || { pause; continue; }
+                    confirm "确认重新配置" "n" || { pause; continue; }
                 fi
                 
                 swapoff /swapfile 2>/dev/null
@@ -790,7 +811,7 @@ manage_swap() {
                     continue
                 fi
                 
-                if confirm "这将删除 SWAP 文件并恢复默认设置"; then
+                if confirm "确认删除 SWAP 文件并恢复默认设置" "n"; then
                     swapoff /swapfile 2>/dev/null
                     rm -f /swapfile
                     sed -i '/\/swapfile/d' /etc/fstab
