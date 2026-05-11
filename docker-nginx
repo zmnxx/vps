@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v23"
+VERSION="v24-fixed"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -93,7 +93,24 @@ ask_yn(){
 
 safe_name(){ echo "$1" | grep -Eq '^[a-zA-Z][a-zA-Z0-9._-]*$'; }
 valid_port(){ echo "$1" | grep -Eq '^[0-9]+$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-valid_domain(){ echo "$1" | grep -Eq '^([a-zA-Z][a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$'; }
+valid_index(){ echo "$1" | grep -Eq '^[0-9]+$'; }
+valid_domain(){
+  # RFC 1035/1123: 域名标签允许字母或数字开头/结尾，中间可有横杠；
+  # 原 v23 要求每一段必须字母开头，导致 sg.038899.xyz 被误判为非法。
+  local d="${1%.}" label
+  [ -n "$d" ] || return 1
+  [ "${#d}" -le 253 ] || return 1
+  [[ "$d" == *.* ]] || return 1
+  [[ "$d" != *..* ]] || return 1
+  [[ "$d" != *:* ]] || return 1
+  IFS='.' read -r -a labels <<< "$d"
+  for label in "${labels[@]}"; do
+    [ -n "$label" ] || return 1
+    [ "${#label}" -le 63 ] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+  [[ "${labels[-1]}" =~ ^[A-Za-z]{2,63}$ ]] || return 1
+}
 
 select_container(){
   local containers=($(docker ps -a --format '{{.Names}}' 2>/dev/null | sort))
@@ -106,6 +123,7 @@ select_container(){
   local n
   read -rp "  请选择 [0-${#containers[@]}]: " n
   [ "$n" = "0" ] || [ -z "$n" ] && return 1
+  valid_index "$n" || { err "选择无效"; return 1; }
   local idx=$((n-1))
   [ "$idx" -lt 0 ] || [ "$idx" -ge ${#containers[@]} ] && { err "选择无效"; return 1; }
   SELECTED_CONTAINER="${containers[$idx]}"
@@ -132,6 +150,7 @@ select_compose_dir(){
   local n
   read -rp "  请选择 [0-${#files[@]}]: " n
   [ "$n" = "0" ] || [ -z "$n" ] && return 1
+  valid_index "$n" || { err "选择无效"; return 1; }
   local idx=$((n-1))
   [ "$idx" -lt 0 ] || [ "$idx" -ge ${#files[@]} ] && { err "选择无效"; return 1; }
   SELECTED_DIR="$(dirname "${files[$idx]}")"
@@ -228,7 +247,7 @@ create_docker_project(){
   [ -z "$name" ] && { info "已取消创建项目"; return 0; }
   
   while ! safe_name "$name"; do
-    err "只能用字母、数字、横杠、下划线"
+    err "只能用字母、数字、点、横杠、下划线，且必须以字母开头"
     read -rp "  项目名称: " name
     [ -z "$name" ] && { info "已取消创建项目"; return 0; }
   done
@@ -313,7 +332,7 @@ list_projects(){
 
 restart_project(){
   select_compose_dir || return 0
-  cd "$SELECTED_DIR"
+  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
   echo
   echo "  启动方式："
   echo "    [1] 启动/重启（应用配置更改）"
@@ -334,14 +353,14 @@ restart_project(){
 
 stop_project(){
   select_compose_dir || return 0
-  cd "$SELECTED_DIR"
+  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
   docker compose stop
   ok "项目已停止"
 }
 
 project_logs(){
   select_compose_dir || return 0
-  cd "$SELECTED_DIR"
+  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
   echo
   echo "=========================================="
   echo "  项目日志: $SELECTED_DIR"
@@ -355,14 +374,15 @@ edit_project(){
   local file="$SELECTED_DIR/docker-compose.yml"
   edit_file "$file"
   if ask_yn "应用配置？"; then
-    cd "$SELECTED_DIR" && docker compose up -d
+    cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
+    docker compose up -d
     ok "已应用配置"
   fi
 }
 
 update_project(){
   select_compose_dir || return 0
-  cd "$SELECTED_DIR"
+  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
   ask_yn "确认更新？" || return 0
   docker compose pull && docker compose up -d
   ok "项目已更新"
@@ -649,7 +669,7 @@ create_nginx_proxy(){
   fi
   
   while ! safe_name "$name"; do
-    err "只能用字母、数字、横杠、下划线"
+    err "只能用字母、数字、点、横杠、下划线，且必须以字母开头"
     read -rp "  配置名称: " name
     [ -z "$name" ] && { info "已取消"; return 0; }
   done
