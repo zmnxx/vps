@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v26-simple"
+VERSION="v27-refined"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -24,6 +24,7 @@ LAST_BASE="$DEFAULT_BASE"
 SELECTED_CONTAINER=""
 SELECTED_DIR=""
 SELECTED_CERT=""
+SELECTED_IMAGE=""
 
 # 输出
 ok(){ echo -e "  ${GREEN}[OK]${NC} $1"; }
@@ -515,6 +516,56 @@ delete_project_config(){
 
 
 
+select_image(){
+  local images=()
+  local line n idx
+  while IFS= read -r line; do
+    [ -n "$line" ] && images+=("$line")
+  done < <(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}' 2>/dev/null | sort)
+  [ ${#images[@]} -eq 0 ] && { warn "没有镜像"; return 1; }
+  echo
+  echo "  选择镜像："
+  for i in "${!images[@]}"; do echo "    [$((i+1))] ${images[$i]}"; done
+  echo "    [0] 取消"
+  echo
+  read -rp "  请选择 [0-${#images[@]}]: " n
+  [ "$n" = "0" ] || [ -z "$n" ] && return 1
+  valid_index "$n" || { err "选择无效"; return 1; }
+  idx=$((n-1))
+  [ "$idx" -lt 0 ] || [ "$idx" -ge ${#images[@]} ] && { err "选择无效"; return 1; }
+  SELECTED_IMAGE="${images[$idx]%% *}"
+}
+
+container_action_menu(){
+  local c="$1"
+  while true; do
+    ui_header "容器操作: $c"
+    echo "  [1] 查看日志"
+    echo "  [2] 进入容器"
+    echo "  [3] 重启容器"
+    echo "  [4] 停止容器"
+    echo "  [5] 启动容器"
+    echo "  [6] 容器详情"
+    echo "  [7] 删除容器"
+    echo "  [0] 返回"
+    echo
+    read -rp "  请选择 [0-7]: " a
+    case "$a" in
+      1) docker logs --tail=200 -f "$c" ;;
+      2) docker exec -it "$c" sh || docker exec -it "$c" bash ;;
+      3) ask_yn "重启 $c？" && docker restart "$c" && ok "已重启"; pause ;;
+      4) ask_yn "停止 $c？" && docker stop "$c" && ok "已停止"; pause ;;
+      5) docker start "$c" && ok "已启动"; pause ;;
+      6) docker inspect "$c" | less ;;
+      7) ask_yn "确认删除 $c？" "n" && docker rm -f "$c" && ok "已删除" && return 0; pause ;;
+      0) return 0 ;;
+      "") continue ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+
 # =============================================
 # 容器管理
 # =============================================
@@ -522,19 +573,11 @@ container_menu(){
   while true; do
     ui_header "容器管理"
     echo "  [1] 容器列表"
-    echo "  [2] 资源占用"
-    echo "  [3] 查看日志"
-    echo "  [4] 进入容器"
-    echo "  [5] 启动容器"
-    echo "  [6] 停止容器"
-    echo "  [7] 重启容器"
-    echo "  [8] 删除容器"
-    echo "  [9] 容器详情"
-    echo "  [10] 容器进程"
-    echo "  [11] 编辑配置"
+    echo "  [2] 选择容器"
+    echo "  [3] 资源占用"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-11]: " c
+    read -rp "  请选择 [0-3]: " c
 
     case "$c" in
       1)
@@ -544,65 +587,13 @@ container_menu(){
         ;;
       2)
         need_docker_running || { pause; continue; }
-        info "按 Ctrl+C 退出实时监控"
-        docker stats
+        select_container || continue
+        container_action_menu "$SELECTED_CONTAINER"
         ;;
       3)
         need_docker_running || { pause; continue; }
-        select_container && docker logs --tail=200 -f "$SELECTED_CONTAINER"
-        ;;
-      4)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        info "进入容器，退出请输入 exit"
-        docker exec -it "$SELECTED_CONTAINER" sh || docker exec -it "$SELECTED_CONTAINER" bash
-        ;;
-      5)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        docker start "$SELECTED_CONTAINER" && ok "已启动: $SELECTED_CONTAINER"
-        ;;
-      6)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        ask_yn "停止 $SELECTED_CONTAINER？" && docker stop "$SELECTED_CONTAINER" && ok "已停止"
-        ;;
-      7)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        ask_yn "重启 $SELECTED_CONTAINER？" && docker restart "$SELECTED_CONTAINER" && ok "已重启"
-        ;;
-      8)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        ask_yn "确认删除 $SELECTED_CONTAINER？" "n" && docker rm -f "$SELECTED_CONTAINER" && ok "已删除"
-        pause
-        ;;
-      9)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        docker inspect "$SELECTED_CONTAINER" | less
-        ;;
-      10)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        docker top "$SELECTED_CONTAINER"
-        pause
-        ;;
-      11)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        local dir
-        dir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$SELECTED_CONTAINER" 2>/dev/null)
-        if [ -n "$dir" ] && [ -f "$dir/docker-compose.yml" ]; then
-          edit_file "$dir/docker-compose.yml"
-          if ask_yn "应用配置？"; then
-            (cd "$dir" && docker compose up -d) && ok "已应用配置"
-          fi
-        else
-          warn "未找到配置"
-        fi
-        pause
+        info "按 Ctrl+C 退出"
+        docker stats
         ;;
       0) return ;;
       "") continue ;;
@@ -610,7 +601,6 @@ container_menu(){
     esac
   done
 }
-
 
 # =============================================
 # 维护清理
@@ -737,6 +727,7 @@ maintenance_menu(){
   done
 }
 
+
 # =============================================
 # 镜像管理
 # =============================================
@@ -745,12 +736,11 @@ image_menu(){
     ui_header "镜像管理"
     echo "  [1] 镜像列表"
     echo "  [2] 拉取镜像"
-    echo "  [3] 删除镜像"
-    echo "  [4] 镜像历史"
-    echo "  [5] 清理悬空镜像"
+    echo "  [3] 选择镜像"
+    echo "  [4] 清理镜像"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-5]: " c
+    read -rp "  请选择 [0-4]: " c
     case "$c" in
       1)
         need_docker_running || { pause; continue; }
@@ -760,31 +750,33 @@ image_menu(){
       2)
         need_docker_running || { pause; continue; }
         local image
-        read -rp "  镜像名，如 nginx:latest: " image
+        read -rp "  镜像名: " image
         [ -z "$image" ] && { info "已取消"; continue; }
         docker pull "$image"
         pause
         ;;
       3)
         need_docker_running || { pause; continue; }
-        docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}'
-        local image
-        read -rp "  要删除的镜像名或 ID: " image
-        [ -z "$image" ] && { info "已取消"; continue; }
-        ask_yn "确认删除镜像 $image？" "n" && docker rmi "$image"
-        pause
+        select_image || continue
+        while true; do
+          ui_header "镜像操作: $SELECTED_IMAGE"
+          echo "  [1] 镜像历史"
+          echo "  [2] 删除镜像"
+          echo "  [0] 返回"
+          echo
+          read -rp "  请选择 [0-2]: " a
+          case "$a" in
+            1) docker history "$SELECTED_IMAGE"; pause ;;
+            2) ask_yn "确认删除 $SELECTED_IMAGE？" "n" && docker rmi "$SELECTED_IMAGE"; pause; break ;;
+            0) break ;;
+            "") continue ;;
+            *) warn "无效选择" ;;
+          esac
+        done
         ;;
       4)
         need_docker_running || { pause; continue; }
-        local image
-        read -rp "  镜像名或 ID: " image
-        [ -z "$image" ] && { info "已取消"; continue; }
-        docker history "$image"
-        pause
-        ;;
-      5)
-        need_docker_running || { pause; continue; }
-        ask_yn "清理悬空镜像？" && docker image prune -f
+        ask_yn "清理未使用镜像？" "n" && docker image prune -a -f
         pause
         ;;
       0) return ;;
@@ -793,7 +785,6 @@ image_menu(){
     esac
   done
 }
-
 
 # =============================================
 # Docker 主菜单
@@ -805,7 +796,7 @@ docker_menu(){
     echo "  [2] 容器管理"
     echo "  [3] 镜像管理"
     echo "  [4] 维护清理"
-    echo "  [5] 状态总览"
+    echo "  [5] 系统状态"
     echo "  [0] 返回"
     echo
     read -rp "  请选择 [0-5]: " c
@@ -820,10 +811,10 @@ docker_menu(){
           echo "  [4] 启动/重启"
           echo "  [5] 停止项目"
           echo "  [6] 下线项目"
-          echo "  [7] 查看项目日志"
+          echo "  [7] 项目日志"
           echo "  [8] 编辑配置"
           echo "  [9] 拉取更新"
-          echo "  [10] 删除项目目录"
+          echo "  [10] 删除项目"
           echo "  [0] 返回"
           echo
           read -rp "  请选择 [0-10]: " sc
