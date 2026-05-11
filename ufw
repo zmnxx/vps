@@ -82,7 +82,10 @@ get_ufw_status_text() {
         echo "未安装"
         return
     fi
-    if ufw status 2>/dev/null | grep -qi "status.*active"; then
+    # 检查 UFW 配置文件中的 ENABLED 状态
+    local enabled
+    enabled=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2 | tr '[:lower:]' '[:upper:]')
+    if [ "$enabled" = "YES" ]; then
         echo "运行中"
     else
         echo "已停止"
@@ -376,7 +379,11 @@ manage_ufw() {
         case $ufw_choice in
             1) 
                 echo -e "\n${CYAN}--- UFW 规则列表 ---${NC}"
-                ufw status numbered
+                if ! ufw status numbered 2>/dev/null; then
+                    echo -e "${YELLOW}UFW 未启用，无法显示编号规则${NC}"
+                    echo -e "${GRAY}已配置的规则（防火墙关闭后仍保留）：${NC}"
+                    ufw status verbose 2>/dev/null || echo "无可用规则"
+                fi
                 pause 
                 ;;
             2)
@@ -403,17 +410,20 @@ manage_ufw() {
                 ;;
             3)
                 echo -e "\n${CYAN}--- 删除规则 ---${NC}"
-                ufw status numbered
-                echo ""
-                read -r -p "输入要删除的规则编号 (空格分隔): " ids
-                [ -z "$ids" ] && continue
-                
-                confirm "确认删除这些规则" "n" || { pause; continue; }
-                
-                for id in $(echo "$ids" | tr ' ' '\n' | sort -rn); do
-                    [[ "$id" =~ ^[0-9]+$ ]] && echo "y" | ufw delete "$id" 2>/dev/null
-                done
-                echo -e "${GREEN}规则已删除${NC}"
+                if ufw status numbered 2>/dev/null; then
+                    echo ""
+                    read -r -p "输入要删除的规则编号 (空格分隔): " ids
+                    [ -z "$ids" ] && continue
+                    
+                    confirm "确认删除这些规则" "n" || { pause; continue; }
+                    
+                    for id in $(echo "$ids" | tr ' ' '\n' | sort -rn); do
+                        [[ "$id" =~ ^[0-9]+$ ]] && echo "y" | ufw delete "$id" 2>/dev/null
+                    done
+                    echo -e "${GREEN}规则已删除${NC}"
+                else
+                    echo -e "${YELLOW}UFW 未启用，无法删除规则${NC}"
+                fi
                 pause 
                 ;;
             4)
