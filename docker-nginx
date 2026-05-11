@@ -15,7 +15,7 @@ CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v24-fixed"
+VERSION="v25-maintenance"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -110,6 +110,121 @@ valid_domain(){
     [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
   done
   [[ "${labels[-1]}" =~ ^[A-Za-z]{2,63}$ ]] || return 1
+}
+
+# =============================================
+# 通用状态/安全执行辅助
+# =============================================
+cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
+
+docker_ready(){ cmd_exists docker && docker info >/dev/null 2>&1; }
+
+need_docker_running(){
+  if ! cmd_exists docker; then
+    err "Docker 未安装，请先执行 一键安装。"
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    err "Docker 未运行，请先启动 Docker 服务: systemctl start docker"
+    return 1
+  fi
+  return 0
+}
+
+service_state_cn(){
+  local svc="$1"
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    echo "运行中"
+  elif systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    echo "已安装/未运行"
+  else
+    echo "未安装或未启用"
+  fi
+}
+
+bytes_human(){ numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
+
+container_log_path(){ docker inspect --format '{{.LogPath}}' "$1" 2>/dev/null; }
+
+clear_container_log(){
+  local target="$1" lp
+  lp=$(container_log_path "$target")
+  [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null
+}
+
+clear_all_container_logs(){
+  local count=0 cid lp
+  need_docker_running || return 1
+  for cid in $(docker ps -aq 2>/dev/null); do
+    lp=$(container_log_path "$cid")
+    if [ -f "$lp" ]; then
+      truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
+    fi
+  done
+  ok "已清空 $count 个容器日志"
+}
+
+show_log_usage(){
+  echo
+  echo "  容器日志占用 TOP 10："
+  if [ -d /var/lib/docker/containers ]; then
+    find /var/lib/docker/containers -name "*-json.log" -type f -printf '%s %p\n' 2>/dev/null | sort -n | tail -10 | while read -r size path; do
+      echo "    $(bytes_human "$size")  $path"
+    done
+  else
+    info "未找到 Docker 日志目录"
+  fi
+}
+
+docker_system_status(){
+  ui_header "系统状态"
+  echo
+  echo "  基础服务："
+  if cmd_exists docker; then
+    echo "    Docker: $(service_state_cn docker)"
+    docker --version 2>/dev/null | sed 's/^/    版本: /'
+  else
+    echo "    Docker: 未安装"
+  fi
+  if cmd_exists nginx; then
+    echo "    Nginx:  $(service_state_cn nginx)"
+    nginx -v 2>&1 | sed 's/^/    版本: /'
+  else
+    echo "    Nginx:  未安装"
+  fi
+  cmd_exists certbot && certbot --version 2>/dev/null | sed 's/^/    Certbot: /' || echo "    Certbot: 未安装"
+  echo
+
+  echo "  Docker 资源："
+  if docker_ready; then
+    local running exited paused images volumes networks
+    running=$(docker ps -q 2>/dev/null | wc -l)
+    exited=$(docker ps -aq --filter "status=exited" 2>/dev/null | wc -l)
+    paused=$(docker ps -aq --filter "status=paused" 2>/dev/null | wc -l)
+    images=$(docker images -q 2>/dev/null | sort -u | wc -l)
+    volumes=$(docker volume ls -q 2>/dev/null | wc -l)
+    networks=$(docker network ls -q 2>/dev/null | wc -l)
+    echo "    运行容器: $running    已停止: $exited    已暂停: $paused"
+    echo "    镜像数量: $images    卷数量: $volumes    网络数量: $networks"
+    echo
+    echo "  Docker 空间："
+    docker system df 2>/dev/null | sed 's/^/    /'
+    echo
+    echo "  容器列表："
+    docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null | sed 's/^/    /'
+  else
+    echo "    Docker 未运行，无法读取容器状态"
+  fi
+  echo
+
+  echo "  系统磁盘："
+  df -h / 2>/dev/null | awk 'NR==1{print "    "$0} NR==2{print "    "$0}'
+  echo
+
+  echo "  定时维护："
+  local job
+  job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh" || true)
+  [ -z "$job" ] && echo "    未设置" || echo "    $job"
 }
 
 select_container(){
@@ -222,8 +337,8 @@ install_all(){
   ok "基础环境安装完成"
   echo
   if has_auto_cleanup; then
-    ok "已存在 Docker 日志定时清理任务，跳过重复设置"
-  elif ask_yn "设置定时自动清理日志？" "y"; then
+    ok "已存在 Docker 定时维护任务，跳过重复设置"
+  elif ask_yn "设置定时维护清理？" "y"; then
     setup_auto_cleanup
   fi
   echo
@@ -402,88 +517,95 @@ delete_project_config(){
   ok "已删除项目目录: $SELECTED_DIR"
 }
 
+
 # =============================================
-# 容器管理
+# 容器管理（单容器级别）
 # =============================================
 container_menu(){
   while true; do
-    ui_header "容器管理"
-    echo "  [1] 查看容器"
-    echo "  [2] 查看日志"
-    echo "  [3] 重启容器"
-    echo "  [4] 停止容器"
+    ui_header "容器管理（单容器）"
+    echo "  [1] 容器列表"
+    echo "  [2] 实时资源占用 stats"
+    echo "  [3] 查看容器日志"
+    echo "  [4] 进入容器 Shell"
     echo "  [5] 启动容器"
-    echo "  [6] 编辑配置"
-    echo "  [7] 清理日志"
+    echo "  [6] 停止容器"
+    echo "  [7] 重启容器"
+    echo "  [8] 删除容器"
+    echo "  [9] 查看容器详情 inspect"
+    echo "  [10] 查看容器进程 top"
+    echo "  [11] 编辑所属 Compose 配置"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-7]: " c
-    
+    read -rp "  请选择 [0-11]: " c
+
     case "$c" in
-      1) docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; pause ;;
-      2) select_container && docker logs --tail=100 -f "$SELECTED_CONTAINER" ;;
+      1)
+        need_docker_running || { pause; continue; }
+        docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+        pause
+        ;;
+      2)
+        need_docker_running || { pause; continue; }
+        info "按 Ctrl+C 退出实时监控"
+        docker stats
+        ;;
       3)
-        select_container || continue
-        ask_yn "重启 $SELECTED_CONTAINER？" && docker restart "$SELECTED_CONTAINER" && ok "已重启"
+        need_docker_running || { pause; continue; }
+        select_container && docker logs --tail=200 -f "$SELECTED_CONTAINER"
         ;;
       4)
+        need_docker_running || { pause; continue; }
+        select_container || continue
+        info "进入容器，退出请输入 exit"
+        docker exec -it "$SELECTED_CONTAINER" sh || docker exec -it "$SELECTED_CONTAINER" bash
+        ;;
+      5)
+        need_docker_running || { pause; continue; }
+        select_container || continue
+        docker start "$SELECTED_CONTAINER" && ok "已启动: $SELECTED_CONTAINER"
+        ;;
+      6)
+        need_docker_running || { pause; continue; }
         select_container || continue
         ask_yn "停止 $SELECTED_CONTAINER？" && docker stop "$SELECTED_CONTAINER" && ok "已停止"
         ;;
-      5)
+      7)
+        need_docker_running || { pause; continue; }
         select_container || continue
-        docker start "$SELECTED_CONTAINER" && ok "已启动"
+        ask_yn "重启 $SELECTED_CONTAINER？" && docker restart "$SELECTED_CONTAINER" && ok "已重启"
         ;;
-      6)
+      8)
+        need_docker_running || { pause; continue; }
+        select_container || continue
+        warn "删除容器不会删除镜像和命名卷，但会删除该容器实例。"
+        ask_yn "确认删除 $SELECTED_CONTAINER？" "n" && docker rm -f "$SELECTED_CONTAINER" && ok "已删除"
+        pause
+        ;;
+      9)
+        need_docker_running || { pause; continue; }
+        select_container || continue
+        docker inspect "$SELECTED_CONTAINER" | less
+        ;;
+      10)
+        need_docker_running || { pause; continue; }
+        select_container || continue
+        docker top "$SELECTED_CONTAINER"
+        pause
+        ;;
+      11)
+        need_docker_running || { pause; continue; }
         select_container || continue
         local dir
         dir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$SELECTED_CONTAINER" 2>/dev/null)
-        [ -n "$dir" ] && [ -f "$dir/docker-compose.yml" ] && edit_file "$dir/docker-compose.yml" || warn "未找到配置"
-        ;;
-      7)
-        select_container || continue
-        local lp
-        lp=$(docker inspect --format '{{.LogPath}}' "$SELECTED_CONTAINER" 2>/dev/null)
-        [ -f "$lp" ] && truncate -s 0 "$lp" && ok "日志已清空" || warn "无法清空"
-        ;;
-      0) return ;;
-      "") continue ;;
-      *) warn "无效选择" ;;
-    esac
-  done
-}
-
-# =============================================
-# 日志管理
-# =============================================
-log_menu(){
-  while true; do
-    ui_header "日志管理"
-    echo "  [1] 清理所有容器日志"
-    echo "  [2] 查看日志占用"
-    echo "  [3] 查看清理记录"
-    echo "  [0] 返回"
-    echo
-    read -rp "  请选择 [0-3]: " c
-    
-    case "$c" in
-      1)
-        ask_yn "确认清空所有日志？" || continue
-        local count=0
-        for cid in $(docker ps -aq); do
-          local lp=$(docker inspect --format '{{.LogPath}}' "$cid" 2>/dev/null)
-          [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
-        done
-        ok "已清空 $count 个日志"
-        ;;
-      2)
-        echo
-        du -sh /var/lib/docker/containers/*/*.log 2>/dev/null | sort -h | tail -10 || info "没有日志"
-        pause
-        ;;
-      3)
-        echo
-        [ -f /var/log/docker-cleanup.log ] && tail -10 /var/log/docker-cleanup.log || warn "没有记录"
+        if [ -n "$dir" ] && [ -f "$dir/docker-compose.yml" ]; then
+          edit_file "$dir/docker-compose.yml"
+          if ask_yn "应用配置？"; then
+            (cd "$dir" && docker compose up -d) && ok "已应用配置"
+          fi
+        else
+          warn "未找到 Compose 配置目录"
+        fi
         pause
         ;;
       0) return ;;
@@ -493,94 +615,184 @@ log_menu(){
   done
 }
 
+
 # =============================================
-# 定时清理
+# 维护清理：合并日志管理 / 空间清理 / 定时清理
 # =============================================
+write_cleanup_script(){
+  cat > /usr/local/bin/docker-cleanup.sh <<'EOF'
+#!/bin/bash
+DATE=$(date '+%Y-%m-%d %H:%M:%S')
+LOG="/var/log/docker-cleanup.log"
+log(){ echo "[$DATE] $1" >> "$LOG"; }
+log "开始维护清理..."
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  count=0
+  for cid in $(docker ps -aq 2>/dev/null); do
+    lp=$(docker inspect --format '{{.LogPath}}' "$cid" 2>/dev/null)
+    if [ -f "$lp" ]; then
+      truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
+    fi
+  done
+  log "已清空 $count 个容器日志"
+  docker container prune -f >> "$LOG" 2>&1
+  docker image prune -f >> "$LOG" 2>&1
+  docker builder prune -f >> "$LOG" 2>&1
+  log "维护清理完成"
+else
+  log "Docker 未安装或未运行，跳过"
+fi
+EOF
+  chmod +x /usr/local/bin/docker-cleanup.sh
+}
+
 setup_auto_cleanup(){
-  ui_header "定时清理任务"
-  echo "  自动清理：所有容器日志、无用镜像、停止的容器"
+  ui_header "定时维护任务"
+  echo "  定时执行：清空容器日志、清理停止容器、清理悬空镜像、清理构建缓存"
+  echo "  注意：默认不会删除命名卷，也不会删除仍被容器使用的镜像。"
   echo
   echo "  [1] 每天凌晨 3 点（推荐）"
   echo "  [2] 每周一凌晨 3 点"
   echo "  [3] 每月 1 号凌晨 3 点"
   echo "  [4] 查看当前任务"
   echo "  [5] 删除任务"
+  echo "  [6] 立即执行一次"
   echo "  [0] 返回"
   echo
-  local choice
+  local choice cron_time job
   read -rp "  请选择 [1]: " choice
   [ -z "$choice" ] && choice="1"
-  
+
   case "$choice" in
     4)
       echo
-      local job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh")
+      job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh" || true)
       [ -z "$job" ] && warn "未设置" || ok "任务: $job"
       pause
       return 0
       ;;
     5)
-      echo
       crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -
-      ok "已删除"
+      ok "已删除定时维护任务"
+      pause
+      return 0
+      ;;
+    6)
+      write_cleanup_script
+      /usr/local/bin/docker-cleanup.sh
+      ok "已执行一次维护清理"
+      [ -f /var/log/docker-cleanup.log ] && tail -10 /var/log/docker-cleanup.log
       pause
       return 0
       ;;
     0) return 0 ;;
-    1) local cron_time="0 3 * * *" ;;
-    2) local cron_time="0 3 * * 1" ;;
-    3) local cron_time="0 3 1 * *" ;;
+    1) cron_time="0 3 * * *" ;;
+    2) cron_time="0 3 * * 1" ;;
+    3) cron_time="0 3 1 * *" ;;
     *) warn "无效选择"; return 1 ;;
   esac
-  
-  cat > /usr/local/bin/docker-cleanup.sh <<'EOF'
-#!/bin/bash
-DATE=$(date '+%Y-%m-%d %H:%M:%S')
-LOG="/var/log/docker-cleanup.log"
-log(){ echo "[$DATE] $1" >> "$LOG"; }
-log "开始清理..."
-for cid in $(docker ps -aq 2>/dev/null); do
-  lp=$(docker inspect --format '{{.LogPath}}' "$cid" 2>/dev/null)
-  [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null
-done
-log "已清空所有日志"
-docker image prune -f >> "$LOG" 2>&1
-docker container prune -f >> "$LOG" 2>&1
-[ "$(date '+%u')" = "1" ] && docker builder prune -f >> "$LOG" 2>&1
-log "清理完成"
-EOF
-  chmod +x /usr/local/bin/docker-cleanup.sh
-  
+
+  write_cleanup_script
   crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -
   (crontab -l 2>/dev/null; echo "$cron_time /usr/local/bin/docker-cleanup.sh") | crontab -
-  
-  ok "定时任务已设置"
-  [ -f /var/log/docker-cleanup.log ] && tail -3 /var/log/docker-cleanup.log
-  ask_yn "立即执行一次？" && /usr/local/bin/docker-cleanup.sh
+  ok "定时维护任务已设置"
+  ask_yn "立即执行一次？" "n" && /usr/local/bin/docker-cleanup.sh
+  [ -f /var/log/docker-cleanup.log ] && tail -5 /var/log/docker-cleanup.log
   pause
 }
 
-# =============================================
-# 空间清理
-# =============================================
-cleanup_menu(){
+maintenance_menu(){
   while true; do
-    ui_header "空间清理"
-    echo "  [1] 查看空间占用"
-    echo "  [2] 清理无用镜像"
-    echo "  [3] 清理构建缓存"
-    echo "  [4] 一键全部清理"
+    ui_header "维护清理"
+    echo "  [1] 状态/空间总览"
+    echo "  [2] 查看日志占用"
+    echo "  [3] 清空单个容器日志"
+    echo "  [4] 清空全部容器日志"
+    echo "  [5] 清理停止容器"
+    echo "  [6] 清理悬空镜像（安全）"
+    echo "  [7] 清理未使用镜像（深度）"
+    echo "  [8] 清理构建缓存"
+    echo "  [9] 一键安全清理"
+    echo "  [10] 一键深度清理（不删卷）"
+    echo "  [11] 删除未使用卷（危险）"
+    echo "  [12] 定时维护任务"
+    echo "  [13] 查看维护记录"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-4]: " c
-    
+    read -rp "  请选择 [0-13]: " c
+
     case "$c" in
-      1) docker system df; docker system df -v | head -15; pause ;;
-      2) ask_yn "清理无用镜像？" && docker image prune -a ;;
-      3) ask_yn "清理构建缓存？" && docker builder prune -a ;;
+      1)
+        need_docker_running || { pause; continue; }
+        docker_system_status
+        pause
+        ;;
+      2) show_log_usage; pause ;;
+      3)
+        need_docker_running || { pause; continue; }
+        select_container || continue
+        clear_container_log "$SELECTED_CONTAINER" && ok "日志已清空: $SELECTED_CONTAINER" || warn "无法清空"
+        pause
+        ;;
       4)
-        warn "一键清理将删除所有未使用的资源"
-        ask_yn "确认？" && docker system prune -a --volumes
+        ask_yn "确认清空全部容器日志？" "n" && clear_all_container_logs
+        pause
+        ;;
+      5)
+        need_docker_running || { pause; continue; }
+        ask_yn "清理所有已停止容器？" "n" && docker container prune -f
+        pause
+        ;;
+      6)
+        need_docker_running || { pause; continue; }
+        ask_yn "清理悬空镜像？" && docker image prune -f
+        pause
+        ;;
+      7)
+        need_docker_running || { pause; continue; }
+        warn "会删除所有未被容器使用的镜像，之后可能需要重新 pull。"
+        ask_yn "确认深度清理镜像？" "n" && docker image prune -a -f
+        pause
+        ;;
+      8)
+        need_docker_running || { pause; continue; }
+        ask_yn "清理构建缓存？" && docker builder prune -a -f
+        pause
+        ;;
+      9)
+        need_docker_running || { pause; continue; }
+        warn "安全清理：清空日志 + 停止容器 + 悬空镜像 + 构建缓存，不删除卷。"
+        if ask_yn "确认执行？" "n"; then
+          clear_all_container_logs
+          docker container prune -f
+          docker image prune -f
+          docker builder prune -f
+          ok "安全清理完成"
+        fi
+        pause
+        ;;
+      10)
+        need_docker_running || { pause; continue; }
+        warn "深度清理：清空日志 + 停止容器 + 所有未使用镜像 + 构建缓存，不删除卷。"
+        if ask_yn "确认执行？" "n"; then
+          clear_all_container_logs
+          docker container prune -f
+          docker image prune -a -f
+          docker builder prune -a -f
+          ok "深度清理完成"
+        fi
+        pause
+        ;;
+      11)
+        need_docker_running || { pause; continue; }
+        warn "危险：会删除所有未被容器使用的 Docker 卷，可能导致数据丢失。"
+        ask_yn "确认删除未使用卷？" "n" && docker volume prune -f
+        pause
+        ;;
+      12) setup_auto_cleanup ;;
+      13)
+        [ -f /var/log/docker-cleanup.log ] && tail -30 /var/log/docker-cleanup.log || warn "没有维护记录"
+        pause
         ;;
       0) return ;;
       "") continue ;;
@@ -588,6 +800,65 @@ cleanup_menu(){
     esac
   done
 }
+
+
+# =============================================
+# 镜像管理
+# =============================================
+image_menu(){
+  while true; do
+    ui_header "镜像管理"
+    echo "  [1] 镜像列表"
+    echo "  [2] 拉取镜像 pull"
+    echo "  [3] 删除镜像 rmi"
+    echo "  [4] 查看镜像历史 history"
+    echo "  [5] 清理悬空镜像"
+    echo "  [0] 返回"
+    echo
+    read -rp "  请选择 [0-5]: " c
+    case "$c" in
+      1)
+        need_docker_running || { pause; continue; }
+        docker images
+        pause
+        ;;
+      2)
+        need_docker_running || { pause; continue; }
+        local image
+        read -rp "  镜像名，如 nginx:latest: " image
+        [ -z "$image" ] && { info "已取消"; continue; }
+        docker pull "$image"
+        pause
+        ;;
+      3)
+        need_docker_running || { pause; continue; }
+        docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}'
+        local image
+        read -rp "  要删除的镜像名或 ID: " image
+        [ -z "$image" ] && { info "已取消"; continue; }
+        ask_yn "确认删除镜像 $image？" "n" && docker rmi "$image"
+        pause
+        ;;
+      4)
+        need_docker_running || { pause; continue; }
+        local image
+        read -rp "  镜像名或 ID: " image
+        [ -z "$image" ] && { info "已取消"; continue; }
+        docker history "$image"
+        pause
+        ;;
+      5)
+        need_docker_running || { pause; continue; }
+        ask_yn "清理悬空镜像？" && docker image prune -f
+        pause
+        ;;
+      0) return ;;
+      "") continue ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
 
 # =============================================
 # Docker 主菜单
@@ -595,39 +866,48 @@ cleanup_menu(){
 docker_menu(){
   while true; do
     ui_header "Docker 管理"
-    echo "  [1] 项目管理"
-    echo "  [2] 容器管理"
-    echo "  [3] 日志管理"
-    echo "  [4] 空间清理"
-    echo "  [5] 定时清理"
+    echo "  [1] 项目管理（Compose 项目级：创建/启动/更新/删除）"
+    echo "  [2] 容器管理（单容器级：日志/Shell/启停/详情）"
+    echo "  [3] 镜像管理"
+    echo "  [4] 维护清理（日志/空间/定时合并）"
+    echo "  [5] Docker 状态总览"
     echo "  [0] 返回"
     echo
     read -rp "  请选择 [0-5]: " c
-    
+
     case "$c" in
       1)
         while true; do
-          ui_header "项目管理"
+          ui_header "项目管理（Docker Compose）"
           echo "  [1] 创建项目"
           echo "  [2] 项目列表"
-          echo "  [3] 启动/重启"
-          echo "  [4] 停止项目"
-          echo "  [5] 查看日志"
-          echo "  [6] 编辑配置"
-          echo "  [7] 更新项目"
-          echo "  [8] 删除配置"
+          echo "  [3] 项目状态 ps"
+          echo "  [4] 启动/重启 up -d"
+          echo "  [5] 停止项目 stop"
+          echo "  [6] 下线项目 down"
+          echo "  [7] 查看项目日志"
+          echo "  [8] 编辑配置"
+          echo "  [9] 拉取更新 pull + up -d"
+          echo "  [10] 删除项目目录"
           echo "  [0] 返回"
           echo
-          read -rp "  请选择 [0-8]: " sc
+          read -rp "  请选择 [0-10]: " sc
           case "$sc" in
             1) create_docker_project; pause ;;
             2) list_projects; pause ;;
-            3) restart_project; pause ;;
-            4) stop_project; pause ;;
-            5) project_logs ;;
-            6) edit_project; pause ;;
-            7) update_project; pause ;;
-            8) delete_project_config; pause ;;
+            3) select_compose_dir && (cd "$SELECTED_DIR" && docker compose ps); pause ;;
+            4) restart_project; pause ;;
+            5) stop_project; pause ;;
+            6)
+              select_compose_dir || continue
+              warn "down 会删除该 Compose 项目创建的容器和默认网络，不删除命名卷。"
+              ask_yn "确认下线项目？" "n" && (cd "$SELECTED_DIR" && docker compose down) && ok "项目已下线"
+              pause
+              ;;
+            7) project_logs ;;
+            8) edit_project; pause ;;
+            9) update_project; pause ;;
+            10) delete_project_config; pause ;;
             0) break ;;
             "") continue ;;
             *) warn "无效选择" ;;
@@ -635,9 +915,9 @@ docker_menu(){
         done
         ;;
       2) container_menu ;;
-      3) log_menu ;;
-      4) cleanup_menu ;;
-      5) setup_auto_cleanup ;;
+      3) image_menu ;;
+      4) maintenance_menu ;;
+      5) docker_system_status; pause ;;
       0) return ;;
       "") continue ;;
       *) warn "无效选择" ;;
@@ -1026,13 +1306,7 @@ main_menu(){
       2) docker_menu ;;
       3) nginx_menu ;;
       4) certbot_menu ;;
-      5)
-        echo
-        docker system df
-        echo
-        docker ps -a --format "table {{.Names}}\t{{.Status}}"
-        pause
-        ;;
+      5) docker_system_status; pause ;;
       6) health_check ;;
       0) ok "再见"; exit 0 ;;
       "") continue ;;
