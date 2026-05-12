@@ -43,7 +43,7 @@ warn()  { echo -e "  ${YELLOW}[WARN]${NC} $1"; }
 err()   { echo -e "  ${RED}[ERROR]${NC} $1"; }
 ui_line()    { echo -e "${CYAN}----------------------------------------${NC}"; }
 ui_box()     { ui_line; echo -e "  ${GREEN}${BOLD}$1${NC}"; ui_line; }
-ui_header()  { echo; ui_box "$1  ─ $OS_NAME"; }
+ui_header()  { echo; ui_box "$1"; }
 pause(){ echo; read -rp "  按回车继续..." _dummy; }
 
 editor_cmd(){
@@ -357,48 +357,6 @@ delete_project_config(){
 # ═══════════════════════════════════════════════════════════
 # 容器管理
 # ═══════════════════════════════════════════════════════════
-
-select_container(){
-  need_docker || return 1
-  local items=()
-  local cid
-  for cid in $(docker ps -aq 2>/dev/null); do
-    items+=("$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's/^\///')")
-  done
-  [ ${#items[@]} -eq 0 ] && { warn "没有容器"; return 1; }
-  select_from_list "选择容器" "${items[@]}" || return 1
-  SELECTED_CONTAINER="$SELECTED_ITEM"
-  return 0
-}
-
-container_action_menu(){
-  local c="$1"
-  while true; do
-    ui_header "容器操作: $c"
-    echo "  [1] 查看日志"
-    echo "  [2] 进入容器"
-    echo "  [3] 重启容器"
-    echo "  [4] 停止容器"
-    echo "  [5] 启动容器"
-    echo "  [6] 容器详情"
-    echo "  [7] 删除容器"
-    echo "  [0] 返回"
-    echo
-    read -rp "  请选择 [0-7]: " a
-    case "$a" in
-      1) docker logs --tail=200 -f "$c" ;;
-      2) docker exec -it "$c" sh 2>/dev/null || docker exec -it "$c" bash ;;
-      3) ask_yn "重启 $c？" "y" && docker restart "$c" && ok "已重启"; pause ;;
-      4) ask_yn "停止 $c？" "y" && docker stop "$c" && ok "已停止"; pause ;;
-      5) docker start "$c" && ok "已启动"; pause ;;
-      6) docker inspect "$c" | less ;;
-      7) ask_yn "确认删除容器 $c？不可恢复" "y" && docker rm -f "$c" && ok "已删除" && return 0; pause ;;
-      0) return 0 ;;
-      "") continue ;;
-      *) echo "  输入 0-7" ;;
-    esac
-  done
-}
 
 # ═══════════════════════════════════════════════════════════
 # 维护清理
@@ -846,10 +804,10 @@ EOF
 main_menu(){
   while true; do
     get_os_name
-    ui_header "Docker+Nginx+HTTPS 工具箱  ─  $OS_NAME"
+    ui_header "Docker+Nginx+HTTPS 工具箱"
     echo "  [1]  一键安装"
     echo "  [2]  安装基础环境"
-    echo "  [3]  项目管理（容器操作）"
+    echo "  [3]  Docker 管理"
     echo "  [4]  Nginx 管理"
     echo "  [5]  HTTPS 证书"
     echo "  [6]  维护清理"
@@ -860,7 +818,7 @@ main_menu(){
     case "$c" in
       1) install_all ;;
       2) install_base_env ;;
-      3) project_menu ;;
+      3) docker_menu ;;
       4) nginx_menu ;;
       5) certbot_menu ;;
       6) maintenance_menu ;;
@@ -872,19 +830,19 @@ main_menu(){
   done
 }
 
-project_menu(){
+docker_menu(){
   while true; do
-    ui_header "项目管理（容器操作）"
-    echo "  [1]  系统状态（容器列表+资源占用）"
+    ui_header "Docker 管理"
+    echo "  [1]  系统状态"
     echo "  [2]  创建项目"
     echo "  [3]  启动/更新项目"
     echo "  [4]  停止项目"
     echo "  [5]  项目日志"
     echo "  [6]  编辑配置"
     echo "  [7]  更新镜像并重启"
-    echo "  [8]  列出项目"
-    echo "  [9]  选择容器操作（进入/重启/停止/删除）"
-    echo "  [0]  返回主菜单"
+    echo "  [8]  列表项目"
+    echo "  [9]  删除项目"
+    echo "  [0]  返回"
     echo
     read -rp "  请选择 [0-9]: " c
     case "$c" in
@@ -897,8 +855,7 @@ project_menu(){
       6) edit_project ;;
       7) update_project ;;
       8) list_projects; pause ;;
-      9) select_container || continue
-         container_action_menu "$SELECTED_CONTAINER" ;;
+      9) delete_project_config ;;
       *) echo "  输入 0-9" ;;
     esac
   done
