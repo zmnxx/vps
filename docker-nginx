@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v32
+# Docker+Nginx+HTTPS 工具箱 v33
 
 set -o pipefail
 set -o errtrace
@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v32"
+VERSION="v33"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -419,10 +419,7 @@ apply_cert_to_nginx(){
   local conf="$1" domain="$2"
   [ -z "$domain" ] && { warn "缺少域名，无法应用证书"; return 1; }
   if [ -z "$conf" ]; then
-    for f in /etc/nginx/sites-enabled/*; do
-      [ -e "$f" ] || continue
-      grep -q "server_name .*\b$domain\b" "$(readlink -f "$f" 2>/dev/null || echo "$f")" 2>/dev/null && { conf=$(basename "$f"); break; }
-    done
+    conf=$(find_site_by_domain "$domain" || true)
   fi
   [ -z "$conf" ] && { warn "没有找到 $domain 对应的 Nginx 站点配置"; return 1; }
   local cert_path="/etc/letsencrypt/live/$domain"
@@ -433,9 +430,11 @@ apply_cert_to_nginx(){
 
   local port
   port=$(grep -m1 'proxy_pass[[:space:]]\+http://127\.0\.0\.1:' "$conffile" | sed -E 's/.*127\.0\.0\.1:([0-9]+).*/\1/' || true)
-  [ -z "$port" ] && read -rp "  未检测到反代端口，请输入端口: " port
+  [ -z "$port" ] && port="$PREV_PORT"
+  [ -z "$port" ] && read -rp "  端口: " port
   valid_port "$port" || { err "端口无效"; return 1; }
 
+  ensure_connection_upgrade_map
   cp "$conffile" "$conffile.bak.$(date +%Y%m%d%H%M%S)"
   cat > "$conffile" <<NGINX
 server {
@@ -460,34 +459,27 @@ server {
     ssl_certificate     $cert_path/fullchain.pem;
     ssl_certificate_key $cert_path/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    client_max_body_size 0;
-    proxy_request_buffering off;
-    proxy_buffering off;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-    send_timeout 3600s;
-
-    add_header Strict-Transport-Security "max-age=63072000" always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header X-Frame-Options SAMEORIGIN always;
-    add_header Referrer-Policy no-referrer-when-downgrade always;
-
     location / {
         proxy_pass http://127.0.0.1:$port;
+
+        client_max_body_size 500M;
+
         proxy_http_version 1.1;
+
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection \$connection_upgrade;
+
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 NGINX
@@ -498,9 +490,35 @@ NGINX
     nginx -t 2>&1 | head -5 | sed 's/^/  /'
     return 1
   fi
-  pause
 }
 
+
+
+
+ensure_connection_upgrade_map(){
+  mkdir -p /etc/nginx/conf.d
+  if grep -R "map \\$http_upgrade \\$connection_upgrade" /etc/nginx/nginx.conf /etc/nginx/conf.d 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  cat > /etc/nginx/conf.d/connection_upgrade.conf <<'NGINXMAP'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+NGINXMAP
+}
+
+manage_connection_upgrade_map(){
+  ui_header "修改 map 配置"
+  ensure_connection_upgrade_map
+  ok "已写入 /etc/nginx/conf.d/connection_upgrade.conf"
+  if nginx -t 2>/dev/null; then
+    systemctl reload nginx && ok "Nginx 已重载" || err "重载失败"
+  else
+    err "配置错误：$(nginx -t 2>&1 | head -1)"
+  fi
+  pause
+}
 
 nginx_config_test(){
   ui_header "Nginx 配置测试"
@@ -517,17 +535,13 @@ nginx_config_test(){
 
 create_nginx_proxy(){
   local hint_name="$1" hint_port="$2"
-  ui_header "创建 Nginx 反代"
-  local name domain port input
+  ui_header "创建反代"
+  local name domain port input tpl conf
   NGINX_TESTED_OK=""
   while ! safe_name "$name"; do
-    if [ -n "$hint_name" ]; then
-      read -rp "  配置名称（默认 $hint_name）: " input
-      [ -z "$input" ] && name="$hint_name" && break
-    else
-      read -rp "  配置名称: " input
-      [ -z "$input" ] && return 1
-    fi
+    [ -n "$hint_name" ] && read -rp "  名称（默认 $hint_name）: " input || read -rp "  名称: " input
+    [ -z "$input" ] && [ -n "$hint_name" ] && name="$hint_name" && break
+    [ -z "$input" ] && return 1
     name="$input"
   done
   while ! valid_domain "$domain"; do
@@ -535,19 +549,25 @@ create_nginx_proxy(){
     [ -z "$domain" ] && return 1
   done
   while ! valid_port "$port"; do
-    if [ -n "$hint_port" ]; then
-      read -rp "  反代端口（默认 $hint_port）: " input
-      [ -z "$input" ] && port="$hint_port" && break
-    else
-      read -rp "  反代端口: " input
-      [ -z "$input" ] && return 1
-    fi
+    [ -n "$hint_port" ] && read -rp "  端口（默认 $hint_port）: " input || read -rp "  端口: " input
+    [ -z "$input" ] && [ -n "$hint_port" ] && port="$hint_port" && break
+    [ -z "$input" ] && return 1
     port="$input"
   done
 
-  local conf="/etc/nginx/sites-available/$name"
+  echo
+  echo "  [1] 通用模板"
+  echo "  [2] 空模板"
+  read -rp "  请选择 [1/2]（默认 1）: " tpl
+  [ -z "$tpl" ] && tpl="1"
+
+  conf="/etc/nginx/sites-available/$name"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
-  cat > "$conf" <<NGINX
+  if [ "$tpl" = "2" ]; then
+    : > "$conf"
+  else
+    ensure_connection_upgrade_map
+    cat > "$conf" <<NGINX
 server {
     listen 80;
     listen [::]:80;
@@ -557,42 +577,75 @@ server {
         root /var/www/html;
     }
 
-    client_max_body_size 0;
-    proxy_request_buffering off;
-    proxy_buffering off;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-    send_timeout 3600s;
-
     location / {
         proxy_pass http://127.0.0.1:$port;
+
+        client_max_body_size 500M;
+
         proxy_http_version 1.1;
+
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
+
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection \$connection_upgrade;
+
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 NGINX
+  fi
   ln -sf "$conf" "/etc/nginx/sites-enabled/$name"
   LAST_DOMAIN="$domain"
   LAST_SITE="$name"
   PREV_PORT="$port"
-  if ask_yn "测试并重载 Nginx？" "y"; then
-    if nginx -t 2>/dev/null && systemctl reload nginx; then
-      ok "Nginx 已重载"
-      NGINX_TESTED_OK="1"
-    else
-      err "配置错误：$(nginx -t 2>&1 | head -1)"
-      NGINX_TESTED_OK=""
+  if ask_yn "编辑配置？" "n"; then
+    edit_file "$conf"
+  fi
+  if ask_yn "申请并应用 HTTPS 证书？" "y"; then
+    if [ ! -s "$conf" ]; then
+      ensure_connection_upgrade_map
+      cat > "$conf" <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+
+        client_max_body_size 500M;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+NGINX
     fi
+    certbot_get "$domain" && apply_cert_to_nginx "$name" "$CERTBOT_DOMAIN"
   fi
   pause
 }
+
 
 
 
@@ -637,19 +690,17 @@ delete_nginx_site(){
 nginx_menu(){
   while true; do
     ui_header "Nginx 管理"
-    echo "  [1]  创建反代配置"
+    echo "  [1]  创建反代"
     echo "  [2]  站点列表"
     echo "  [3]  测试配置"
     echo "  [4]  重载 Nginx"
     echo "  [5]  编辑站点"
     echo "  [6]  删除站点"
+    echo "  [7]  修改 map 配置"
     echo "  [0]  返回"
-    read -rp "  请选择 [0-6]: " c
+    read -rp "  请选择 [0-7]: " c
     case "$c" in
-      1) create_nginx_proxy
-         if [ -n "$LAST_DOMAIN" ] && ask_yn "申请并应用 HTTPS 证书？" "y"; then
-           certbot_get "$LAST_DOMAIN" && apply_cert_to_nginx "$LAST_SITE" "$LAST_DOMAIN"
-         fi ;;
+      1) create_nginx_proxy ;;
       2) list_nginx_sites ;;
       3) nginx_config_test ;;
       4) systemctl reload nginx && ok "Nginx 已重载" || err "重载失败"; pause ;;
@@ -657,11 +708,13 @@ nginx_menu(){
          select_from_list "选择要编辑的站点" "${sites[@]}" || continue
          edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"; pause ;;
       6) delete_nginx_site ;;
+      7) manage_connection_upgrade_map ;;
       0) return ;;
-      *) echo "  输入 0-6" ;;
+      *) echo "  输入 0-7" ;;
     esac
   done
 }
+
 
 
 
@@ -690,10 +743,11 @@ find_site_by_domain(){
 certbot_get(){
   need_nginx || return 1
   ui_header "申请 SSL 证书"
-  local domain="${1:-}" domains=() email old_email webroot="/var/www/html"
+  local domain="${1:-}" domains=() email old_email webroot="/var/www/html" input
   mkdir -p "$webroot"
   if [ -n "$domain" ]; then
-    echo "  域名: $domain"
+    read -rp "  域名（默认 $domain）: " input
+    [ -n "$input" ] && domain="$input"
     domains+=("$domain")
   else
     while true; do
@@ -711,7 +765,14 @@ certbot_get(){
     [ -z "$email" ] && email="admin@$cert_name"
   fi
   if [ "$NGINX_TESTED_OK" != "1" ]; then
-    ask_yn "测试 Nginx 配置？" "y" && { nginx -t && ok "Nginx 配置正确" || { err "Nginx 配置有误"; pause; return 1; }; }
+    if nginx -t; then
+      ok "Nginx 配置正确"
+      NGINX_TESTED_OK="1"
+    else
+      err "Nginx 配置有误"
+      pause
+      return 1
+    fi
   fi
   local args=()
   for d in "${domains[@]}"; do args+=( -d "$d" ); done
@@ -719,6 +780,7 @@ certbot_get(){
     && { ok "证书已申请: $cert_name"; CERTBOT_DOMAIN="$cert_name"; } \
     || { err "证书申请失败"; CERTBOT_DOMAIN=""; pause; return 1; }
 }
+
 
 
 
