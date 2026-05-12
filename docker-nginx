@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v35
+# Docker+Nginx+HTTPS 工具箱 v36
 
 set -o pipefail
 set -o errtrace
@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v35"
+VERSION="v36"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -314,29 +314,14 @@ stop_project(){
 project_logs(){
   need_docker || return 1
   select_compose_dir || return 1
-  local mode lines name
+  local name
   name=$(basename "$SELECTED_DIR")
-  echo
-  echo "  [1] 最近日志"
-  echo "  [2] 实时日志"
-  echo "  [0] 返回"
-  read -rp "  请选择 [1]: " mode
-  [ -z "$mode" ] && mode="1"
-  case "$mode" in
-    1)
-      read -rp "  行数（默认 200）: " lines
-      [ -z "$lines" ] && lines="200"
-      case "$lines" in ''|*[!0-9]*) lines="200" ;; esac
-      ui_header "$name 最近日志"
-      docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail="$lines" 2>&1 | sed 's/^/  /'
-      pause ;;
-    2)
-      warn "实时日志需要按 Ctrl+C 返回"
-      docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=100 -f ;;
-    0) return 0 ;;
-    *) echo "  输入 0-2"; pause ;;
-  esac
+  ui_header "$name 实时日志"
+  warn "按 Ctrl+C 返回菜单"
+  docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200 -f
+  pause
 }
+
 
 edit_project(){
   select_compose_dir || return 1
@@ -356,10 +341,43 @@ update_project(){
 project_ps(){
   need_docker || return 1
   select_compose_dir || return 1
-  ui_header "$(basename "$SELECTED_DIR") 容器"
-  docker compose -f "$SELECTED_DIR/docker-compose.yml" ps 2>&1 | sed 's/^/  /'
+  local ids id name image state status ports restart created
+  ui_header "$(basename "$SELECTED_DIR") 容器状态"
+  ids=$(docker compose -f "$SELECTED_DIR/docker-compose.yml" ps -q 2>/dev/null || true)
+  if [ -z "$ids" ]; then
+    warn "没有找到容器，项目可能未启动"
+    pause
+    return 0
+  fi
+  for id in $ids; do
+    name=$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')
+    image=$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)
+    state=$(docker inspect --format '{{.State.Status}}' "$id" 2>/dev/null)
+    status=$(docker inspect --format '{{.State.Health.Status}}' "$id" 2>/dev/null || true)
+    restart=$(docker inspect --format '{{.RestartCount}}' "$id" 2>/dev/null)
+    created=$(docker inspect --format '{{.Created}}' "$id" 2>/dev/null | cut -dT -f1)
+    ports=$(docker port "$id" 2>/dev/null | tr '\n' ' ')
+    [ -z "$ports" ] && ports="无"
+    case "$state" in
+      running) state="运行中" ;;
+      exited) state="已停止" ;;
+      restarting) state="重启中" ;;
+      paused) state="已暂停" ;;
+      created) state="已创建" ;;
+    esac
+    [ -z "$status" ] || [ "$status" = "<no value>" ] && status="无健康检查"
+    echo "  容器名称: ${name:-未知}"
+    echo "  镜像:     ${image:-未知}"
+    echo "  状态:     ${state:-未知}"
+    echo "  健康:     $status"
+    echo "  重启次数: ${restart:-0}"
+    echo "  创建日期: ${created:-未知}"
+    echo "  端口:     $ports"
+    echo "  ───────────────────────────────"
+  done
   pause
 }
+
 
 project_restart_only(){
   need_docker || return 1
@@ -370,15 +388,51 @@ project_restart_only(){
   pause
 }
 
+project_size(){
+  select_compose_dir || return 1
+  ui_header "$(basename "$SELECTED_DIR") 占用空间"
+  echo "  项目目录: $SELECTED_DIR"
+  echo "  目录大小: $(du -sh "$SELECTED_DIR" 2>/dev/null | awk '{print $1}')"
+  echo
+  echo "  子目录/文件:"
+  du -sh "$SELECTED_DIR"/* 2>/dev/null | sort -h | sed 's/^/  /' || true
+  pause
+}
+
+clear_project_logs(){
+  need_docker || return 1
+  select_compose_dir || return 1
+  local ids id lp count=0 name
+  name=$(basename "$SELECTED_DIR")
+  ask_yn "清理 $name 的容器日志？" "y" || return 0
+  ids=$(docker compose -f "$SELECTED_DIR/docker-compose.yml" ps -q 2>/dev/null || true)
+  if [ -z "$ids" ]; then
+    warn "没有找到容器，项目可能未启动"
+    pause
+    return 0
+  fi
+  for id in $ids; do
+    lp=$(docker inspect --format '{{.LogPath}}' "$id" 2>/dev/null || true)
+    [ -n "$lp" ] && [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
+  done
+  ok "已清理 $count 个容器日志"
+  pause
+}
+
 delete_project_config(){
   select_compose_dir || return 1
   local dir="$SELECTED_DIR" name
   name=$(basename "$dir")
-  ask_yn "删除 $name？" "n" || return 0
-  ask_yn "同时删除容器和数据卷？" "n" && docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || docker compose -f "$dir/docker-compose.yml" down 2>/dev/null || true
+  ask_yn "删除 $name？" "y" || return 0
+  if ask_yn "同时删除容器和数据卷？" "y"; then
+    docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
+  else
+    docker compose -f "$dir/docker-compose.yml" down 2>/dev/null || true
+  fi
   rm -rf -- "$dir" && ok "$name 已删除"
   pause
 }
+
 
 
 # ─── 维护清理 ────────────────────────────────────────────
@@ -988,15 +1042,17 @@ docker_menu(){
     echo "  [2]  创建项目"
     echo "  [3]  启动/更新"
     echo "  [4]  停止项目"
-    echo "  [5]  查看日志"
+    echo "  [5]  实时日志"
     echo "  [6]  编辑配置"
     echo "  [7]  更新镜像"
     echo "  [8]  容器状态"
     echo "  [9]  重启项目"
-    echo "  [10] 删除项目"
-    echo "  [11] 系统状态"
+    echo "  [10] 项目空间"
+    echo "  [11] 清理日志"
+    echo "  [12] 删除项目"
+    echo "  [13] 系统状态"
     echo "  [0]  返回"
-    read -rp "  请选择 [0-11]: " c
+    read -rp "  请选择 [0-13]: " c
     case "$c" in
       0) return ;;
       1) list_projects; pause ;;
@@ -1008,12 +1064,15 @@ docker_menu(){
       7) update_project ;;
       8) project_ps ;;
       9) project_restart_only ;;
-      10) delete_project_config ;;
-      11) docker_system_status ;;
-      *) echo "  输入 0-11" ;;
+      10) project_size ;;
+      11) clear_project_logs ;;
+      12) delete_project_config ;;
+      13) docker_system_status ;;
+      *) echo "  输入 0-13" ;;
     esac
   done
 }
+
 
 
 # ─── 主菜单 ──────────────────────────────────────────────
