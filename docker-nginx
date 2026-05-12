@@ -568,17 +568,13 @@ cert_actions_menu(){
   not_after=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
   issuer=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -issuer 2>/dev/null | sed 's/issuer= //')
   subject=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -subject 2>/dev/null | sed 's/subject= //')
-  echo "  域名: $subject"
-  echo "  颁发者: $issuer"
-  echo "  生效时间: ${not_before:-未知}"
-  echo "  到期时间: ${not_after:-未知}"
-  echo
+  echo "  域名: ${subject##*= }"
+  echo "  颁发者: ${issuer##*= }"
+  echo "  生效: ${not_before:-未知}"
+  echo "  到期: ${not_after:-未知}"
   local remaining
   remaining=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -checkend 0 2>/dev/null && echo "有效" || echo "已过期")
   echo "  状态: $([ "$remaining" = "有效" ] && echo "有效")$([ "$remaining" = "已过期" ] && echo "已过期")"
-  echo
-  echo "  快捷操作："
-  ask_yn "删除此证书？" "n" && certbot delete --cert-name "$c" && ok "已删除"
   pause
 }
 
@@ -586,9 +582,10 @@ certbot_menu(){
   while true; do
     ui_header "HTTPS 证书"
     echo "  [1]  申请证书"
-    echo "  [2]  证书列表"
+    echo "  [2]  证书路径"
     echo "  [3]  删除证书"
-    echo "  [4]  续期所有"
+    echo "  [4]  测试续期"
+    echo "  [5]  实际续期"
     echo "  [0]  返回"
     read -rp "  请选择 [0-4]: " c
     case "$c" in
@@ -614,18 +611,15 @@ certbot_menu(){
         pause
         ;;
       4)
-        ui_header "续期所有证书"
-        info "测试续期..."
-        certbot renew --dry-run >> /dev/null 2>&1
-        if [ $? -eq 0 ]; then
-          ok "测试通过，开始实际续期..."
-          certbot renew -q && ok "续期完成" || warn "续期失败"
-        else
-          err "测试续期失败，请检查配置"
-        fi
+        info "测试续期中..."
+        certbot renew --dry-run && ok "测试通过，证书可正常续期" || err "测试失败，请检查配置"
+        pause ;;
+      5)
+        info "实际续期中..."
+        certbot renew -q && ok "续期完成" || err "续期失败"
         pause ;;
       0) return ;;
-      *) echo "  输入 0-4" ;;
+      *) echo "  输入 0-5" ;;
     esac
   done
 }
