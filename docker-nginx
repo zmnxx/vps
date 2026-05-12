@@ -70,11 +70,11 @@ save_conf(){
 ask_yn(){
   local q="$1" d="${2:-}" a prompt
   if [ "$d" = "y" ]; then
-    prompt="[Y/n]"
+    prompt="(y/n 默认 y)"
   elif [ "$d" = "n" ]; then
-    prompt="[y/N]"
+    prompt="(y/n 默认 n)"
   else
-    prompt="[y/n]"
+    prompt="(y/n)"
   fi
   while true; do
     read -rp "  $q $prompt: " a
@@ -395,11 +395,16 @@ view_cleanup_history(){
 run_full_cleanup(){
   need_docker || return 1
   ask_yn "清空日志并清理停止容器、未使用镜像、构建缓存和未使用卷？" "y" || return 0
+  local logfile="/var/log/docker-cleanup.log"
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$ts] 手动清理开始..." >> "$logfile"
   clear_all_container_logs
-  docker container prune -f
-  docker image prune -a -f
-  docker builder prune -a -f
-  docker volume prune -f
+  docker container prune -f >> "$logfile" 2>&1
+  docker image prune -a -f >> "$logfile" 2>&1
+  docker builder prune -a -f >> "$logfile" 2>&1
+  docker volume prune -f >> "$logfile" 2>&1
+  echo "[$ts] 手动清理完成" >> "$logfile"
   ok "清理完成"
   pause
 }
@@ -446,23 +451,21 @@ setup_auto_cleanup(){
 maintenance_menu(){
   while true; do
     ui_header "维护清理"
-    echo "  [1] 状态总览"
-    echo "  [2] 一键清理"
-    echo "  [3] 查看清理历史"
-    echo "  [4] 清空容器日志"
-    echo "  [5] 定时任务"
-    echo "  [0] 返回"
+    echo "  [1]  一键清理"
+    echo "  [2]  查看清理历史"
+    echo "  [3]  清空容器日志"
+    echo "  [4]  定时任务"
+    echo "  [0]  返回"
     echo
-    read -rp "  请选择 [0-5]: " c
+    read -rp "  请选择 [0-4]: " c
     case "$c" in
-      1) docker_system_status ;;
-      2) run_full_cleanup ;;
-      3) view_cleanup_history ;;
-      4) need_docker || { pause; continue; }
+      1) run_full_cleanup ;;
+      2) view_cleanup_history ;;
+      3) need_docker || { pause; continue; }
          clear_all_container_logs; pause ;;
-      5) setup_auto_cleanup ;;
+      4) setup_auto_cleanup ;;
       0) return ;;
-      *) echo "  输入 0-5" ;;
+      *) echo "  输入 0-4" ;;
     esac
   done
 }
@@ -555,14 +558,16 @@ NGINX
   if ask_yn "测试配置并重载 Nginx？" "y"; then
     if nginx -t 2>/dev/null; then
       systemctl reload nginx
-      ok "✅ Nginx 配置正确，已重新加载"
+      ok "Nginx 配置正确，已重新加载"
     else
       local err_msg
       err_msg=$(nginx -t 2>&1)
-      err "❌ 配置错误：$(echo "$err_msg" | head -1)"
+      err "配置错误：$(echo "$err_msg" | head -1)"
     fi
   fi
   pause
+  LAST_DOMAIN="$domain"
+  return 0
 }
 
 list_sites(){
@@ -570,22 +575,28 @@ list_sites(){
 }
 
 certbot_get(){
-  need_docker || return 1
-  local domains=() cert_name resolved
+  need_docker && need_nginx || return 1
   ui_header "申请 SSL 证书"
-  while true; do
-    read -rp "  域名（多个用空格隔开）: " -a domains
-    [ ${#domains[@]} -gt 0 ] && break
-  done
-  cert_name="${domains[0]}"
-  if ask_yn "申请证书前先测试 Nginx 配置？" "y"; then
+  local domain="${1:-}" domains=()
+  if [ -n "$domain" ]; then
+    domains+=("$domain")
+  fi
+  if [ ${#domains[@]} -eq 0 ]; then
+    while true; do
+      read -rp "  域名（多个用空格隔开）: " -a domains
+      [ ${#domains[@]} -gt 0 ] && break
+    done
+  fi
+  local cert_name="${domains[0]}"
+  if ask_yn "申请前先测试 Nginx 配置？" "y"; then
     nginx -t && ok "Nginx 配置正确" || { err "Nginx 配置有误"; pause; return 1; }
   fi
   certbot certonly --nginx -d "${domains[0]}" ${domains[@]:1} -n \
     --agree-tos --email "admin@${cert_name}" || {
     err "证书申请失败"; pause; return 1
   }
-  ok "证书已申请"
+  ok "证书已申请: $cert_name"
+  pause
 }
 
 list_cert_names(){
@@ -638,15 +649,17 @@ cert_actions_menu(){
 certbot_menu(){
   while true; do
     ui_header "HTTPS 证书"
-    echo "  [1] 申请新证书"
-    echo "  [2] 证书列表"
-    echo "  [3] 续期所有"
+    echo "  [1] 先创建反代再申请证书"
+    echo "  [2] 仅申请证书（已有 Nginx 配置）"
+    echo "  [3] 证书列表"
+    echo "  [4] 续期所有"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-3]: " c
+    read -rp "  请选择 [0-4]: " c
     case "$c" in
-      1) create_nginx_proxy; certbot_get ;;
-      2)
+      1) create_nginx_proxy; [ -n "$LAST_DOMAIN" ] && certbot_get "$LAST_DOMAIN" ;;
+      2) certbot_get ;;
+      3)
         local certs=()
         local cert
         for cert in /etc/letsencrypt/live/*/; do
@@ -658,7 +671,7 @@ certbot_menu(){
         select_from_list "选择证书" "${certs[@]}" || continue
         cert_actions_menu "$SELECTED_ITEM"
         ;;
-      3) certbot renew && ok "续期完成"; pause ;;
+      4) certbot renew && ok "续期完成"; pause ;;
       0) return ;;
     esac
   done
@@ -678,7 +691,7 @@ nginx_menu(){
     read -rp "  请选择 [0-6]: " c
     case "$c" in
       1) create_nginx_proxy
-         ask_yn "为此域名申请 HTTPS 证书？" "y" && certbot_get
+         [ -n "$LAST_DOMAIN" ] && ask_yn "为此域名申请 HTTPS 证书？" "y" && certbot_get "$LAST_DOMAIN"
          pause ;;
       2) list_sites; pause ;;
       3) nginx_config_test; pause ;;
