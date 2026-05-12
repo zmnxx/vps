@@ -197,6 +197,12 @@ install_all(){
   fi
   if ask_yn "创建第一个项目？" "y"; then
     create_docker_project
+    if ask_yn "配置 Nginx 反代？" "y"; then
+      local dft_port="${PREV_PORT:-}"
+      [ -n "$dft_port" ] && info "提示：容器端口为 $dft_port"
+      create_nginx_proxy "$PREV_NAME" "$dft_port"
+      [ -n "$LAST_DOMAIN" ] && ask_yn "为此域名申请 HTTPS 证书？" "y" && certbot_get "$LAST_DOMAIN"
+    fi
   fi
   ok "安装完成"
   pause
@@ -212,11 +218,12 @@ create_docker_project(){
     read -rp "  项目名称（字母开头，a-z0-9._-）: " name
     [ -z "$name" ] && return 1
   done
+  PREV_NAME="$name"
   local base="${LAST_BASE%/}"
   mkdir -p "$base/$name"
   LAST_BASE="$base"
   save_conf
-  info "端口映射（如 3000）；留空则无端口映射"
+  info "容器端口（如 3000），留空生成空白模板"
   read -rp "  容器端口: " port
   if [ -n "$port" ]; then
     cat > "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
@@ -238,7 +245,10 @@ services:
 DOCKERCOMPOSE
   fi
   ok "项目已创建: $base/$name/"
-  ask_yn "现在编辑 docker-compose.yml？" "y" && edit_file "$base/$name/docker-compose.yml"
+  if ask_yn "现在编辑 docker-compose.yml？" "y"; then
+    edit_file "$base/$name/docker-compose.yml"
+  fi
+  PREV_PORT="$port"
 }
 
 select_compose_dir(){
@@ -406,19 +416,32 @@ nginx_config_test(){
 }
 
 create_nginx_proxy(){
+  local hint_name="$1" hint_port="$2"
   ui_header "创建 Nginx 反代"
   local name domain port tpl
+  if [ -n "$hint_name" ]; then
+    info "回车默认使用: $hint_name"
+  fi
   while ! safe_name "$name"; do
-    read -rp "  配置名称（如 myapp, a-z0-9._-）: " name
-    [ -z "$name" ] && return 1
+    read -rp "  配置名称（如 myapp, a-z0-9._-）: " input
+    [ -z "$input" ] && [ -n "$hint_name" ] && name="$hint_name" && break
+    [ -z "$input" ] && return 1
+    name="$input"
   done
   while ! valid_domain "$domain"; do
     read -rp "  域名（如 example.com）: " domain
     [ -z "$domain" ] && return 1
   done
+  local port_prompt="  反代端口"
+  [ -n "$hint_port" ] && port_prompt="$port_prompt（回车默认 $hint_port）"
+  port_prompt="$port_prompt: "
   while ! valid_port "$port"; do
-    read -rp "  反代端口（1-65535）: " port
-    [ -z "$port" ] && return 1
+    read -rp "$port_prompt" input
+    if [ -z "$input" ] && [ -n "$hint_port" ]; then
+      port="$hint_port" && break
+    fi
+    [ -z "$input" ] && return 1
+    port="$input"
   done
   echo
   echo "  [1] 通用模板"
@@ -443,6 +466,7 @@ server {
 NGINX
     ok "空白模板已创建"
     edit_file "$conf"
+    ln -sf "$conf" "/etc/nginx/sites-enabled/$name"
   else
     cat > "$conf" <<NGINX
 server {
@@ -611,12 +635,24 @@ certbot_menu(){
         pause
         ;;
       4)
-        info "测试续期中..."
-        certbot renew --dry-run && ok "测试通过，证书可正常续期" || err "测试失败，请检查配置"
+        local certs=() cert
+        for cert in /etc/letsencrypt/live/*/; do
+          [ -d "$cert" ] && certs+=("$(basename "$cert")")
+        done
+        [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; pause; continue; }
+        select_from_list "选择要测试续期的证书" "${certs[@]}" || continue
+        info "测试续期: $SELECTED_ITEM"
+        certbot renew --cert-name "$SELECTED_ITEM" --dry-run && ok "测试通过" || err "测试失败"
         pause ;;
       5)
-        info "实际续期中..."
-        certbot renew -q && ok "续期完成" || err "续期失败"
+        local certs=() cert
+        for cert in /etc/letsencrypt/live/*/; do
+          [ -d "$cert" ] && certs+=("$(basename "$cert")")
+        done
+        [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; pause; continue; }
+        select_from_list "选择要续期的证书" "${certs[@]}" || continue
+        info "实际续期: $SELECTED_ITEM"
+        certbot renew --cert-name "$SELECTED_ITEM" -q && ok "续期完成" || err "续期失败"
         pause ;;
       0) return ;;
       *) echo "  输入 0-5" ;;
