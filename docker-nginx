@@ -376,16 +376,14 @@ maintenance_menu(){
   while true; do
     ui_header "维护清理"
     echo "  [1]  一键清理"
-    echo "  [2]  查看清理历史"
-    echo "  [3]  清空容器日志"
-    echo "  [4]  定时任务"
+    echo "  [2]  清理历史"
+    echo "  [3]  定时任务"
     echo "  [0]  返回"
-    read -rp "  请选择 [0-4]: " c
+    read -rp "  请选择 [0-3]: " c
     case "$c" in
       1) run_full_cleanup ;;
       2) view_cleanup_history ;;
-      3) need_docker || { pause; continue; }; clear_all_container_logs; pause ;;
-      4) setup_auto_cleanup ;;
+      3) setup_auto_cleanup ;;
       0) return ;;
       *) echo "  输入 0-4" ;;
     esac
@@ -583,21 +581,35 @@ certbot_menu(){
     ui_header "HTTPS 证书"
     echo "  [1]  申请证书"
     echo "  [2]  证书列表"
-    echo "  [3]  续期所有"
+    echo "  [3]  删除证书"
+    echo "  [4]  续期所有"
     echo "  [0]  返回"
-    read -rp "  请选择 [0-3]: " c
+    read -rp "  请选择 [0-4]: " c
     case "$c" in
       1) certbot_get ;;
-      2) local certs=() cert
-         for cert in /etc/letsencrypt/live/*/; do
-           [ -d "$cert" ] && certs+=("$(basename "$cert")")
-         done
-         [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; pause; continue; }
-         select_from_list "选择证书" "${certs[@]}" || continue
-         cert_actions_menu "$SELECTED_ITEM" ;;
-      3) certbot renew && ok "续期完成" || warn "续期失败或无需续期"; pause ;;
+      2)
+        local certs=() cert
+        for cert in /etc/letsencrypt/live/*/; do
+          [ -d "$cert" ] && certs+=("$(basename "$cert")")
+        done
+        [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; pause; continue; }
+        select_from_list "选择证书" "${certs[@]}" || continue
+        cert_actions_menu "$SELECTED_ITEM"
+        ;;
+      3)
+        local certs=() cert
+        for cert in /etc/letsencrypt/live/*/; do
+          [ -d "$cert" ] && certs+=("$(basename "$cert")")
+        done
+        [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; pause; continue; }
+        select_from_list "选择要删除的证书" "${certs[@]}" || continue
+        ask_yn "确认删除证书 $SELECTED_ITEM？" "y" || continue
+        certbot delete --cert-name "$SELECTED_ITEM" && ok "$SELECTED_ITEM 已删除"
+        pause
+        ;;
+      4) certbot renew && ok "续期完成" || warn "续期失败或无需续期"; pause ;;
       0) return ;;
-      *) echo "  输入 0-3" ;;
+      *) echo "  输入 0-4" ;;
     esac
   done
 }
