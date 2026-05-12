@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v36
+# Docker+Nginx+HTTPS 工具箱 v37
 
 set -o pipefail
 set -o errtrace
@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v36"
+VERSION="v37"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -615,22 +615,41 @@ NGINX
 
 
 ensure_connection_upgrade_map(){
-  mkdir -p /etc/nginx/conf.d
-  if grep -R "map \\$http_upgrade \\$connection_upgrade" /etc/nginx/nginx.conf /etc/nginx/conf.d 2>/dev/null | grep -q .; then
+  local conf="/etc/nginx/nginx.conf" tmp
+  [ -f "$conf" ] || { err "未找到 $conf"; return 1; }
+  if grep -q 'map[[:space:]]\+\$http_upgrade[[:space:]]\+\$connection_upgrade' "$conf" 2>/dev/null; then
     return 0
   fi
-  cat > /etc/nginx/conf.d/connection_upgrade.conf <<'NGINXMAP'
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    '' close;
+  tmp=$(mktemp)
+  awk '
+    BEGIN { inserted=0 }
+    /^[[:space:]]*http[[:space:]]*\{/ && inserted==0 {
+      print
+      print "    map $http_upgrade $connection_upgrade {"
+      print "        default upgrade;"
+      print "        '\''\'\'' close;"
+      print "    }"
+      print ""
+      inserted=1
+      next
+    }
+    { print }
+    END { if (inserted==0) exit 2 }
+  ' "$conf" > "$tmp"
+  if [ $? -ne 0 ]; then
+    rm -f "$tmp"
+    err "未找到 http 配置块"
+    return 1
+  fi
+  cat "$tmp" > "$conf"
+  rm -f "$tmp"
 }
-NGINXMAP
-}
+
 
 manage_connection_upgrade_map(){
   ui_header "修改 map 配置"
-  ensure_connection_upgrade_map
-  ok "已写入 /etc/nginx/conf.d/connection_upgrade.conf"
+  ensure_connection_upgrade_map || { pause; return 1; }
+  ok "已写入 /etc/nginx/nginx.conf"
   if nginx -t 2>/dev/null; then
     systemctl reload nginx && ok "Nginx 已重载" || err "重载失败"
   else
@@ -638,6 +657,7 @@ manage_connection_upgrade_map(){
   fi
   pause
 }
+
 
 nginx_config_test(){
   ui_header "Nginx 配置测试"
