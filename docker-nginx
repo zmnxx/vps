@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v30
+# Docker+Nginx+HTTPS 工具箱 v31
 
 set -o pipefail
 set -o errtrace
@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v30"
+VERSION="v31"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -142,9 +142,16 @@ collect_compose_files(){
   { for d in $dirs; do [ -d "$d" ] && find "$d" -name "docker-compose.yml" -type f 2>/dev/null; done; } | sort -u
 }
 extract_first_host_port(){
-  grep -E '^[[:space:]]*-[[:space:]]*"?[0-9.:]+:[0-9]+' "$1" 2>/dev/null |
-    head -1 | sed -E 's/.*:([0-9]+)"?$/\1/'
+  local f="$1" line port
+  line=$(grep -E '^[[:space:]]*-[[:space:]]*"?([0-9.]+:)?[0-9]+:[0-9]+' "$f" 2>/dev/null | head -1 || true)
+  [ -z "$line" ] && return 1
+  line=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*"?//; s/"?[[:space:]]*$//')
+  line=${line#127.0.0.1:}
+  line=${line#0.0.0.0:}
+  port=${line%%:*}
+  valid_port "$port" && echo "$port"
 }
+
 
 # ─── 安装 ────────────────────────────────────────────────
 
@@ -187,7 +194,7 @@ install_base_env(){
 }
 
 install_all(){
-  ui_header "一键安装向导"
+  ui_header "一键安装"
   install_docker || return 1
   install_nginx || return 1
   install_certbot || return 1
@@ -195,37 +202,29 @@ install_all(){
 
   if has_auto_cleanup; then
     ok "定时维护任务已存在"
-  elif ask_yn "设置 Docker 定时维护清理？" "y"; then
+  elif ask_yn "设置定时维护清理？" "y"; then
     setup_auto_cleanup
   fi
 
-  echo
-  info "推荐流程：创建/导入 Docker 项目 → 启动容器 → 创建 Nginx 反代 → 申请并自动应用 HTTPS"
-  if ask_yn "现在创建或准备一个 Docker 项目？" "y"; then
+  if ask_yn "创建 Docker 项目？" "y"; then
     create_docker_project
-    if ask_yn "现在启动/更新这个项目？" "n"; then
-      if [ -n "$PREV_DIR" ] && [ -f "$PREV_DIR/docker-compose.yml" ]; then
-        docker compose -f "$PREV_DIR/docker-compose.yml" up -d && ok "项目已启动" || warn "项目启动失败，请检查 compose 配置"
-      else
-        restart_project
-      fi
+    if [ -n "$PREV_DIR" ] && ask_yn "启动/更新这个项目？" "n"; then
+      docker compose -f "$PREV_DIR/docker-compose.yml" up -d && ok "项目已启动" || warn "项目启动失败"
     fi
   fi
 
-  local proxy_name="${PREV_NAME:-}" proxy_port="${PREV_PORT:-}"
-  if ask_yn "现在创建 Nginx 反代站点？" "y"; then
-    create_nginx_proxy "$proxy_name" "$proxy_port"
-    if [ -n "$LAST_DOMAIN" ] && ask_yn "现在为 $LAST_DOMAIN 申请并应用 HTTPS 证书？" "y"; then
+  if ask_yn "创建 Nginx 反代？" "y"; then
+    create_nginx_proxy "${PREV_NAME:-}" "${PREV_PORT:-}"
+    if [ -n "$LAST_DOMAIN" ] && ask_yn "申请并应用 HTTPS 证书？" "y"; then
       certbot_get "$LAST_DOMAIN"
-      if [ -n "$CERTBOT_DOMAIN" ]; then
-        apply_cert_to_nginx "$LAST_SITE" "$CERTBOT_DOMAIN"
-      fi
+      [ -n "$CERTBOT_DOMAIN" ] && apply_cert_to_nginx "$LAST_SITE" "$CERTBOT_DOMAIN"
     fi
   fi
 
-  ok "一键向导完成"
+  ok "一键安装完成"
   pause
 }
+
 
 
 # ─── Docker 项目管理 ────────────────────────────────────
@@ -233,9 +232,9 @@ install_all(){
 create_docker_project(){
   need_docker || return 1
   ui_header "创建 Docker 项目"
-  local name port image tpl input
+  local name input
   while ! safe_name "$name"; do
-    read -rp "  项目名称（字母开头，a-z0-9._-）: " name
+    read -rp "  项目名称: " name
     [ -z "$name" ] && return 1
   done
   PREV_NAME="$name"
@@ -247,79 +246,20 @@ create_docker_project(){
   PREV_DIR="$base/$name"
   save_conf
 
-  echo
-  echo "  选择 docker-compose 模板："
-  echo "    [1] 空白模板（只生成文件骨架，适合粘贴官方 compose）"
-  echo "    [2] 通用单容器模板（image + restart，可选端口映射）"
-  echo "    [3] OpenList 模板（openlistteam/openlist:latest，默认 5244）"
-  read -rp "  请选择 [1-3]（默认 1）: " tpl
-  [ -z "$tpl" ] && tpl="1"
+  : > "$base/$name/docker-compose.yml"
+  ok "已创建: $base/$name/docker-compose.yml"
+  edit_file "$base/$name/docker-compose.yml"
 
-  case "$tpl" in
-    2)
-      read -rp "  镜像名（如 nginx:latest，可留空后续编辑）: " image
-      [ -z "$image" ] && image="your-image:latest"
-      read -rp "  宿主机端口:容器端口（如 3000:3000，留空不写 ports）: " port
-      cat > "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
-services:
-  $name:
-    image: $image
-    container_name: $name
-    restart: unless-stopped
-DOCKERCOMPOSE
-      if [ -n "$port" ]; then
-        cat >> "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
-    ports:
-      - "127.0.0.1:$port"
-DOCKERCOMPOSE
-        PREV_PORT="${port%%:*}"
-      else
-        PREV_PORT=""
-      fi
-      ;;
-    3)
-      read -rp "  OpenList 宿主机端口（默认 5244）: " port
-      [ -z "$port" ] && port="5244"
-      cat > "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
-services:
-  $name:
-    image: openlistteam/openlist:latest
-    container_name: $name
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:$port:5244"
-    volumes:
-      - ./data:/opt/openlist/data
-DOCKERCOMPOSE
-      PREV_PORT="$port"
-      ;;
-    *)
-      cat > "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
-services:
-  $name:
-    image: 
-    container_name: $name
-    restart: unless-stopped
-    # ports:
-    #   - "127.0.0.1:3000:3000"
-    # volumes:
-    #   - ./data:/data
-    # environment:
-    #   - TZ=Asia/Shanghai
-DOCKERCOMPOSE
-      PREV_PORT=""
-      ;;
-  esac
-
-  ok "项目已创建: $base/$name/"
-  if ask_yn "现在编辑 docker-compose.yml？" "y"; then
-    edit_file "$base/$name/docker-compose.yml"
+  PREV_PORT=$(extract_first_host_port "$base/$name/docker-compose.yml" || true)
+  if [ -n "$PREV_PORT" ]; then
+    info "检测到端口: $PREV_PORT"
+  else
+    warn "未检测到端口"
+    read -rp "  反代端口，留空跳过: " input
+    valid_port "$input" && PREV_PORT="$input"
   fi
-  if [ -z "$PREV_PORT" ]; then
-    PREV_PORT=$(extract_first_host_port "$base/$name/docker-compose.yml")
-  fi
-  [ -n "$PREV_PORT" ] && info "检测到反代端口: $PREV_PORT" || warn "未检测到端口，创建 Nginx 反代时需要手动填写"
 }
+
 
 
 select_compose_dir(){
@@ -577,54 +517,35 @@ nginx_config_test(){
 create_nginx_proxy(){
   local hint_name="$1" hint_port="$2"
   ui_header "创建 Nginx 反代"
-  local name domain port tpl input
-  if [ -n "$hint_name" ]; then
-    info "配置名称回车默认: $hint_name"
-  fi
+  local name domain port input
   while ! safe_name "$name"; do
-    read -rp "  配置名称（如 myapp, a-z0-9._-）: " input
-    [ -z "$input" ] && [ -n "$hint_name" ] && name="$hint_name" && break
-    [ -z "$input" ] && return 1
+    if [ -n "$hint_name" ]; then
+      read -rp "  配置名称（默认 $hint_name）: " input
+      [ -z "$input" ] && name="$hint_name" && break
+    else
+      read -rp "  配置名称: " input
+      [ -z "$input" ] && return 1
+    fi
     name="$input"
   done
   while ! valid_domain "$domain"; do
-    read -rp "  域名（如 example.com）: " domain
+    read -rp "  域名: " domain
     [ -z "$domain" ] && return 1
   done
-  local port_prompt="  反代端口"
-  [ -n "$hint_port" ] && port_prompt="$port_prompt（回车默认 $hint_port）"
-  port_prompt="$port_prompt: "
   while ! valid_port "$port"; do
-    read -rp "$port_prompt" input
-    if [ -z "$input" ] && [ -n "$hint_port" ]; then
-      port="$hint_port" && break
+    if [ -n "$hint_port" ]; then
+      read -rp "  反代端口（默认 $hint_port）: " input
+      [ -z "$input" ] && port="$hint_port" && break
+    else
+      read -rp "  反代端口: " input
+      [ -z "$input" ] && return 1
     fi
-    [ -z "$input" ] && return 1
     port="$input"
   done
-  echo
-  echo "  [1] 通用反代模板（HTTP 可直接启用，兼容大文件/WebSocket/OpenList）"
-  echo "  [2] 极简空白模板（创建后立即编辑）"
-  read -rp "  请选择 [1/2]（默认 1）: " tpl
-  [ -z "$tpl" ] && tpl="1"
+
   local conf="/etc/nginx/sites-available/$name"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
-  if [ "$tpl" = "2" ]; then
-    cat > "$conf" <<NGINX
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $domain;
-
-    location / {
-        proxy_pass http://127.0.0.1:$port;
-    }
-}
-NGINX
-    ok "极简模板已创建"
-    edit_file "$conf"
-  else
-    cat > "$conf" <<NGINX
+  cat > "$conf" <<NGINX
 server {
     listen 80;
     listen [::]:80;
@@ -655,17 +576,16 @@ server {
     }
 }
 NGINX
-    ok "通用 HTTP 反代模板已创建；申请证书后会自动改为 HTTPS 模板"
-  fi
   ln -sf "$conf" "/etc/nginx/sites-enabled/$name"
   LAST_DOMAIN="$domain"
   LAST_SITE="$name"
   PREV_PORT="$port"
-  if ask_yn "测试配置并重载 Nginx？" "y"; then
-    nginx -t 2>/dev/null && systemctl reload nginx && ok "Nginx 配置正确，已重新加载" || err "配置错误：$(nginx -t 2>&1 | head -1)"
+  if ask_yn "测试并重载 Nginx？" "y"; then
+    nginx -t 2>/dev/null && systemctl reload nginx && ok "Nginx 已重载" || err "配置错误：$(nginx -t 2>&1 | head -1)"
   fi
   pause
 }
+
 
 
 list_nginx_sites(){
@@ -935,7 +855,7 @@ docker_menu(){
 main_menu(){
   while true; do
     get_os_name
-    ui_header "Docker+Nginx+HTTPS 工具箱"
+    ui_header "Docker Nginx HTTPS 工具箱"
     echo "  [1]  一键安装"
     echo "  [2]  安装基础环境"
     echo "  [3]  Docker 管理"
