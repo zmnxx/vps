@@ -28,7 +28,13 @@ detect_os(){
 }
 
 OS_NAME=""
-get_os_name(){ OS_NAME=$(. /etc/os-release && echo "$PRETTY_NAME"); }
+get_os_name(){
+  local id ver
+  . /etc/os-release
+  id="$ID"
+  ver=$(echo "$VERSION_ID" | cut -d. -f1)
+  [ "$id" = "debian" ] && OS_NAME="Debian $ver" || OS_NAME="$id $ver"
+}
 
 # ─── 输出 ──────────────────────────────────────────────────
 ok()    { echo -e "  ${GREEN}[OK]${NC} $1"; }
@@ -339,13 +345,9 @@ update_project(){
 
 delete_project_config(){
   select_compose_dir || return 1
-  if ! ask_yn "确认删除项目 ${SELECTED_DIR}？此操作不可恢复" "n"; then
-    return 0
-  fi
-  if ! ask_yn "再次确认：删除 ${SELECTED_DIR} 的所有文件和容器？" ""; then
-    return 0
-  fi
   local dir="$SELECTED_DIR"
+  ask_yn "删除项目 ${SELECTED_DIR}（容器+文件）？" "y" || return 0
+  ask_yn "再次确认：不可恢复" "y" || return 0
   docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null
   rm -rf -- "$dir"
   ok "已删除"
@@ -390,9 +392,7 @@ container_action_menu(){
       4) ask_yn "停止 $c？" "y" && docker stop "$c" && ok "已停止"; pause ;;
       5) docker start "$c" && ok "已启动"; pause ;;
       6) docker inspect "$c" | less ;;
-      7) if ask_yn "确认删除容器 $c？" ""; then
-           docker rm -f "$c" && ok "已删除" && return 0
-         fi; pause ;;
+      7) ask_yn "确认删除容器 $c？不可恢复" "y" && docker rm -f "$c" && ok "已删除" && return 0; pause ;;
       0) return 0 ;;
       "") continue ;;
       *) echo "  输入 0-7" ;;
@@ -454,15 +454,13 @@ image_menu(){
         done <<< "$(docker images --format '{{.Repository}} {{.Tag}}')"
         select_from_list "选择要删除的镜像" "${items[@]}" || continue
         local sel="$SELECTED_ITEM"
-        if ask_yn "确认删除镜像 $sel？" ""; then
+        if ask_yn "确认删除镜像 $sel？" "y"; then
           docker rmi "$sel" && ok "已删除"
         fi
         pause
         ;;
       4)
-        if ask_yn "清理未使用的镜像？" ""; then
-          docker image prune -a -f && ok "清理完成"
-        fi
+        ask_yn "清理未使用的镜像？" "y" && docker image prune -a -f && ok "清理完成"
         pause
         ;;
       0) return ;;
@@ -510,11 +508,23 @@ EOF
   chmod +x /usr/local/bin/docker-cleanup.sh
 }
 
+view_cleanup_history(){
+  ui_header "清理历史"
+  local logfile="/var/log/docker-cleanup.log"
+  if [ ! -f "$logfile" ]; then
+    warn "暂无清理记录"
+  else
+    local cnt=$(wc -l < "$logfile")
+    echo "  共 $cnt 条记录，最近 30 条："
+    echo "  ───────────────────────────────"
+    tail -30 "$logfile" | sed 's/^/  /'
+  fi
+  pause
+}
+
 run_full_cleanup(){
   need_docker || return 1
-  if ! ask_yn "清空日志并清理停止容器、未使用镜像、构建缓存和未使用卷？" ""; then
-    return 0
-  fi
+  ask_yn "清空日志并清理停止容器、未使用镜像、构建缓存和未使用卷？" "y" || return 0
   clear_all_container_logs
   docker container prune -f
   docker image prune -a -f
@@ -568,19 +578,21 @@ maintenance_menu(){
     ui_header "维护清理"
     echo "  [1] 状态总览"
     echo "  [2] 一键清理"
-    echo "  [3] 清空容器日志"
-    echo "  [4] 定时任务"
+    echo "  [3] 查看清理历史"
+    echo "  [4] 清空容器日志"
+    echo "  [5] 定时任务"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-4]: " c
+    read -rp "  请选择 [0-5]: " c
     case "$c" in
       1) docker_system_status ;;
       2) run_full_cleanup ;;
-      3) need_docker || { pause; continue; }
+      3) view_cleanup_history ;;
+      4) need_docker || { pause; continue; }
          clear_all_container_logs; pause ;;
-      4) setup_auto_cleanup ;;
+      5) setup_auto_cleanup ;;
       0) return ;;
-      *) echo "  输入 0-4" ;;
+      *) echo "  输入 0-5" ;;
     esac
   done
 }
@@ -624,7 +636,7 @@ server {
 NGINX
   ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
   ok "配置文件已创建: /etc/nginx/sites-available/$name"
-  if ask_yn "现在编辑配置？" "y"; then
+  if ask_yn "现在编辑配置？" "n"; then
     edit_file "/etc/nginx/sites-available/$name"
   fi
   if ask_yn "测试配置并重载 Nginx？" "y"; then
@@ -693,7 +705,7 @@ cert_actions_menu(){
         pause
         ;;
       4)
-        if ask_yn "确认删除证书 $cert？" ""; then
+        if ask_yn "确认删除证书 $cert？" "y"; then
           certbot delete --cert-name "$cert" && ok "已删除"
         fi
         pause
@@ -768,7 +780,7 @@ nginx_menu(){
         done
         select_from_list "选择要删除的站点" "${sites[@]}" || continue
         local name="$SELECTED_ITEM"
-        if ask_yn "确认删除站点 $name 的配置？" ""; then
+        if ask_yn "确认删除站点 $name 的配置？" "y"; then
           rm -f "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
           ok "已删除"
           ask_yn "重载 Nginx？" "y" && nginx -t && systemctl reload nginx && ok "已重载"
