@@ -400,94 +400,6 @@ container_action_menu(){
   done
 }
 
-container_menu(){
-  while true; do
-    ui_header "容器管理"
-    echo "  [1] 容器列表"
-    echo "  [2] 选择容器操作"
-    echo "  [3] 资源占用"
-    echo "  [0] 返回"
-    echo
-    read -rp "  请选择 [0-3]: " c
-    case "$c" in
-      1) need_docker || { pause; continue; }
-         docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" ;;
-      2) select_container || continue
-         container_action_menu "$SELECTED_CONTAINER" ;;
-      3) need_docker || { pause; continue; }
-         info "按 Ctrl+C 退出"; docker stats ;;
-      0) return ;;
-      "") continue ;;
-      *) echo "  输入 0-3" ;;
-    esac
-  done
-}
-
-# ═══════════════════════════════════════════════════════════
-# 镜像管理
-# ═══════════════════════════════════════════════════════════
-
-image_menu(){
-  while true; do
-    ui_header "镜像管理"
-    echo "  [1] 镜像列表"
-    echo "  [2] 拉取镜像"
-    echo "  [3] 删除镜像"
-    echo "  [4] 清理未使用镜像"
-    echo "  [0] 返回"
-    echo
-    read -rp "  请选择 [0-4]: " c
-    case "$c" in
-      1) docker images ;;
-      2)
-        local img
-        read -rp "  输入镜像名（如 nginx:alpine）: " img
-        [ -n "$img" ] && docker pull "$img" || warn "输入为空"
-        pause
-        ;;
-      3)
-        local items=()
-        while read -r line; do
-          repo=$(echo "$line" | awk '{print $1}')
-          tag=$(echo "$line" | awk '{print $2}')
-          items+=("$repo:$tag")
-        done <<< "$(docker images --format '{{.Repository}} {{.Tag}}')"
-        select_from_list "选择要删除的镜像" "${items[@]}" || continue
-        local sel="$SELECTED_ITEM"
-        if ask_yn "确认删除镜像 $sel？" "y"; then
-          docker rmi "$sel" && ok "已删除"
-        fi
-        pause
-        ;;
-      4)
-        ask_yn "清理未使用的镜像？" "y" && docker image prune -a -f && ok "清理完成"
-        pause
-        ;;
-      0) return ;;
-    esac
-  done
-}
-
-# ═══════════════════════════════════════════════════════════
-# Docker 系统状态
-# ═══════════════════════════════════════════════════════════
-
-docker_system_status(){
-  need_docker || return 1
-  ui_header "Docker 状态"
-  echo "  版  本: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '─')"
-  echo "  容  器: $(docker ps -q 2>/dev/null | wc -l) 运行 / $(docker ps -aq 2>/dev/null | wc -l) 总计"
-  echo "  镜  像: $(docker images -q 2>/dev/null | wc -l) 个"
-  echo "  卷:     $(docker volume ls -q 2>/dev/null | wc -l) 个"
-  local disk docker_root
-  disk=$(df -h /var/lib/docker 2>/dev/null | awk 'NR==2{print $4}' || echo "─")
-  echo "  磁盘剩余: $disk"
-  echo
-  info "资源使用（按 Ctrl+C 退出）"
-  docker stats --no-stream 2>/dev/null
-  pause
-}
-
 # ═══════════════════════════════════════════════════════════
 # 维护清理
 # ═══════════════════════════════════════════════════════════
@@ -601,11 +513,23 @@ maintenance_menu(){
 # Nginx 管理
 # ═══════════════════════════════════════════════════════════
 
-nginx_config_test(){ nginx -t 2>&1; }
+nginx_config_test(){
+  ui_header "Nginx 配置测试"
+  if nginx -t 2>/dev/null; then
+    ok "✅ 配置正确，语法通过"
+  else
+    local err_msg
+    err_msg=$(nginx -t 2>&1)
+    err "❌ 配置错误："
+    echo "$err_msg" | head -5 | sed 's/^/  /'
+  fi
+  pause
+}
 
 create_nginx_proxy(){
   ui_header "创建 Nginx 反代"
-  local name domain port
+  local name domain port tpl
+
   while ! safe_name "$name"; do
     read -rp "  配置名称（如 myapp, a-z0-9._-）: " name
     [ -z "$name" ] && return 1
@@ -619,7 +543,18 @@ create_nginx_proxy(){
     [ -z "$port" ] && return 1
   done
 
-  cat > "/etc/nginx/sites-available/$name" <<NGINX
+  echo
+  echo "  选择模板类型："
+  echo "  [1] 通用模板（标准 Nginx 反代，最常用）"
+  echo "  [2] 空白模板（手动编写，灵活度最高）"
+  echo
+  read -rp "  请选择 [1-2]（默认 1）: " tpl
+  [ -z "$tpl" ] && tpl="1"
+
+  if [ "$tpl" = "2" ]; then
+    cat > "/etc/nginx/sites-available/$name" <<NGINX
+# 自定义配置 - $name
+# 域名: $domain  →  127.0.0.1:$port
 server {
     listen 80;
     listen [::]:80;
@@ -634,13 +569,40 @@ server {
     }
 }
 NGINX
-  ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
-  ok "配置文件已创建: /etc/nginx/sites-available/$name"
-  if ask_yn "现在编辑配置？" "n"; then
+    ok "空白模板已创建，请编辑配置添加所需规则"
     edit_file "/etc/nginx/sites-available/$name"
+  else
+    cat > "/etc/nginx/sites-available/$name" <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+    ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
+    ok "配置文件已创建: /etc/nginx/sites-available/$name"
+    if ask_yn "现在编辑配置？" "n"; then
+      edit_file "/etc/nginx/sites-available/$name"
+    fi
   fi
+
   if ask_yn "测试配置并重载 Nginx？" "y"; then
-    nginx -t && systemctl reload nginx && ok "Nginx 已重载" || err "配置错误"
+    if nginx -t 2>/dev/null; then
+      systemctl reload nginx
+      ok "✅ Nginx 配置正确，已重新加载"
+    else
+      local err_msg
+      err_msg=$(nginx -t 2>&1)
+      err "❌ 配置错误：$(echo "$err_msg" | head -1)"
+    fi
   fi
   pause
 }
@@ -757,7 +719,9 @@ nginx_menu(){
     echo
     read -rp "  请选择 [0-6]: " c
     case "$c" in
-      1) create_nginx_proxy ;;
+      1) create_nginx_proxy
+         ask_yn "为此域名申请 HTTPS 证书？" "y" && certbot_get
+         pause ;;
       2) list_sites; pause ;;
       3) nginx_config_test; pause ;;
       4)
@@ -882,78 +846,80 @@ EOF
 main_menu(){
   while true; do
     get_os_name
-    ui_header "Docker+Nginx+HTTPS 工具箱"
-    echo "  [1]  一键安装（环境+定时+项目）"
+    ui_header "Docker+Nginx+HTTPS 工具箱  ─  $OS_NAME"
+    echo "  [1]  一键安装"
     echo "  [2]  安装基础环境"
-    echo "  [3]  Docker 管理"
+    echo "  [3]  项目管理（容器操作）"
     echo "  [4]  Nginx 管理"
     echo "  [5]  HTTPS 证书"
-    echo "  [6]  系统健康检查"
-    echo "  [q]  退出"
+    echo "  [6]  维护清理"
+    echo "  [7]  系统健康检查"
+    echo "  [0]  退出"
     echo
-    read -rp "  请选择 [1-6/q]: " c
+    read -rp "  请选择 [0-7]: " c
     case "$c" in
       1) install_all ;;
       2) install_base_env ;;
-      3) docker_menu ;;
+      3) project_menu ;;
       4) nginx_menu ;;
       5) certbot_menu ;;
-      6) health_check ;;
-      q|Q) echo; exit 0 ;;
+      6) maintenance_menu ;;
+      7) health_check ;;
+      0) echo; exit 0 ;;
       "") continue ;;
-      *) echo "  输入 1-6 或 q" ;;
+      *) echo "  输入 0-7" ;;
     esac
   done
 }
 
-docker_menu(){
+project_menu(){
   while true; do
-    ui_header "Docker 管理"
-    echo "  [1]  系统状态"
-    echo "  [2]  项目管理"
-    echo "  [3]  容器管理"
-    echo "  [4]  镜像管理"
-    echo "  [5]  维护清理"
+    ui_header "项目管理（容器操作）"
+    echo "  [1]  系统状态（容器列表+资源占用）"
+    echo "  [2]  创建项目"
+    echo "  [3]  启动/更新项目"
+    echo "  [4]  停止项目"
+    echo "  [5]  项目日志"
+    echo "  [6]  编辑配置"
+    echo "  [7]  更新镜像并重启"
+    echo "  [8]  列出项目"
+    echo "  [9]  选择容器操作（进入/重启/停止/删除）"
     echo "  [0]  返回主菜单"
     echo
-    read -rp "  请选择 [0-5]: " c
+    read -rp "  请选择 [0-9]: " c
     case "$c" in
       0) return ;;
       1) docker_system_status ;;
-      2)
-        while true; do
-          ui_header "项目管理"
-          echo "  [1]  创建项目"
-          echo "  [2]  启动/更新项目"
-          echo "  [3]  停止项目"
-          echo "  [4]  项目日志"
-          echo "  [5]  编辑配置"
-          echo "  [6]  更新镜像并重启"
-          echo "  [7]  列出项目"
-          echo "  [8]  删除项目"
-          echo "  [0]  返回"
-          echo
-          read -rp "  请选择 [0-8]: " sc
-          case "$sc" in
-            0) break ;;
-            1) create_docker_project ;;
-            2) restart_project ;;
-            3) stop_project ;;
-            4) project_logs ;;
-            5) edit_project ;;
-            6) update_project ;;
-            7) list_projects; pause ;;
-            8) delete_project_config ;;
-            *) echo "  输入 0-8" ;;
-          esac
-        done
-        ;;
-      3) container_menu ;;
-      4) image_menu ;;
-      5) maintenance_menu ;;
-      *) echo "  输入 0-5" ;;
+      2) create_docker_project ;;
+      3) restart_project ;;
+      4) stop_project ;;
+      5) project_logs ;;
+      6) edit_project ;;
+      7) update_project ;;
+      8) list_projects; pause ;;
+      9) select_container || continue
+         container_action_menu "$SELECTED_CONTAINER" ;;
+      *) echo "  输入 0-9" ;;
     esac
   done
+}
+
+docker_system_status(){
+  need_docker || return 1
+  ui_header "Docker 系统状态"
+  echo "  版  本: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '─')"
+  echo "  容  器: $(docker ps -q 2>/dev/null | wc -l) 运行 / $(docker ps -aq 2>/dev/null | wc -l) 总计"
+  echo "  镜  像: $(docker images -q 2>/dev/null | wc -l) 个"
+  echo "  卷:     $(docker volume ls -q 2>/dev/null | wc -l) 个"
+  local disk=$(df -h /var/lib/docker 2>/dev/null | awk 'NR==2{print $4}' 2>/dev/null || echo '─')
+  echo "  磁盘:   ${disk:-─} 剩余"
+  echo
+  echo "  ── 资源占用 ──"
+  docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.PIDs}}' 2>/dev/null || warn "无运行中的容器"
+  echo
+  echo "  ── 容器列表 ──"
+  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || echo "  （无容器）"
+  pause
 }
 
 main(){
