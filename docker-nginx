@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# Docker + Nginx + HTTPS 工具箱 v28
-# 优化：解耦一键安装、统一选择器、配置增强、错误处理改进
+# Docker+Nginx+HTTPS 工具箱 v29
+# 优化：ask_yn 默认值规范化、模板简化、菜单精简、代码瘦身
 # ============================================================
 
 set -o pipefail
@@ -13,27 +13,33 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v28"
+VERSION="v29"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
-
-# ─── 全局变量 ──────────────────────────────────────────────
 LAST_BASE="$DEFAULT_BASE"
 
-# ─── 输出函数 ──────────────────────────────────────────────
+detect_os(){
+  . /etc/os-release
+  case "$ID" in
+    debian|ubuntu) return 0 ;;
+    *) err "仅支持 Debian/Ubuntu（当前: $ID）"; exit 1 ;;
+  esac
+}
+
+OS_NAME=""
+get_os_name(){ OS_NAME=$(. /etc/os-release && echo "$PRETTY_NAME"); }
+
+# ─── 输出 ──────────────────────────────────────────────────
 ok()    { echo -e "  ${GREEN}[OK]${NC} $1"; }
 info()  { echo -e "  ${BLUE}[INFO]${NC} $1"; }
 warn()  { echo -e "  ${YELLOW}[WARN]${NC} $1"; }
 err()   { echo -e "  ${RED}[ERROR]${NC} $1"; }
-
-ui_line()  { echo -e "${CYAN}----------------------------------------${NC}"; }
-ui_box()   { ui_line; echo -e "  ${GREEN}${BOLD}$1${NC}"; ui_line; }
-ui_header(){ echo; ui_box "$1"; }
-
+ui_line()    { echo -e "${CYAN}----------------------------------------${NC}"; }
+ui_box()     { ui_line; echo -e "  ${GREEN}${BOLD}$1${NC}"; ui_line; }
+ui_header()  { echo; ui_box "$1  ─ $OS_NAME"; }
 pause(){ echo; read -rp "  按回车继续..." _dummy; }
 
-# ─── 编辑器 ────────────────────────────────────────────────
 editor_cmd(){
   local ed
   IFS=' ' read -r ed _ <<< "$EDITOR"
@@ -41,172 +47,113 @@ editor_cmd(){
   command -v nano >/dev/null 2>&1 && { echo nano; return; }
   echo vi
 }
-edit_file(){
-  local ed
-  ed=$(editor_cmd)
-  "$ed" "$1"
+edit_file(){ "$(editor_cmd)" "$1"; }
+
+# ─── 配置 ──────────────────────────────────────────────────
+load_conf(){
+  mkdir -p "$CONF_DIR"
+  [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+  : "${LAST_BASE:=$DEFAULT_BASE}"
+}
+save_conf(){
+  mkdir -p "$CONF_DIR"
+  echo "LAST_BASE=$LAST_BASE" > "$CONF_FILE"
 }
 
-# ─── 系统检查 ──────────────────────────────────────────────
+# ─── 交互 ──────────────────────────────────────────────────
+ask_yn(){
+  local q="$1" d="${2:-}" a prompt
+  if [ "$d" = "y" ]; then
+    prompt="[Y/n]"
+  elif [ "$d" = "n" ]; then
+    prompt="[y/N]"
+  else
+    prompt="[y/n]"
+  fi
+  while true; do
+    read -rp "  $q $prompt: " a
+    [ -z "$a" ] && [ -n "$d" ] && a="$d"
+    case "$a" in y|Y|yes) return 0 ;; n|N|no) return 1 ;;
+      "") [ -z "$d" ] && continue || return 0 ;;
+      *) echo "    请输入 y 或 n" ;; esac
+  done
+}
+
 need_root(){
   [ "$(id -u)" -eq 0 ] || { err "需要 root 权限"; exit 1; }
 }
-
-detect_os(){
-  . /etc/os-release
-  case "$ID" in
-    debian|ubuntu) return 0 ;;
-    *) err "仅支持 Debian / Ubuntu（当前: $ID）"; exit 1 ;;
-  esac
-}
-
-# ─── 配置持久化 ────────────────────────────────────────────
-load_conf(){
-  mkdir -p "$CONF_DIR"
-  if [ -f "$CONF_FILE" ]; then
-    . "$CONF_FILE"
-  fi
-  : "${LAST_BASE:=$DEFAULT_BASE}"
-}
-
-save_conf(){
-  mkdir -p "$CONF_DIR"
-  cat > "$CONF_FILE" <<EOF
-LAST_BASE=$LAST_BASE
-EOF
-}
-
-# ─── 通用交互 ──────────────────────────────────────────────
-ask_yn(){
-  local q="$1" d="${2:-y}" a prompt
-  [ "$d" = "y" ] && prompt="[Y/n 默认Y]" || prompt="[y/N 默认N]"
-  while true; do
-    read -rp "  $q $prompt: " a
-    [ -z "$a" ] && a="$d"
-    case "$a" in y|Y) return 0 ;; n|N) return 1 ;;
-      *) warn "请输入 y 或 n" ;; esac
-  done
-}
-
-# ─── 通用菜单选择器 ────────────────────────────────────────
-SELECTED_ITEM=""
-select_from_list(){
-  local title="$1"
-  shift
-  local items=("$@")
-  local n idx
-
-  [ ${#items[@]} -eq 0 ] && { warn "没有可选项"; return 1; }
-
-  echo
-  echo "  $title"
-  for i in "${!items[@]}"; do
-    echo "    [$((i+1))] ${items[$i]}"
-  done
-  echo "    [0] 取消"
-  echo
-
-  read -rp "  请选择 [0-${#items[@]}]: " n
-  [ "$n" = "0" ] || [ -z "$n" ] && return 1
-
-  case "$n" in
-    ''|*[!0-9]*) err "请输入数字"; return 1 ;;
-  esac
-
-  idx=$((n-1))
-  [ "$idx" -lt 0 ] || [ "$idx" -ge ${#items[@]} ] && { err "选择无效"; return 1; }
-  SELECTED_ITEM="${items[$idx]}"
+cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
+docker_ready(){ cmd_exists docker && docker info >/dev/null 2>&1; }
+need_docker(){
+  if ! cmd_exists docker; then err "Docker 未安装"; return 1; fi
+  if ! docker info >/dev/null 2>&1; then err "Docker 未运行"; return 1; fi
   return 0
 }
 
-# ─── 输入验证 ──────────────────────────────────────────────
-safe_name(){ case "$1" in ''|*[!a-zA-Z0-9._-]*) return 1 ;; esac
-  [[ "$1" =~ ^[a-zA-Z] ]]; }
+safe_name(){ case "$1" in ''|*[!a-zA-Z0-9._-]*) return 1 ;; esac; [[ "$1" =~ ^[a-zA-Z] ]]; }
 valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
 valid_domain(){
   local d="${1%.}" label
-  [ -n "$d" ] || return 1
-  [ "${#d}" -le 253 ] || return 1
-  [[ "$d" != *..* ]] || return 1
-  [[ "$d" == *.* ]] || return 1
+  [ -n "$d" ] && [ "${#d}" -le 253 ] && [[ "$d" != *..* ]] && [[ "$d" == *.* ]] || return 1
   local IFS='.'
   for label in $d; do
-    [ -n "$label" ] || return 1
-    [ "${#label}" -le 63 ] || return 1
+    [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
     [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
   done
-  # 检查 TLD 纯字母
   local tld="${d##*.}"
-  [[ "$tld" =~ ^[A-Za-z]{2,63}$ ]] || return 1
+  [[ "$tld" =~ ^[A-Za-z]{2,63}$ ]]
+}
+
+# ─── 统一选择器 ────────────────────────────────────────────
+SELECTED_ITEM=""
+select_from_list(){
+  local title="$1"; shift
+  local items=("$@") n idx
+  [ ${#items[@]} -eq 0 ] && { warn "没有可选项"; return 1; }
+  echo
+  echo "  $title"
+  for i in "${!items[@]}"; do echo "    [$((i+1))] ${items[$i]}"; done
+  echo "    [0] 取消"
+  echo
+  read -rp "  请选择 [0-${#items[@]}]: " n
+  [ "$n" = "0" ] || [ -z "$n" ] && return 1
+  case "$n" in ''|*[!0-9]*) err "请输入数字"; return 1 ;; esac
+  idx=$((n-1))
+  [ "$idx" -ge ${#items[@]} ] && { err "选择无效"; return 1; }
+  SELECTED_ITEM="${items[$idx]}"
   return 0
 }
 
-# ─── 命令/Docker 状态 ─────────────────────────────────────
-cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
-
-docker_ready(){
-  cmd_exists docker && docker info >/dev/null 2>&1
-}
-
-need_docker_running(){
-  if ! cmd_exists docker; then
-    err "Docker 未安装，请先执行「一键安装 → 基础环境」"
-    return 1
-  fi
-  if ! docker info >/dev/null 2>&1; then
-    err "Docker 未运行，请执行: systemctl start docker"
-    return 1
-  fi
-  return 0
-}
-
-service_state_cn(){
-  local svc="$1"
-  systemctl is-active --quiet "$svc" 2>/dev/null && echo "运行中" && return
-  systemctl is-enabled --quiet "$svc" 2>/dev/null && echo "已安装/未运行" && return
-  echo "未安装或未启用"
-}
-
-# ─── Docker 日志工具 ──────────────────────────────────────
+# ─── Docker 工具 ──────────────────────────────────────────
 bytes_human(){ numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
-
-container_log_path(){
-  docker inspect --format '{{.LogPath}}' "$1" 2>/dev/null
-}
-
-clear_container_log(){
-  local lp
-  lp=$(container_log_path "$1")
-  [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null
-}
-
+container_log_path(){ docker inspect --format '{{.LogPath}}' "$1" 2>/dev/null; }
 clear_all_container_logs(){
+  need_docker || return 1
   local count=0 cid lp
-  need_docker_running || return 1
   for cid in $(docker ps -aq 2>/dev/null); do
     lp=$(container_log_path "$cid")
     [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
   done
   ok "已清空 $count 个容器日志"
 }
-
-show_log_usage(){
-  echo
-  echo "  容器日志占用 TOP 10："
-  local dir="/var/lib/docker/containers"
-  if [ -d "$dir" ]; then
-    find "$dir" -name "*-json.log" -type f -printf '%s %p\n' 2>/dev/null |
-      sort -n | tail -10 |
-      while read -r size path; do
-        echo "    $(bytes_human "$size")  $path"
-      done
-  else
-    info "未找到 Docker 日志目录"
-  fi
+has_auto_cleanup(){ crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"; }
+service_state(){
+  systemctl is-active --quiet "$1" 2>/dev/null && echo "运行中" && return
+  systemctl is-enabled --quiet "$1" 2>/dev/null && echo "已安装/未运行" && return
+  echo "未安装"
 }
+collect_compose_files(){
+  local dirs="$LAST_BASE /docker /opt/docker-apps /app"
+  { for d in $dirs; do [ -d "$d" ] && find "$d" -name "docker-compose.yml" -type f 2>/dev/null; done; } | sort -u
+}
+extract_first_host_port(){
+  grep -E '^[[:space:]]*-[[:space:]]*"?[0-9.:]+:[0-9]+' "$1" 2>/dev/null |
+    head -1 | sed -E 's/.*:([0-9]+)"?$/\1/'
+}
+
 # ═══════════════════════════════════════════════════════════
-# 安装模块 — 拆分「基础安装」和「初始配置」
+# 安装模块 — 拆分基础安装(仅装软件) 和 完整安装(含引导)
 # ═══════════════════════════════════════════════════════════
 
 install_docker(){
@@ -226,7 +173,7 @@ install_docker(){
 }
 
 install_nginx(){
-  command -v nginx >/dev/null 2>&1 && { ok "Nginx 已安装"; return 0; }
+  cmd_exists nginx && { ok "Nginx 已安装"; return 0; }
   info "安装 Nginx..."
   apt-get install -y -qq nginx
   systemctl enable --now nginx 2>/dev/null
@@ -234,13 +181,12 @@ install_nginx(){
 }
 
 install_certbot(){
-  command -v certbot >/dev/null 2>&1 && { ok "Certbot 已安装"; return 0; }
+  cmd_exists certbot && { ok "Certbot 已安装"; return 0; }
   info "安装 Certbot..."
   apt-get install -y -qq certbot python3-certbot-nginx
   ok "Certbot 安装完成"
 }
 
-# ─── 基础安装（仅安装软件，不引导项目创建） ────────────────
 install_base_env(){
   ui_header "安装基础环境"
   echo
@@ -249,12 +195,6 @@ install_base_env(){
   install_certbot
   echo
   ok "基础环境安装完成"
-  echo
-  info "接下来可进行以下操作："
-  echo "    ① 设置定时维护清理"
-  echo "    ② 创建 Docker 项目"
-  echo "    ③ 配置 Nginx 反向代理"
-  echo "    全部可通过主菜单完成。"
   pause
 }
 
@@ -268,7 +208,7 @@ install_all(){
   ok "基础环境安装完成"
   echo
   if has_auto_cleanup; then
-    ok "已存在 Docker 定时维护任务，跳过重复设置"
+    ok "定时维护任务已存在"
   elif ask_yn "设置定时维护清理？" "y"; then
     setup_auto_cleanup
   fi
@@ -282,208 +222,134 @@ install_all(){
 }
 
 # ═══════════════════════════════════════════════════════════
-# Docker 项目管理
+# Docker 项目管理 — 直接用空白模板，不要通用模板选择
 # ═══════════════════════════════════════════════════════════
 
-extract_first_host_port(){
-  grep -E '^[[:space:]]*-[[:space:]]*"?[0-9.:]+:[0-9]+' "$1" 2>/dev/null |
-    head -1 | sed -E 's/.*:([0-9]+)"?$/\1/'
-}
-
-has_auto_cleanup(){
-  crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"
-}
-
-ask_create_nginx_after_project(){
-  local default_name="$1" default_port="$2"
-  echo
-  if ask_yn "是否继续创建 Nginx 反向代理？" "y"; then
-    create_nginx_proxy "$default_name" "$default_port" "wizard"
-  else
-    info "已完成 Docker 项目创建。后续可在「Nginx 管理」中创建反向代理。"
-  fi
-}
-
 create_docker_project(){
-  ui_header "创建新项目"
-  echo
-
-  local name base dir file t guessed_port
-
-  read -rp "  项目名称: " name
-  [ -z "$name" ] && { info "已取消"; return 0; }
-
+  need_docker || return 1
+  ui_header "创建 Docker 项目"
+  local name port
   while ! safe_name "$name"; do
-    err "只能用字母、数字、点、横杠、下划线，且必须以字母开头"
-    read -rp "  项目名称: " name
-    [ -z "$name" ] && { info "已取消"; return 0; }
+    read -rp "  项目名称（字母开头，a-z0-9._-）: " name
+    [ -z "$name" ] && return 1
   done
-
-  read -rp "  存放目录 [默认 $LAST_BASE]: " base
-  [ -z "$base" ] && base="$LAST_BASE"
+  local base="${LAST_BASE%/}"
+  mkdir -p "$base/$name"
   LAST_BASE="$base"
   save_conf
-
-  dir="$base/$name"
-  file="$dir/docker-compose.yml"
-  mkdir -p "$dir"
-
-  if [ -f "$file" ]; then
-    warn "文件已存在: $file"
-    ask_yn "覆盖？" || return 0
-  fi
-
-  echo
-  echo "  选择模板："
-  echo "    [1] 通用模板（推荐）"
-  echo "    [2] 空模板（完全空白）"
-  echo
-  read -rp "  请选择 [1]: " t
-  [ -z "$t" ] && t="1"
-
-  if [ "$t" = "2" ]; then
-    : > "$file"
-    ok "已创建空模板: $file"
-  else
-    cat > "$file" <<'EOFTMPL'
+  info "端口映射（如 3000）；留空则无端口映射"
+  read -rp "  容器端口: " port
+  if [ -n "$port" ]; then
+    cat > "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
 services:
-  APP_NAME:
+  $name:
     image: your-image:latest
-    container_name: APP_NAME
+    container_name: $name
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080"
-    volumes:
-      - ./data:/app/data
-EOFTMPL
-    ok "已创建通用模板: $file"
-  fi
-
-  echo
-  info "接下来进入编辑器，请检查/填写 docker-compose.yml 后保存退出。"
-  pause
-  edit_file "$file"
-
-  echo
-  if [ ! -s "$file" ]; then
-    warn "配置文件为空，已跳过启动。"
-    return 0
-  fi
-
-  guessed_port=$(extract_first_host_port "$file")
-  [ -z "$guessed_port" ] && guessed_port="8080"
-
-  if ask_yn "现在启动/应用这个项目？" "y"; then
-    if (cd "$dir" && docker compose up -d); then
-      ok "项目已启动"
-      ask_create_nginx_after_project "$name" "$guessed_port"
-    else
-      err "项目启动失败，请检查 docker-compose.yml 后重试。"
-    fi
+      - "$port:$port"
+DOCKERCOMPOSE
   else
-    info "已保存配置，稍后可在「项目管理 → 启动/重启」中启动。"
-    ask_create_nginx_after_project "$name" "$guessed_port"
+    cat > "$base/$name/docker-compose.yml" <<DOCKERCOMPOSE
+services:
+  $name:
+    image: your-image:latest
+    container_name: $name
+    restart: unless-stopped
+DOCKERCOMPOSE
   fi
-}
-
-collect_compose_files(){
-  local dirs="$LAST_BASE /docker /opt/docker-apps /app"
-  {
-    for d in $dirs; do
-      [ -d "$d" ] && find "$d" -name "docker-compose.yml" -type f 2>/dev/null
-    done
-    true
-  } | sort -u
+  ok "项目已创建: $base/$name/"
+  if ask_yn "现在编辑 docker-compose.yml？" "y"; then
+    edit_file "$base/$name/docker-compose.yml"
+  fi
 }
 
 select_compose_dir(){
-  local files
-  mapfile -t files < <(collect_compose_files)
-  [ ${#files[@]} -eq 0 ] && { warn "没有找到项目"; return 1; }
-
-  local items=()
-  local f
-  for f in "${files[@]}"; do items+=("$(dirname "$f")"); done
-  select_from_list "选择项目：" "${items[@]}" || return 1
+  local dirs
+  dirs=$(collect_compose_files)
+  if [ -z "$dirs" ]; then
+    warn "未找到 docker-compose.yml"
+    if ask_yn "创建新项目？" "y"; then
+      create_docker_project
+      dirs=$(collect_compose_files)
+      [ -z "$dirs" ] && return 1
+    else
+      return 1
+    fi
+  fi
+  local files=()
+  local d
+  for d in $dirs; do files+=("$d"); done
+  local items=() item_dir
+  local item
+  for item in "${files[@]}"; do items+=("$(dirname "$item")"); done
+  select_from_list "选择项目目录" "${items[@]}" || return 1
   SELECTED_DIR="$SELECTED_ITEM"
   return 0
 }
 
 list_projects(){
-  ui_header "项目列表"
-  echo
-  local files
-  mapfile -t files < <(collect_compose_files)
-  [ ${#files[@]} -eq 0 ] && { warn "没有找到项目"; return 0; }
-  for f in "${files[@]}"; do
-    echo "  $(dirname "$f")"
+  need_docker || return 1
+  local dirs
+  dirs=$(collect_compose_files)
+  [ -z "$dirs" ] && { warn "未找到 docker-compose.yml"; return 0; }
+  local d
+  for d in $dirs; do
+    local name status
+    name=$(basename "$(dirname "$d")")
+    status=$(docker compose -f "$d" ps --format '{{.Name}} {{.State}}' 2>/dev/null | head -1 || echo "─ 未启动")
+    echo "  ${CYAN}$name${NC}: $status"
   done
-  echo
-  info "共 ${#files[@]} 个项目"
 }
 
 restart_project(){
-  select_compose_dir || return 0
-  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
-  echo
-  echo "  启动方式："
-  echo "    [1] 启动/重启（应用配置更改）"
-  echo "    [2] 仅重启容器（不改配置）"
-  echo
-  local t
-  read -rp "  请选择 [1]: " t
-  [ -z "$t" ] && t="1"
-  if [ "$t" = "1" ]; then
-    docker compose up -d && ok "项目已启动/重启"
-  else
-    docker compose restart && ok "容器已重启"
-  fi
+  select_compose_dir || return 1
+  docker compose -f "$SELECTED_DIR/docker-compose.yml" up -d && ok "$(basename "$SELECTED_DIR") 已启动"
+  pause
 }
 
 stop_project(){
-  select_compose_dir || return 0
-  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
-  docker compose stop
-  ok "项目已停止"
+  select_compose_dir || return 1
+  docker compose -f "$SELECTED_DIR/docker-compose.yml" down && ok "$(basename "$SELECTED_DIR") 已停止"
+  pause
 }
 
 project_logs(){
-  select_compose_dir || return 0
-  cd "$SELECTED_DIR" || { err "无法进入项目目录: $SELECTED_DIR"; return 1; }
-  echo
-  echo "=========================================="
-  echo "  项目日志: $SELECTED_DIR"
-  echo "  最近 100 行（Ctrl+C 退出）"
-  echo "=========================================="
-  docker compose logs --tail=100 -f
+  select_compose_dir || return 1
+  docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200 -f
 }
 
 edit_project(){
-  select_compose_dir || return 0
-  local file="$SELECTED_DIR/docker-compose.yml"
-  edit_file "$file"
-  if ask_yn "应用配置？"; then
-    cd "$SELECTED_DIR" || { err "无法进入目录: $SELECTED_DIR"; return 1; }
-    docker compose up -d
-    ok "已应用配置"
-  fi
+  select_compose_dir || return 1
+  edit_file "$SELECTED_DIR/docker-compose.yml"
 }
 
 update_project(){
-  select_compose_dir || return 0
-  cd "$SELECTED_DIR" || { err "无法进入目录: $SELECTED_DIR"; return 1; }
-  ask_yn "确认更新？" || return 0
-  docker compose pull && docker compose up -d && ok "项目已更新"
+  need_docker || return 1
+  select_compose_dir || return 1
+  local name="$SELECTED_DIR"
+  local dir="$name"
+  name=$(basename "$name")
+  if ask_yn "拉取新镜像并重建 $name？" "y"; then
+    docker compose -f "$dir/docker-compose.yml" pull && \
+    docker compose -f "$dir/docker-compose.yml" up -d && \
+    ok "$name 已更新" && pause
+  fi
 }
 
 delete_project_config(){
-  select_compose_dir || return 0
-  echo
-  warn "将删除项目目录: $SELECTED_DIR"
-  ask_yn "确认删除？" "n" || return 0
-  (cd "$SELECTED_DIR" && docker compose down) 2>/dev/null || true
-  rm -rf -- "$SELECTED_DIR"
-  ok "已删除: $SELECTED_DIR"
+  select_compose_dir || return 1
+  if ! ask_yn "确认删除项目 ${SELECTED_DIR}？此操作不可恢复" "n"; then
+    return 0
+  fi
+  if ! ask_yn "再次确认：删除 ${SELECTED_DIR} 的所有文件和容器？" ""; then
+    return 0
+  fi
+  local dir="$SELECTED_DIR"
+  docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null
+  rm -rf -- "$dir"
+  ok "已删除"
+  pause
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -491,9 +357,14 @@ delete_project_config(){
 # ═══════════════════════════════════════════════════════════
 
 select_container(){
-  local containers
-  mapfile -t containers < <(docker ps -a --format '{{.Names}}' 2>/dev/null | sort)
-  select_from_list "选择容器：" "${containers[@]}" || return 1
+  need_docker || return 1
+  local items=()
+  local cid
+  for cid in $(docker ps -aq 2>/dev/null); do
+    items+=("$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's/^\///')")
+  done
+  [ ${#items[@]} -eq 0 ] && { warn "没有容器"; return 1; }
+  select_from_list "选择容器" "${items[@]}" || return 1
   SELECTED_CONTAINER="$SELECTED_ITEM"
   return 0
 }
@@ -515,17 +386,16 @@ container_action_menu(){
     case "$a" in
       1) docker logs --tail=200 -f "$c" ;;
       2) docker exec -it "$c" sh 2>/dev/null || docker exec -it "$c" bash ;;
-      3) ask_yn "重启 $c？" && docker restart "$c" && ok "已重启"; pause ;;
-      4) ask_yn "停止 $c？" && docker stop "$c" && ok "已停止"; pause ;;
+      3) ask_yn "重启 $c？" "y" && docker restart "$c" && ok "已重启"; pause ;;
+      4) ask_yn "停止 $c？" "y" && docker stop "$c" && ok "已停止"; pause ;;
       5) docker start "$c" && ok "已启动"; pause ;;
       6) docker inspect "$c" | less ;;
-      7)
-        ask_yn "确认删除 $c？" "n" && docker rm -f "$c" && ok "已删除" && return 0
-        pause
-        ;;
+      7) if ask_yn "确认删除容器 $c？" ""; then
+           docker rm -f "$c" && ok "已删除" && return 0
+         fi; pause ;;
       0) return 0 ;;
       "") continue ;;
-      *) warn "无效选择" ;;
+      *) echo "  输入 0-7" ;;
     esac
   done
 }
@@ -534,31 +404,21 @@ container_menu(){
   while true; do
     ui_header "容器管理"
     echo "  [1] 容器列表"
-    echo "  [2] 选择容器"
+    echo "  [2] 选择容器操作"
     echo "  [3] 资源占用"
     echo "  [0] 返回"
     echo
     read -rp "  请选择 [0-3]: " c
-
     case "$c" in
-      1)
-        need_docker_running || { pause; continue; }
-        docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-        pause
-        ;;
-      2)
-        need_docker_running || { pause; continue; }
-        select_container || continue
-        container_action_menu "$SELECTED_CONTAINER"
-        ;;
-      3)
-        need_docker_running || { pause; continue; }
-        info "按 Ctrl+C 退出"
-        docker stats
-        ;;
+      1) need_docker || { pause; continue; }
+         docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" ;;
+      2) select_container || continue
+         container_action_menu "$SELECTED_CONTAINER" ;;
+      3) need_docker || { pause; continue; }
+         info "按 Ctrl+C 退出"; docker stats ;;
       0) return ;;
       "") continue ;;
-      *) warn "无效选择" ;;
+      *) echo "  输入 0-3" ;;
     esac
   done
 }
@@ -567,120 +427,67 @@ container_menu(){
 # 镜像管理
 # ═══════════════════════════════════════════════════════════
 
-select_image(){
-  local images
-  mapfile -t images < <(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}' 2>/dev/null | sort)
-  select_from_list "选择镜像：" "${images[@]}" || return 1
-  SELECTED_IMAGE="${SELECTED_ITEM%% *}"
-  return 0
-}
-
 image_menu(){
   while true; do
     ui_header "镜像管理"
     echo "  [1] 镜像列表"
     echo "  [2] 拉取镜像"
-    echo "  [3] 选择镜像"
+    echo "  [3] 删除镜像"
     echo "  [4] 清理未使用镜像"
     echo "  [0] 返回"
     echo
     read -rp "  请选择 [0-4]: " c
     case "$c" in
-      1)
-        need_docker_running || { pause; continue; }
-        docker images
-        pause
-        ;;
+      1) docker images ;;
       2)
-        need_docker_running || { pause; continue; }
-        local image
-        read -rp "  镜像名: " image
-        [ -z "$image" ] && { info "已取消"; continue; }
-        docker pull "$image"
+        local img
+        read -rp "  输入镜像名（如 nginx:alpine）: " img
+        [ -n "$img" ] && docker pull "$img" || warn "输入为空"
         pause
         ;;
       3)
-        need_docker_running || { pause; continue; }
-        select_image || continue
-        while true; do
-          ui_header "镜像操作: $SELECTED_IMAGE"
-          echo "  [1] 镜像历史"
-          echo "  [2] 删除镜像"
-          echo "  [0] 返回"
-          echo
-          read -rp "  请选择 [0-2]: " a
-          case "$a" in
-            1) docker history "$SELECTED_IMAGE"; pause ;;
-            2) ask_yn "确认删除 $SELECTED_IMAGE？" "n" && docker rmi "$SELECTED_IMAGE"; pause; break ;;
-            0) break ;;
-            "") continue ;;
-            *) warn "无效选择" ;;
-          esac
-        done
+        local items=()
+        while read -r line; do
+          repo=$(echo "$line" | awk '{print $1}')
+          tag=$(echo "$line" | awk '{print $2}')
+          items+=("$repo:$tag")
+        done <<< "$(docker images --format '{{.Repository}} {{.Tag}}')"
+        select_from_list "选择要删除的镜像" "${items[@]}" || continue
+        local sel="$SELECTED_ITEM"
+        if ask_yn "确认删除镜像 $sel？" ""; then
+          docker rmi "$sel" && ok "已删除"
+        fi
+        pause
         ;;
       4)
-        need_docker_running || { pause; continue; }
-        ask_yn "清理未使用镜像？" "n" && docker image prune -a -f
+        if ask_yn "清理未使用的镜像？" ""; then
+          docker image prune -a -f && ok "清理完成"
+        fi
         pause
         ;;
       0) return ;;
-      "") continue ;;
-      *) warn "无效选择" ;;
     esac
   done
 }
 
 # ═══════════════════════════════════════════════════════════
-# Docker 整体状态
+# Docker 系统状态
 # ═══════════════════════════════════════════════════════════
 
 docker_system_status(){
-  ui_header "系统状态"
+  need_docker || return 1
+  ui_header "Docker 状态"
+  echo "  版  本: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '─')"
+  echo "  容  器: $(docker ps -q 2>/dev/null | wc -l) 运行 / $(docker ps -aq 2>/dev/null | wc -l) 总计"
+  echo "  镜  像: $(docker images -q 2>/dev/null | wc -l) 个"
+  echo "  卷:     $(docker volume ls -q 2>/dev/null | wc -l) 个"
+  local disk docker_root
+  disk=$(df -h /var/lib/docker 2>/dev/null | awk 'NR==2{print $4}' || echo "─")
+  echo "  磁盘剩余: $disk"
   echo
-  echo "  基础服务："
-  if cmd_exists docker; then
-    echo "    Docker: $(service_state_cn docker)"
-    docker --version 2>/dev/null | sed 's/^/    版本: /'
-  else
-    echo "    Docker: 未安装"
-  fi
-  if cmd_exists nginx; then
-    echo "    Nginx:  $(service_state_cn nginx)"
-    nginx -v 2>&1 | sed 's/^/    版本: /'
-  else
-    echo "    Nginx:  未安装"
-  fi
-  cmd_exists certbot && certbot --version 2>/dev/null | sed 's/^/    Certbot: /' || echo "    Certbot: 未安装"
-  echo
-
-  if docker_ready; then
-    echo "  Docker 资源："
-    local running exited paused images volumes networks
-    running=$(docker ps -q 2>/dev/null | wc -l)
-    exited=$(docker ps -aq --filter "status=exited" 2>/dev/null | wc -l)
-    paused=$(docker ps -aq --filter "status=paused" 2>/dev/null | wc -l)
-    images=$(docker images -q 2>/dev/null | sort -u | wc -l)
-    volumes=$(docker volume ls -q 2>/dev/null | wc -l)
-    networks=$(docker network ls -q 2>/dev/null | wc -l)
-    echo "    运行容器: $running    已停止: $exited    已暂停: $paused"
-    echo "    镜像数量: $images    卷数量: $volumes    网络数量: $networks"
-    echo
-    echo "  Docker 空间："
-    docker system df 2>/dev/null | sed 's/^/    /'
-    echo
-    echo "  容器列表："
-    docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null | sed 's/^/    /'
-  else
-    echo "  Docker 未运行，无法读取容器状态"
-  fi
-  echo
-
-  echo "  系统磁盘："
-  df -h / 2>/dev/null | awk 'NR==1{print "    "$0} NR==2{print "    "$0}'
-  echo
-
-  echo "  定时维护："
-  crontab -l 2>/dev/null | grep "docker-cleanup.sh" || echo "    未设置"
+  info "资源使用（按 Ctrl+C 退出）"
+  docker stats --no-stream 2>/dev/null
+  pause
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -693,42 +500,33 @@ write_cleanup_script(){
 DATE=$(date '+%Y-%m-%d %H:%M:%S')
 LOG="/var/log/docker-cleanup.log"
 log(){ echo "[$DATE] $1" >> "$LOG"; }
-log "开始维护清理..."
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  count=0
-  for cid in $(docker ps -aq 2>/dev/null); do
-    lp=$(docker inspect --format '{{.LogPath}}' "$cid" 2>/dev/null)
-    if [ -f "$lp" ]; then
-      truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
-    fi
-  done
-  log "已清空 $count 个容器日志"
-  docker container prune -f >> "$LOG" 2>&1
-  docker image prune -a -f >> "$LOG" 2>&1
-  docker builder prune -a -f >> "$LOG" 2>&1
-  docker volume prune -f >> "$LOG" 2>&1
-  log "维护清理完成"
-else
-  log "Docker 未安装或未运行，跳过"
-fi
+log "开始维护..."
+docker container prune -f >> "$LOG" 2>&1
+docker image prune -a -f >> "$LOG" 2>&1
+docker builder prune -a -f >> "$LOG" 2>&1
+docker volume prune -f >> "$LOG" 2>&1
+log "维护完成"
 EOF
   chmod +x /usr/local/bin/docker-cleanup.sh
 }
 
 run_full_cleanup(){
-  need_docker_running || return 1
-  warn "将清空日志并清理停止容器、未使用镜像、构建缓存和未使用卷。"
-  ask_yn "确认清理？" "n" || return 0
+  need_docker || return 1
+  if ! ask_yn "清空日志并清理停止容器、未使用镜像、构建缓存和未使用卷？" ""; then
+    return 0
+  fi
   clear_all_container_logs
   docker container prune -f
   docker image prune -a -f
   docker builder prune -a -f
   docker volume prune -f
   ok "清理完成"
+  pause
 }
 
 setup_auto_cleanup(){
   ui_header "定时维护"
+  local cron_time job
   echo "  [1] 每天凌晨 3 点"
   echo "  [2] 每周一凌晨 3 点"
   echo "  [3] 每月 1 号凌晨 3 点"
@@ -737,16 +535,12 @@ setup_auto_cleanup(){
   echo "  [6] 立即执行"
   echo "  [0] 返回"
   echo
-  local choice cron_time
   read -rp "  请选择 [1]: " choice
   [ -z "$choice" ] && choice="1"
-
   case "$choice" in
     4)
-      local job
       job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh" || true)
-      [ -z "$job" ] && warn "未设置" || ok "任务: $job"
-      pause; return 0 ;;
+      [ -z "$job" ] && warn "未设置" || ok "$job"; pause; return 0 ;;
     5)
       crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -
       ok "已删除"; pause; return 0 ;;
@@ -760,9 +554,8 @@ setup_auto_cleanup(){
     1) cron_time="0 3 * * *" ;;
     2) cron_time="0 3 * * 1" ;;
     3) cron_time="0 3 1 * *" ;;
-    *) warn "无效选择"; return 1 ;;
+    *) echo "  输入 1-6"; return 1 ;;
   esac
-
   write_cleanup_script
   crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -
   (crontab -l 2>/dev/null; echo "$cron_time /usr/local/bin/docker-cleanup.sh") | crontab -
@@ -774,27 +567,20 @@ maintenance_menu(){
   while true; do
     ui_header "维护清理"
     echo "  [1] 状态总览"
-    echo "  [2] 日志占用"
-    echo "  [3] 清空日志"
-    echo "  [4] 一键清理"
-    echo "  [5] 定时维护"
-    echo "  [6] 维护记录"
+    echo "  [2] 一键清理"
+    echo "  [3] 清空容器日志"
+    echo "  [4] 定时任务"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-6]: " c
+    read -rp "  请选择 [0-4]: " c
     case "$c" in
-      1) docker_system_status; pause ;;
-      2) show_log_usage; pause ;;
-      3) ask_yn "确认清空全部容器日志？" "n" && clear_all_container_logs; pause ;;
-      4) run_full_cleanup; pause ;;
-      5) setup_auto_cleanup ;;
-      6)
-        [ -f /var/log/docker-cleanup.log ] && tail -30 /var/log/docker-cleanup.log || warn "没有记录"
-        pause
-        ;;
+      1) docker_system_status ;;
+      2) run_full_cleanup ;;
+      3) need_docker || { pause; continue; }
+         clear_all_container_logs; pause ;;
+      4) setup_auto_cleanup ;;
       0) return ;;
-      "") continue ;;
-      *) warn "无效选择" ;;
+      *) echo "  输入 0-4" ;;
     esac
   done
 }
@@ -803,299 +589,193 @@ maintenance_menu(){
 # Nginx 管理
 # ═══════════════════════════════════════════════════════════
 
-nginx_config_test(){
-  nginx -t >/tmp/nginx_check.log 2>&1
-}
+nginx_config_test(){ nginx -t 2>&1; }
 
 create_nginx_proxy(){
-  local default_name="${1:-}" default_port="${2:-}" mode="${3:-manual}"
+  ui_header "创建 Nginx 反代"
   local name domain port
-
-  ui_header "创建反向代理"
-  echo
-
-  if [ -n "$default_name" ]; then
-    read -rp "  配置名称 [$default_name]: " name
-    [ -z "$name" ] && name="$default_name"
-  else
-    read -rp "  配置名称: " name
-    [ -z "$name" ] && { info "已取消"; return 0; }
-  fi
-
   while ! safe_name "$name"; do
-    err "只能用字母、数字、点、横杠、下划线，且必须以字母开头"
-    read -rp "  配置名称: " name
-    [ -z "$name" ] && { info "已取消"; return 0; }
+    read -rp "  配置名称（如 myapp, a-z0-9._-）: " name
+    [ -z "$name" ] && return 1
   done
-
-  read -rp "  域名: " domain
-  [ -z "$domain" ] && { info "已取消"; return 0; }
   while ! valid_domain "$domain"; do
-    err "域名格式不正确"
-    read -rp "  域名: " domain
-    [ -z "$domain" ] && { info "已取消"; return 0; }
+    read -rp "  域名（如 example.com）: " domain
+    [ -z "$domain" ] && return 1
   done
-
-  if [ -n "$default_port" ]; then
-    read -rp "  本地端口 [$default_port]: " port
-    [ -z "$port" ] && port="$default_port"
-  else
-    read -rp "  本地端口: " port
-  fi
   while ! valid_port "$port"; do
-    err "端口必须为 1-65535"
-    read -rp "  本地端口: " port
-    [ -z "$port" ] && { info "已取消"; return 0; }
+    read -rp "  反代端口（1-65535）: " port
+    [ -z "$port" ] && return 1
   done
 
-  # 自动创建 ssl 参数文件
-  if [ ! -f /etc/nginx/ssl_params.conf ]; then
-    cat > /etc/nginx/ssl_params.conf <<'EOF'
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-ssl_prefer_server_ciphers on;
-ssl_session_cache shared:SSL:10m;
-ssl_session_timeout 10m;
-EOF
-  fi
-
-  local conf="/etc/nginx/sites-available/$name"
-  if [ -f "$conf" ]; then
-    warn "配置已存在: $conf"
-    ask_yn "覆盖？" || return 0
-  fi
-
-  cat > "$conf" <<CONF
+  cat > "/etc/nginx/sites-available/$name" <<NGINX
 server {
     listen 80;
+    listen [::]:80;
     server_name $domain;
-    return 301 https://\$server_name\$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name $domain;
-
-    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-    include /etc/nginx/ssl_params.conf;
 
     location / {
         proxy_pass http://127.0.0.1:$port;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
     }
 }
-CONF
-
-  if [ "$mode" = "wizard" ]; then
-    ok "配置已创建: $name"
-    echo
-    info "提示：请先申请 SSL 证书后再启用站点。"
-    echo "  在「HTTPS 证书」菜单中申请: $domain"
-    if ask_yn "是否现在申请 SSL 证书？" "y"; then
-      local email_opt=""
-      read -rp "  邮箱（可选，用于紧急续期通知）: " email
-      [ -n "$email" ] && email_opt="--email $email"
-      certbot --nginx -d "$domain" $email_opt && {
-        ok "证书申请完成"
-        nginx_config_test && systemctl reload nginx && ok "站点已启用: $name"
-      } || {
-        err "证书申请失败，请稍后手动申请并执行: ln -sf $conf /etc/nginx/sites-enabled/ && systemctl reload nginx"
-      }
-    fi
-  else
-    echo
-    ln -sf "$conf" /etc/nginx/sites-enabled/ 2>/dev/null
-    nginx_config_test && {
-      systemctl reload nginx
-      ok "站点已启用: $name"
-    } || {
-      rm -f "/etc/nginx/sites-enabled/$name"
-      err "配置检查失败"
-      cat /tmp/nginx_check.log
-      info "请稍后在「Nginx 管理 → 编辑站点」中修正配置"
-    }
+NGINX
+  ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
+  ok "配置文件已创建: /etc/nginx/sites-available/$name"
+  if ask_yn "现在编辑配置？" "y"; then
+    edit_file "/etc/nginx/sites-available/$name"
   fi
+  if ask_yn "测试配置并重载 Nginx？" "y"; then
+    nginx -t && systemctl reload nginx && ok "Nginx 已重载" || err "配置错误"
+  fi
+  pause
 }
 
-nginx_menu(){
+list_sites(){
+  ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | sed 's/^/  /'
+}
+
+certbot_get(){
+  need_docker || return 1
+  local domains=() cert_name resolved
+  ui_header "申请 SSL 证书"
   while true; do
-    ui_header "Nginx 管理"
-    echo "  [1] 创建反向代理"
-    echo "  [2] 站点列表"
-    echo "  [3] 启用站点"
-    echo "  [4] 禁用站点"
-    echo "  [5] 删除站点"
-    echo "  [6] 编辑站点"
-    echo "  [7] 测试配置并重载"
-    echo "  [8] 查看日志"
+    read -rp "  域名（多个用空格隔开）: " -a domains
+    [ ${#domains[@]} -gt 0 ] && break
+  done
+  cert_name="${domains[0]}"
+  if ask_yn "申请证书前先测试 Nginx 配置？" "y"; then
+    nginx -t && ok "Nginx 配置正确" || { err "Nginx 配置有误"; pause; return 1; }
+  fi
+  certbot certonly --nginx -d "${domains[0]}" ${domains[@]:1} -n \
+    --agree-tos --email "admin@${cert_name}" || {
+    err "证书申请失败"; pause; return 1
+  }
+  ok "证书已申请"
+}
+
+list_cert_names(){
+  local cert
+  for cert in /etc/letsencrypt/live/*/; do
+    [ -d "$cert" ] && basename "$cert"
+  done
+}
+
+cert_actions_menu(){
+  local cert="$1"
+  while true; do
+    ui_header "证书: $cert"
+    echo "  [1] 查看信息"
+    echo "  [2] 续期"
+    echo "  [3] 查看定时续期"
+    echo "  [4] 删除证书"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-8]: " c
-
+    read -rp "  请选择 [0-4]: " c
     case "$c" in
-      1) create_nginx_proxy; pause ;;
+      1)
+        certbot certificates --cert-name "$cert" 2>/dev/null
+        local exp
+        exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$cert/fullchain.pem" 2>/dev/null | cut -d= -f2)
+        echo "  过期时间: $exp"
+        pause
+        ;;
       2)
-        echo
-        echo "  已启用站点:"
-        ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "^default$" | sed 's/^/    /'
-        [ "$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "^default$" | wc -l)" -eq 0 ] && echo "    （无）"
-        echo
-        echo "  所有可用站点:"
-        ls /etc/nginx/sites-available/ 2>/dev/null | sed 's/^/    /'
-        [ "$(ls /etc/nginx/sites-available/ 2>/dev/null | wc -l)" -eq 0 ] && echo "    （无）"
+        ask_yn "续期证书 $cert？" "y" && certbot renew --cert-name "$cert" && ok "已续期"
         pause
         ;;
       3)
-        local all_sites
-        mapfile -t all_sites < <(ls /etc/nginx/sites-available/ 2>/dev/null | grep -v "^default$")
-        [ ${#all_sites[@]} -eq 0 ] && { warn "没有可用站点"; pause; continue; }
-        select_from_list "选择要启用的站点：" "${all_sites[@]}" || continue
-        ln -sf "/etc/nginx/sites-available/$SELECTED_ITEM" "/etc/nginx/sites-enabled/$SELECTED_ITEM" 2>/dev/null
-        nginx_config_test && {
-          systemctl reload nginx
-          ok "站点已启用: $SELECTED_ITEM"
-        } || {
-          rm -f "/etc/nginx/sites-enabled/$SELECTED_ITEM"
-          err "配置检查失败"
+        systemctl list-timers 2>/dev/null | grep certbot || {
+          crontab -l 2>/dev/null | grep certbot || echo "  未设置定时续期"
         }
         pause
         ;;
       4)
-        local enabled_sites
-        mapfile -t enabled_sites < <(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "^default$")
-        [ ${#enabled_sites[@]} -eq 0 ] && { warn "没有已启用站点"; pause; continue; }
-        select_from_list "选择要禁用的站点：" "${enabled_sites[@]}" || continue
-        rm -f "/etc/nginx/sites-enabled/$SELECTED_ITEM"
-        systemctl reload nginx
-        ok "站点已禁用: $SELECTED_ITEM"
-        pause
-        ;;
-      5)
-        local all_sites2
-        mapfile -t all_sites2 < <(ls /etc/nginx/sites-available/ 2>/dev/null)
-        [ ${#all_sites2[@]} -eq 0 ] && { warn "没有站点"; pause; continue; }
-        select_from_list "选择要删除的站点：" "${all_sites2[@]}" || continue
-        ask_yn "确认删除 $SELECTED_ITEM？" || continue
-        rm -f "/etc/nginx/sites-available/$SELECTED_ITEM" "/etc/nginx/sites-enabled/$SELECTED_ITEM"
-        systemctl reload nginx
-        ok "站点已删除: $SELECTED_ITEM"
-        pause
-        ;;
-      6)
-        local all_sites3
-        mapfile -t all_sites3 < <(ls /etc/nginx/sites-available/ 2>/dev/null)
-        [ ${#all_sites3[@]} -eq 0 ] && { warn "没有站点"; pause; continue; }
-        select_from_list "选择要编辑的站点：" "${all_sites3[@]}" || continue
-        edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"
-        nginx_config_test && {
-          systemctl reload nginx
-          ok "配置已重载"
-        } || err "配置检查失败"
-        pause
-        ;;
-      7)
-        nginx_config_test && {
-          ok "配置正确"
-          ask_yn "重新加载？" && systemctl reload nginx && ok "已重载"
-        } || {
-          err "配置有错误"
-          cat /tmp/nginx_check.log
-        }
-        pause
-        ;;
-      8)
-        echo
-        echo "  [1] 访问日志"
-        echo "  [2] 错误日志"
-        read -rp "  请选择 [1]: " sl
-        [ -z "$sl" ] && sl="1"
-        [ "$sl" = "1" ] && tail -30 /var/log/nginx/access.log || tail -30 /var/log/nginx/error.log
+        if ask_yn "确认删除证书 $cert？" ""; then
+          certbot delete --cert-name "$cert" && ok "已删除"
+        fi
         pause
         ;;
       0) return ;;
-      "") continue ;;
-      *) warn "无效选择" ;;
     esac
   done
-}
-
-# ═══════════════════════════════════════════════════════════
-# HTTPS 证书
-# ═══════════════════════════════════════════════════════════
-
-list_cert_names(){
-  if [ -d /etc/letsencrypt/renewal ]; then
-    find /etc/letsencrypt/renewal -maxdepth 1 -type f -name "*.conf" 2>/dev/null |
-      sed 's#.*/##; s#\.conf$##' | sort -u
-  elif [ -d /etc/letsencrypt/live ]; then
-    find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
-      sed 's#.*/##' | grep -v '^README$' | sort -u
-  fi
-}
-
-select_cert_name(){
-  local certs
-  mapfile -t certs < <(list_cert_names)
-  select_from_list "选择证书：" "${certs[@]}" || return 1
-  SELECTED_CERT="$SELECTED_ITEM"
-  return 0
 }
 
 certbot_menu(){
   while true; do
     ui_header "HTTPS 证书"
     echo "  [1] 申请新证书"
-    echo "  [2] 查看证书列表"
-    echo "  [3] 测试续期"
-    echo "  [4] 强制续期"
-    echo "  [5] 删除证书"
+    echo "  [2] 证书列表"
+    echo "  [3] 续期所有"
     echo "  [0] 返回"
     echo
-    read -rp "  请选择 [0-5]: " c
-
+    read -rp "  请选择 [0-3]: " c
     case "$c" in
-      1)
-        local domain email email_opt=""
-        read -rp "  域名: " domain
-        [ -z "$domain" ] && { info "已取消"; continue; }
-        while ! valid_domain "$domain"; do
-          err "域名格式不正确"
-          read -rp "  域名: " domain
-          [ -z "$domain" ] && { info "已取消"; break; }
+      1) create_nginx_proxy; certbot_get ;;
+      2)
+        local certs=()
+        local cert
+        for cert in /etc/letsencrypt/live/*/; do
+          [ -d "$cert" ] && certs+=("$(basename "$cert")")
         done
-        [ -z "$domain" ] && continue
-        read -rp "  邮箱（可选）: " email
-        [ -n "$email" ] && email_opt="--email $email"
-        certbot --nginx -d "$domain" $email_opt && ok "证书申请完成" || err "申请失败"
-        pause
+        if [ ${#certs[@]} -eq 0 ]; then
+          warn "没有证书"; pause; continue
+        fi
+        select_from_list "选择证书" "${certs[@]}" || continue
+        cert_actions_menu "$SELECTED_ITEM"
         ;;
-      2) certbot certificates 2>/dev/null; pause ;;
-      3) certbot renew --dry-run && ok "续期测试通过" || err "测试失败"; pause ;;
+      3) certbot renew && ok "续期完成"; pause ;;
+      0) return ;;
+    esac
+  done
+}
+
+nginx_menu(){
+  while true; do
+    ui_header "Nginx 管理"
+    echo "  [1] 创建反代配置"
+    echo "  [2] 站点列表"
+    echo "  [3] 测试配置"
+    echo "  [4] 重载 Nginx"
+    echo "  [5] 编辑站点"
+    echo "  [6] 删除站点"
+    echo "  [0] 返回"
+    echo
+    read -rp "  请选择 [0-6]: " c
+    case "$c" in
+      1) create_nginx_proxy ;;
+      2) list_sites; pause ;;
+      3) nginx_config_test; pause ;;
       4)
-        select_cert_name || { pause; continue; }
-        certbot renew --cert-name "$SELECTED_CERT" --force-renewal &&
-          ok "续期完成: $SELECTED_CERT" || err "续期失败"
+        nginx -t && systemctl reload nginx && ok "已重载" || err "配置错误"
         pause
         ;;
       5)
-        select_cert_name || { pause; continue; }
-        ask_yn "确认删除证书 $SELECTED_CERT？" "n" && {
-          certbot delete --cert-name "$SELECTED_CERT" && ok "已删除证书: $SELECTED_CERT"
-        }
+        local sites=()
+        local s
+        for s in /etc/nginx/sites-enabled/*; do
+          [ -f "$s" ] && sites+=("$(basename "$s")")
+        done
+        select_from_list "选择站点" "${sites[@]}" || continue
+        edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"
+        ;;
+      6)
+        local sites=()
+        for s in /etc/nginx/sites-enabled/*; do
+          [ -f "$s" ] && sites+=("$(basename "$s")")
+        done
+        select_from_list "选择要删除的站点" "${sites[@]}" || continue
+        local name="$SELECTED_ITEM"
+        if ask_yn "确认删除站点 $name 的配置？" ""; then
+          rm -f "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
+          ok "已删除"
+          ask_yn "重载 Nginx？" "y" && nginx -t && systemctl reload nginx && ok "已重载"
+        fi
         pause
         ;;
       0) return ;;
-      "") continue ;;
-      *) warn "无效选择" ;;
     esac
   done
 }
@@ -1106,51 +786,66 @@ certbot_menu(){
 
 health_check(){
   ui_header "系统健康检查"
-  echo
+  local issues=0
 
-  echo "  Docker:"
-  if docker info >/dev/null 2>&1; then
-    local stopped
-    stopped=$(docker ps -a --filter "status=exited" -q 2>/dev/null | wc -l)
-    [ "$stopped" -gt 0 ] && echo "    警告: $stopped 个容器已停止" || echo "    正常"
+  # Docker
+  if docker_ready; then
+    ok "Docker: 运行中"
+    local dver
+    dver=$(docker version --format '{{.Server.Version}}' 2>/dev/null)
+    info "  版本 $dver"
+    local running total
+    running=$(docker ps -q 2>/dev/null | wc -l)
+    total=$(docker ps -aq 2>/dev/null | wc -l)
+    info "  容器 $running/$total 运行中"
   else
-    echo "    未运行"
+    warn "Docker 未运行"
+    issues=$((issues+1))
   fi
 
-  echo
-  echo "  Nginx:"
-  systemctl is-active --quiet nginx && echo "    正常" || echo "    未运行"
-
-  echo
-  echo "  磁盘:"
-  local pct
-  pct=$(df / 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
-  [ "$pct" -gt 80 ] && echo "    警告: 使用率 ${pct}%" || echo "    正常: ${pct}%"
-
-  echo
-  echo "  SSL 证书:"
-  if [ -d /etc/letsencrypt/live ]; then
-    local issues=0
-    for cert in /etc/letsencrypt/live/*/; do
-      [ ! -f "${cert}fullchain.pem" ] && continue
-      local exp ts days
-      exp=$(openssl x509 -enddate -noout -in "${cert}fullchain.pem" 2>/dev/null | cut -d= -f2)
-      [ -z "$exp" ] && continue
-      ts=$(date -d "$exp" +%s 2>/dev/null) || continue
-      days=$(( (ts - $(date +%s)) / 86400 ))
-      if [ "$days" -lt 30 ]; then
-        echo "    警告: $(basename "$cert") $days 天后过期"
-        issues=$((issues+1))
-      fi
-    done
-    [ "$issues" -eq 0 ] && echo "    正常"
+  # Nginx
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    ok "Nginx: 运行中"
+    nginx -t 2>/dev/null && info "  配置正确" || { warn "配置有误"; issues=$((issues+1)); }
   else
-    echo "    无证书"
+    warn "Nginx 未运行"
+    issues=$((issues+1))
   fi
 
-  echo
-  echo "  定时清理:"
-  crontab -l 2>/dev/null | grep -q "docker-cleanup.sh" && echo "    已设置" || echo "    未设置"
+  # 磁盘
+  local disk_usage
+  disk_usage=$(df / | awk 'NR==2{print $5}' | sed 's/%//')
+  if [ "$disk_usage" -gt 90 ]; then
+    warn "磁盘使用率: ${disk_usage}%（超 90%）"
+    issues=$((issues+1))
+  elif [ "$disk_usage" -gt 80 ]; then
+    warn "磁盘使用率: ${disk_usage}%（超 80%）"
+  else
+    ok "磁盘使用率: ${disk_usage}%"
+  fi
+
+  # SSL 证书
+  local cert
+  for cert in /etc/letsencrypt/live/*/; do
+    local domain exp_days
+    domain=$(basename "$cert")
+    exp_days=$(openssl x509 -enddate -noout -in "${cert}fullchain.pem" 2>/dev/null -checkend $((30*86400)) && echo "ok" || echo "expiring")
+    if [ "$exp_days" = "expiring" ]; then
+      warn "证书 $domain 30 天内过期"
+      issues=$((issues+1))
+    else
+      ok "证书 $domain 有效"
+    fi
+  done
+
+  # 定时任务
+  if has_auto_cleanup; then
+    ok "定时维护: 已设置"
+  else
+    warn "定时维护: 未设置"
+  fi
+
+  [ "$issues" -eq 0 ] && ok "系统健康" || warn "发现 $issues 个问题"
   pause
 }
 
@@ -1158,115 +853,102 @@ health_check(){
 # 主菜单
 # ═══════════════════════════════════════════════════════════
 
+main_menu_help() {
+  cat <<'EOF'
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Docker+Nginx+HTTPS 工具箱 v29                         │
+  │                                                         │
+  │  使用前建议先执行 [1] 一键安装                           │
+  │  或 [2] 安装基础环境                                    │
+  │                                                         │
+  │  每个菜单输入编号选择，按 0 返回上一级                   │
+  └─────────────────────────────────────────────────────────┘
+EOF
+}
+
 main_menu(){
   while true; do
+    get_os_name
+    ui_header "Docker+Nginx+HTTPS 工具箱"
+    echo "  [1]  一键安装（环境+定时+项目）"
+    echo "  [2]  安装基础环境"
+    echo "  [3]  Docker 管理"
+    echo "  [4]  Nginx 管理"
+    echo "  [5]  HTTPS 证书"
+    echo "  [6]  系统健康检查"
+    echo "  [q]  退出"
     echo
-    ui_box "Docker + Nginx 工具箱 $VERSION"
-    local docker_s nginx_s
-    docker info >/dev/null 2>&1 && docker_s="${GREEN}运行中${NC}" || docker_s="${YELLOW}未运行${NC}"
-    systemctl is-active --quiet nginx 2>/dev/null && nginx_s="${GREEN}运行中${NC}" || nginx_s="${YELLOW}未运行${NC}"
-    echo -e "  Docker: ${docker_s}    Nginx: ${nginx_s}"
-    ui_line
-    echo "  [1] 一键安装（完整流程）"
-    echo "  [2] 安装基础环境（仅软件）"
-    echo "  [3] Docker 管理"
-    echo "  [4] Nginx 管理"
-    echo "  [5] HTTPS 证书"
-    echo "  [6] 系统状态"
-    echo "  [7] 健康检查"
-    echo "  [0] 退出"
-    ui_line
-    echo
-    read -rp "  请选择 [0-7]: " c
-
+    read -rp "  请选择 [1-6/q]: " c
     case "$c" in
       1) install_all ;;
       2) install_base_env ;;
       3) docker_menu ;;
       4) nginx_menu ;;
       5) certbot_menu ;;
-      6) docker_system_status; pause ;;
-      7) health_check ;;
-      0) ok "再见"; exit 0 ;;
+      6) health_check ;;
+      q|Q) echo; exit 0 ;;
       "") continue ;;
-      *) warn "无效选择" ;;
+      *) echo "  输入 1-6 或 q" ;;
     esac
   done
 }
-
-# ═══════════════════════════════════════════════════════════
-# Docker 主菜单（内嵌在 main_menu → 3）
-# ═══════════════════════════════════════════════════════════
 
 docker_menu(){
   while true; do
     ui_header "Docker 管理"
-    echo "  [1] 项目管理"
-    echo "  [2] 容器管理"
-    echo "  [3] 镜像管理"
-    echo "  [4] 维护清理"
-    echo "  [5] 系统状态"
-    echo "  [0] 返回"
+    echo "  [1]  系统状态"
+    echo "  [2]  项目管理"
+    echo "  [3]  容器管理"
+    echo "  [4]  镜像管理"
+    echo "  [5]  维护清理"
+    echo "  [0]  返回主菜单"
     echo
     read -rp "  请选择 [0-5]: " c
-
     case "$c" in
-      1)
+      0) return ;;
+      1) docker_system_status ;;
+      2)
         while true; do
           ui_header "项目管理"
-          echo "  [1] 创建项目"
-          echo "  [2] 项目列表"
-          echo "  [3] 项目状态"
-          echo "  [4] 启动/重启"
-          echo "  [5] 停止项目"
-          echo "  [6] 下线项目"
-          echo "  [7] 项目日志"
-          echo "  [8] 编辑配置"
-          echo "  [9] 拉取更新"
-          echo "  [10] 删除项目"
-          echo "  [0] 返回"
+          echo "  [1]  创建项目"
+          echo "  [2]  启动/更新项目"
+          echo "  [3]  停止项目"
+          echo "  [4]  项目日志"
+          echo "  [5]  编辑配置"
+          echo "  [6]  更新镜像并重启"
+          echo "  [7]  列出项目"
+          echo "  [8]  删除项目"
+          echo "  [0]  返回"
           echo
-          read -rp "  请选择 [0-10]: " sc
+          read -rp "  请选择 [0-8]: " sc
           case "$sc" in
-            1) create_docker_project; pause ;;
-            2) list_projects; pause ;;
-            3) select_compose_dir && (cd "$SELECTED_DIR" && docker compose ps); pause ;;
-            4) restart_project; pause ;;
-            5) stop_project; pause ;;
-            6)
-              select_compose_dir || continue
-              ask_yn "确认下线项目？" "n" && (cd "$SELECTED_DIR" && docker compose down) && ok "项目已下线"
-              pause
-              ;;
-            7) project_logs ;;
-            8) edit_project; pause ;;
-            9) update_project; pause ;;
-            10) delete_project_config; pause ;;
             0) break ;;
-            "") continue ;;
-            *) warn "无效选择" ;;
+            1) create_docker_project ;;
+            2) restart_project ;;
+            3) stop_project ;;
+            4) project_logs ;;
+            5) edit_project ;;
+            6) update_project ;;
+            7) list_projects; pause ;;
+            8) delete_project_config ;;
+            *) echo "  输入 0-8" ;;
           esac
         done
         ;;
-      2) container_menu ;;
-      3) image_menu ;;
-      4) maintenance_menu ;;
-      5) docker_system_status; pause ;;
-      0) return ;;
-      "") continue ;;
-      *) warn "无效选择" ;;
+      3) container_menu ;;
+      4) image_menu ;;
+      5) maintenance_menu ;;
+      *) echo "  输入 0-5" ;;
     esac
   done
 }
-
-# ═══════════════════════════════════════════════════════════
-# 入口
-# ═══════════════════════════════════════════════════════════
 
 main(){
   need_root
   detect_os
   load_conf
+  get_os_name
   main_menu
 }
 
