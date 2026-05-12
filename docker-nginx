@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v33
+# Docker+Nginx+HTTPS 工具箱 v34
 
 set -o pipefail
 set -o errtrace
@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v33"
+VERSION="v34"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -215,10 +215,6 @@ install_all(){
 
   if ask_yn "创建 Nginx 反代？" "y"; then
     create_nginx_proxy "${PREV_NAME:-}" "${PREV_PORT:-}"
-    if [ -n "$LAST_DOMAIN" ] && ask_yn "申请并应用 HTTPS 证书？" "y"; then
-      certbot_get "$LAST_DOMAIN"
-      [ -n "$CERTBOT_DOMAIN" ] && apply_cert_to_nginx "$LAST_SITE" "$CERTBOT_DOMAIN"
-    fi
   fi
 
   ok "一键安装完成"
