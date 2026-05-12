@@ -331,15 +331,15 @@ view_cleanup_history(){
   ui_header "清理历史"
   local logfile="/var/log/docker-cleanup.log"
   if [ ! -s "$logfile" ]; then
-    warn "暂无清理记录，手动清理或定时任务执行后才会生成记录"
+    warn "暂无清理记录"
     pause
     return
   fi
   local cnt
   cnt=$(wc -l < "$logfile")
-  echo "  共 $cnt 条记录"
+  echo "  共 $cnt 条记录，显示最近 60 条"
   echo "  ───────────────────────────────"
-  cat "$logfile" | sed 's/^/  /'
+  tail -60 "$logfile" | sed 's/^/  /'
   pause
 }
 
@@ -557,23 +557,29 @@ certbot_get(){
 }
 
 cert_actions_menu(){
-  local cert="$1"
-  while true; do
-    ui_header "证书: $cert"
-    echo "  [1] 查看详情"
-    echo "  [2] 删除证书"
-    echo "  [0] 返回"
-    read -rp "  请选择 [0-2]: " a
-    case "$a" in
-      1) certbot certificates --cert-name "$cert" | head -10
-         echo "  路径: /etc/letsencrypt/live/$cert/"
-         pause ;;
-      2) ask_yn "确认删除证书 $cert？" "y" && certbot delete --cert-name "$cert" && ok "已删除"
-         pause ; return ;;
-      0) return ;;
-      *) echo "  输入 0-2" ;;
-    esac
-  done
+  local c="$1"
+  ui_header "证书: $c"
+  echo "  路径: /etc/letsencrypt/live/$c/"
+  echo "  证书文件: /etc/letsencrypt/live/$c/fullchain.pem"
+  echo "  私钥文件: /etc/letsencrypt/live/$c/privkey.pem"
+  echo
+  local not_before not_after issuer subject
+  not_before=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -startdate 2>/dev/null | cut -d= -f2)
+  not_after=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+  issuer=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -issuer 2>/dev/null | sed 's/issuer= //')
+  subject=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -subject 2>/dev/null | sed 's/subject= //')
+  echo "  域名: $subject"
+  echo "  颁发者: $issuer"
+  echo "  生效时间: ${not_before:-未知}"
+  echo "  到期时间: ${not_after:-未知}"
+  echo
+  local remaining
+  remaining=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -checkend 0 2>/dev/null && echo "有效" || echo "已过期")
+  echo "  状态: $([ "$remaining" = "有效" ] && echo "有效")$([ "$remaining" = "已过期" ] && echo "已过期")"
+  echo
+  echo "  快捷操作："
+  ask_yn "删除此证书？" "n" && certbot delete --cert-name "$c" && ok "已删除"
+  pause
 }
 
 certbot_menu(){
@@ -607,7 +613,17 @@ certbot_menu(){
         certbot delete --cert-name "$SELECTED_ITEM" && ok "$SELECTED_ITEM 已删除"
         pause
         ;;
-      4) certbot renew && ok "续期完成" || warn "续期失败或无需续期"; pause ;;
+      4)
+        ui_header "续期所有证书"
+        info "测试续期..."
+        certbot renew --dry-run >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          ok "测试通过，开始实际续期..."
+          certbot renew -q && ok "续期完成" || warn "续期失败"
+        else
+          err "测试续期失败，请检查配置"
+        fi
+        pause ;;
       0) return ;;
       *) echo "  输入 0-4" ;;
     esac
