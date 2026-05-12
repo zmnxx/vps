@@ -227,23 +227,28 @@ EOF
 }
 
 write_portscan(){
-	local bt="$1" mr="$2"
-	# filter
+	local bt="$1" mr="$2" be="" src="logpath = /var/log/ufw.log"
 	cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
 [Definition]
 failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
 ignoreregex =
 EOF
-	# jail — 使用 iptables banaction 而非 ufw，避免 ufw 规则编号冲突导致封禁/解封不一致
+	if command -v journalctl >/dev/null 2>&1; then
+		be="backend = systemd"
+		src="journalmatch = _TRANSPORT=kernel"
+	else
+		touch /var/log/ufw.log 2>/dev/null
+	fi
 	cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
 [ufw-port-scan]
 enabled = true
 filter = ufw-port-scan
-logpath = /var/log/ufw.log
+$be
+$src
 maxretry = $mr
 bantime = $bt
 findtime = 10m
-banaction = iptables
+banaction = iptables-allports
 EOF
 }
 
