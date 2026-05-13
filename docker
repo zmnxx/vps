@@ -272,6 +272,12 @@ install_base_env(){
 
 install_all(){
   ui_header "一键安装"
+  INSTALL_DOCKER_PROJECT=""
+  INSTALL_DOCKER_DIR=""
+  INSTALL_PORT=""
+  INSTALL_SITE=""
+  INSTALL_DOMAIN=""
+  INSTALL_CERT="未申请"
   install_docker || return 1
   install_nginx || return 1
   install_certbot || return 1
@@ -285,6 +291,9 @@ install_all(){
 
   if ask_yn "创建 Docker 项目？" "y"; then
     create_docker_project
+    INSTALL_DOCKER_PROJECT="$PREV_NAME"
+    INSTALL_DOCKER_DIR="$PREV_DIR"
+    INSTALL_PORT="$PREV_PORT"
     if [ -n "$PREV_DIR" ] && ask_yn "启动/更新这个项目？" "y"; then
       docker compose -f "$PREV_DIR/docker-compose.yml" up -d && ok "项目已启动" || warn "项目启动失败"
     fi
@@ -292,8 +301,18 @@ install_all(){
 
   if ask_yn "创建 Nginx 反代？" "y"; then
     create_nginx_proxy "${PREV_NAME:-}" "${PREV_PORT:-}"
+    INSTALL_SITE="$LAST_SITE"
+    INSTALL_DOMAIN="$LAST_DOMAIN"
+    [ -n "$CERTBOT_DOMAIN" ] && INSTALL_CERT="$CERTBOT_DOMAIN"
   fi
 
+  ui_header "安装摘要"
+  echo "  Docker 项目: ${INSTALL_DOCKER_PROJECT:-未创建}"
+  echo "  项目目录:   ${INSTALL_DOCKER_DIR:-─}"
+  echo "  反代端口:   ${INSTALL_PORT:-未识别/未设置}"
+  echo "  Nginx 站点: ${INSTALL_SITE:-未创建}"
+  echo "  域名:       ${INSTALL_DOMAIN:-─}"
+  echo "  HTTPS 证书: ${INSTALL_CERT:-未申请}"
   ok "一键安装完成"
   pause
 }
@@ -558,76 +577,71 @@ delete_all_data(){
   local deleted_any=0
 
   if ask_yn "删除 Docker 项目？" "y"; then
-    while true; do
-      local dirs files=() items=() item selected dir name port
-      dirs=$(collect_compose_files)
-      for item in $dirs; do files+=("$item"); done
-      if [ ${#files[@]} -eq 0 ]; then
-        warn "没有 Docker 项目"
-        break
-      fi
+    local dirs files=() items=() item selected dir name port
+    dirs=$(collect_compose_files)
+    for item in $dirs; do files+=("$item"); done
+    if [ ${#files[@]} -eq 0 ]; then
+      warn "没有 Docker 项目"
+    else
       for item in "${files[@]}"; do
         name=$(basename "$(dirname "$item")")
         port=$(extract_first_host_port "$item" || true)
         [ -z "$port" ] && port="未识别"
         items+=("$name | $port | $(dirname "$item")")
       done
-      select_from_list "选择要删除的 Docker 项目" "${items[@]}" || break
-      selected="$SELECTED_ITEM"
-      dir="$(echo "$selected" | awk -F' \| ' '{print $3}')"
-      name=$(basename "$dir")
-      ask_yn "删除项目 $name？" "y" || break
-      ask_yn "同时删除容器和数据卷？" "y" || break
-      docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
-      rm -rf -- "$dir" && ok "$name 已删除"
-      deleted_any=1
-      ask_yn "继续删除其他 Docker 项目？" "y" || break
-    done
+      if select_from_list "选择要删除的 Docker 项目" "${items[@]}"; then
+        selected="$SELECTED_ITEM"
+        dir="$(echo "$selected" | awk -F' \\| ' '{print $3}')"
+        name=$(basename "$dir")
+        if ask_yn "删除项目 $name？" "y"; then
+          docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
+          rm -rf -- "$dir" && ok "$name 已删除"
+          deleted_any=1
+        fi
+      fi
+    fi
   fi
 
   if ask_yn "删除 Nginx 站点？" "y"; then
-    while true; do
-      local sites=() f conf info name selected
-      for f in /etc/nginx/sites-enabled/*; do
-        [ -L "$f" ] || [ -f "$f" ] || continue
-        conf=$(readlink -f "$f" 2>/dev/null || echo "$f")
-        info=$(extract_nginx_site_info "$conf")
-        sites+=("$info")
-      done
-      [ ${#sites[@]} -eq 0 ] && { warn "没有站点"; break; }
-      select_from_list "选择要删除的 Nginx 站点" "${sites[@]}" || break
-      selected="$SELECTED_ITEM"
-      name=$(echo "$selected" | cut -d'|' -f1)
-      ask_yn "删除站点 $name？" "y" || break
-      rm -f "/etc/nginx/sites-enabled/$name" "/etc/nginx/sites-available/$name"
-      ok "$name 已删除"
-      deleted_any=1
-      ask_yn "继续删除其他 Nginx 站点？" "y" || break
+    local sites=() f conf info name selected
+    for f in /etc/nginx/sites-enabled/*; do
+      [ -L "$f" ] || [ -f "$f" ] || continue
+      conf=$(readlink -f "$f" 2>/dev/null || echo "$f")
+      info=$(extract_nginx_site_info "$conf")
+      sites+=("$info")
     done
+    if [ ${#sites[@]} -eq 0 ]; then
+      warn "没有站点"
+    else
+      if select_from_list "选择要删除的 Nginx 站点" "${sites[@]}"; then
+        selected="$SELECTED_ITEM"
+        name=$(echo "$selected" | cut -d'|' -f1)
+        if ask_yn "删除站点 $name？" "y"; then
+          rm -f "/etc/nginx/sites-enabled/$name" "/etc/nginx/sites-available/$name"
+          ok "$name 已删除"
+          deleted_any=1
+        fi
+      fi
+    fi
   fi
 
   if ask_yn "删除 HTTPS 证书？" "y"; then
-    while true; do
-      local certs=() cert answer
-      for cert in /etc/letsencrypt/live/*/; do [ -d "$cert" ] && certs+=("$(basename "$cert")"); done
-      [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; break; }
-      select_from_list "选择要删除的证书" "${certs[@]}" || break
-      while true; do
-        read -rp "  输入 y 确认删除证书 $SELECTED_ITEM: " answer
-        case "$answer" in
-          y|Y|yes) break ;;
-          n|N|no|"") warn "已取消"; answer=""; break ;;
-          *) echo "    请输入 y 或 n" ;;
-        esac
-      done
-      [ -z "$answer" ] && break
-      certbot delete --cert-name "$SELECTED_ITEM" && ok "$SELECTED_ITEM 已删除"
-      deleted_any=1
-      ask_yn "继续删除其他证书？" "y" || break
-    done
+    local certs=() cert selected
+    for cert in /etc/letsencrypt/live/*/; do [ -d "$cert" ] && certs+=("$(basename "$cert")"); done
+    if [ ${#certs[@]} -eq 0 ]; then
+      warn "没有证书"
+    else
+      if select_from_list "选择要删除的证书" "${certs[@]}"; then
+        selected="$SELECTED_ITEM"
+        if ask_yn "删除证书 $selected？" "y"; then
+          certbot delete --cert-name "$selected" -n >/dev/null 2>&1 && ok "$selected 已删除" || warn "$selected 删除失败或已不存在"
+          deleted_any=1
+        fi
+      fi
+    fi
   fi
 
-  [ "$deleted_any" -eq 0 ] && warn "本次没有删除任何内容"
+  [ "$deleted_any" -eq 0 ] && warn "本次没有删除任何内容" || ok "一键删除流程完成"
   nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
   pause
 }
@@ -916,6 +930,15 @@ server {
     }
 }
 NGINX
+    fi
+    if nginx -t; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+      ok "Nginx 已重载"
+    else
+      err "Nginx 配置有误，暂不申请证书"
+      nginx -t 2>&1 | head -5 | sed 's/^/  /'
+      pause
+      return 1
     fi
     certbot_get "$domain" && apply_cert_to_nginx "$name" "$CERTBOT_DOMAIN"
   fi
