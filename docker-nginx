@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v40
+# Docker+Nginx+HTTPS 工具箱 v41
 
 set -o pipefail
 set -o errtrace
@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v40"
+VERSION="v42"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -142,16 +142,93 @@ collect_compose_files(){
   { for d in $dirs; do [ -d "$d" ] && find "$d" -name "docker-compose.yml" -type f 2>/dev/null; done; } | sort -u
 }
 extract_first_host_port(){
-  local f="$1" line port
-  line=$(grep -E '^[[:space:]]*-[[:space:]]*"?([0-9.]+:)?[0-9]+:[0-9]+' "$f" 2>/dev/null | head -1 || true)
-  [ -z "$line" ] && return 1
-  line=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*"?//; s/"?[[:space:]]*$//')
-  line=${line#127.0.0.1:}
-  line=${line#0.0.0.0:}
-  port=${line%%:*}
-  valid_port "$port" && echo "$port"
+  local f="$1" line candidate port
+
+  line=$(grep -E '^[[:space:]]*-[[:space:]]*"?([0-9.]+:)?[0-9]+:[0-9]+([/:][^" ]*)?"?[[:space:]]*$' "$f" 2>/dev/null | head -1 || true)
+  if [ -n "$line" ]; then
+    candidate=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*"?//; s/"?[[:space:]]*$//')
+    candidate=${candidate%%/*}
+    if echo "$candidate" | grep -Eq '^[0-9]+:[0-9]+$'; then
+      port=${candidate%%:*}
+      valid_port "$port" && { echo "$port"; return 0; }
+    fi
+    if echo "$candidate" | grep -Eq '^[0-9.]+:[0-9]+:[0-9]+$'; then
+      candidate=${candidate#*:}
+      port=${candidate%%:*}
+      valid_port "$port" && { echo "$port"; return 0; }
+    fi
+  fi
+
+  candidate=$(awk '
+    BEGIN{in_env=0}
+    /^[[:space:]]*environment:[[:space:]]*$/ {in_env=1; next}
+    in_env && /^[[:space:]]*[A-Za-z0-9_]+[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*$/ {
+      gsub(/^[[:space:]]+/, "", $0)
+      sub(/^[^:]+:[[:space:]]*/, "", $0)
+      print $0
+      exit
+    }
+    in_env && /^[[:space:]]*-[[:space:]]*[A-Za-z0-9_]+=.*$/ {
+      v=$0
+      sub(/.*=/, "", v)
+      if (v ~ /^[0-9]+$/) { print v; exit }
+    }
+    in_env && /^[^[:space:]-]/ {in_env=0}
+  ' "$f" 2>/dev/null | head -1 || true)
+  valid_port "$candidate" && { echo "$candidate"; return 0; }
+
+  return 1
 }
 
+extract_nginx_site_info(){
+  local conf="$1" name domain port https
+  name=$(basename "$conf")
+  domain=$(grep -E '^[[:space:]]*server_name[[:space:]]+' "$conf" 2>/dev/null | head -1 | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;.*$//' | awk '{print $1}')
+  port=$(grep -E 'proxy_pass[[:space:]]+http://(127\.0\.0\.1|localhost):[0-9]+' "$conf" 2>/dev/null | head -1 | sed -E 's/.*:("?)([0-9]+).*/\2/' || true)
+  grep -q 'listen[[:space:]]+443[[:space:]]+ssl' "$conf" 2>/dev/null && https="HTTPS" || https="HTTP"
+  echo "$name|${domain:-未识别}|${port:-未识别}|$https"
+}
+
+format_cert_date(){
+  local raw="$1"
+  [ -z "$raw" ] && return 1
+  date -u -d "$raw" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "$raw"
+}
+
+cert_days_left(){
+  local raw="$1" end_ts now_ts
+  [ -z "$raw" ] && return 1
+  end_ts=$(date -u -d "$raw" +%s 2>/dev/null) || return 1
+  now_ts=$(date -u +%s)
+  echo $(( (end_ts - now_ts) / 86400 ))
+}
+
+show_cert_summary_line(){
+  local cert="$1" name raw exp days status
+  [ -f "$cert" ] || return 0
+  name=$(basename "$(dirname "$cert")")
+  raw=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+  exp=$(format_cert_date "$raw")
+  days=$(cert_days_left "$raw" 2>/dev/null || true)
+  if [ -n "$days" ]; then
+    if [ "$days" -lt 0 ]; then
+      status="已过期"
+    else
+      status="剩余 ${days} 天"
+    fi
+    echo "    $name: $exp（$status）"
+  else
+    echo "    $name: ${exp:-未知}"
+  fi
+}
+
+remove_cleanup_cron(){
+  local tmp
+  tmp=$(mktemp)
+  crontab -l 2>/dev/null | grep -v 'docker-cleanup.sh' > "$tmp" || true
+  crontab "$tmp" 2>/dev/null || crontab -r 2>/dev/null || true
+  rm -f "$tmp"
+}
 
 # ─── 安装 ────────────────────────────────────────────────
 
@@ -195,6 +272,12 @@ install_base_env(){
 
 install_all(){
   ui_header "一键安装"
+  INSTALL_DOCKER_PROJECT=""
+  INSTALL_DOCKER_DIR=""
+  INSTALL_PORT=""
+  INSTALL_SITE=""
+  INSTALL_DOMAIN=""
+  INSTALL_CERT="未申请"
   install_docker || return 1
   install_nginx || return 1
   install_certbot || return 1
@@ -207,7 +290,10 @@ install_all(){
   fi
 
   if ask_yn "创建 Docker 项目？" "y"; then
-    create_docker_project
+    create_docker_project || { warn "已取消一键安装"; pause; return 0; }
+    INSTALL_DOCKER_PROJECT="$PREV_NAME"
+    INSTALL_DOCKER_DIR="$PREV_DIR"
+    INSTALL_PORT="$PREV_PORT"
     if [ -n "$PREV_DIR" ] && ask_yn "启动/更新这个项目？" "y"; then
       docker compose -f "$PREV_DIR/docker-compose.yml" up -d && ok "项目已启动" || warn "项目启动失败"
     fi
@@ -215,14 +301,21 @@ install_all(){
 
   if ask_yn "创建 Nginx 反代？" "y"; then
     create_nginx_proxy "${PREV_NAME:-}" "${PREV_PORT:-}"
+    INSTALL_SITE="$LAST_SITE"
+    INSTALL_DOMAIN="$LAST_DOMAIN"
+    [ -n "$CERTBOT_DOMAIN" ] && INSTALL_CERT="$CERTBOT_DOMAIN"
   fi
 
+  ui_header "安装摘要"
+  echo "  Docker 项目: ${INSTALL_DOCKER_PROJECT:-未创建}"
+  echo "  项目目录:   ${INSTALL_DOCKER_DIR:-─}"
+  echo "  反代端口:   ${INSTALL_PORT:-未识别/未设置}"
+  echo "  Nginx 站点: ${INSTALL_SITE:-未创建}"
+  echo "  域名:       ${INSTALL_DOMAIN:-─}"
+  echo "  HTTPS 证书: ${INSTALL_CERT:-未申请}"
   ok "一键安装完成"
   pause
 }
-
-
-
 
 # ─── Docker 项目管理 ────────────────────────────────────
 
@@ -247,17 +340,25 @@ create_docker_project(){
   ok "已创建: $base/$name/docker-compose.yml"
   edit_file "$base/$name/docker-compose.yml"
 
-  PREV_PORT=$(extract_first_host_port "$base/$name/docker-compose.yml" || true)
-  if [ -n "$PREV_PORT" ]; then
-    info "检测到端口: $PREV_PORT"
+  local detected_port
+  detected_port=$(extract_first_host_port "$base/$name/docker-compose.yml" || true)
+  if [ -n "$detected_port" ]; then
+    read -rp "  反代端口（默认 $detected_port）: " input
+    [ -z "$input" ] && input="$detected_port"
   else
     warn "未检测到端口"
     read -rp "  反代端口，留空跳过: " input
-    valid_port "$input" && PREV_PORT="$input"
+  fi
+  if [ -n "$input" ]; then
+    if valid_port "$input"; then
+      PREV_PORT="$input"
+      info "反代端口: $PREV_PORT"
+    else
+      warn "端口无效，已跳过"
+      PREV_PORT=""
+    fi
   fi
 }
-
-
 
 select_compose_dir(){
   local dirs
@@ -281,14 +382,18 @@ list_projects(){
   local dirs dir count=0
   dirs=$(collect_compose_files)
   [ -z "$dirs" ] && { warn "未找到 docker-compose.yml"; return 0; }
+  echo "  项目                 端口       状态"
+  echo "  ─────────────────────────────────────────"
   for dir in $dirs; do
-    local name status file
+    local name status file port
     file="$dir"
     name=$(basename "$(dirname "$file")")
     status=$(docker compose -f "$file" ps --format '{{.Name}} {{.State}}' 2>/dev/null | head -1 || true)
     [ -z "$status" ] && status="未启动"
+    port=$(extract_first_host_port "$file" || true)
+    [ -z "$port" ] && port="未识别"
     count=$((count+1))
-    printf "  [%s] %-18s %s\n" "$count" "$name" "$status"
+    printf "  %-20s %-10s %s\n" "$name" "$port" "$status"
   done
 }
 
@@ -321,7 +426,6 @@ project_logs(){
   docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200 -f
   pause
 }
-
 
 edit_project(){
   select_compose_dir || return 1
@@ -378,7 +482,6 @@ project_ps(){
   pause
 }
 
-
 project_restart_only(){
   need_docker || return 1
   select_compose_dir || return 1
@@ -423,7 +526,7 @@ delete_project_config(){
   select_compose_dir || return 1
   local dir="$SELECTED_DIR" name
   name=$(basename "$dir")
-  ask_yn "删除 $name？" "y" || return 0
+  ask_yn "删除项目 $name？" "y" || return 0
   if ask_yn "同时删除容器和数据卷？" "y"; then
     docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
   else
@@ -433,9 +536,7 @@ delete_project_config(){
   pause
 }
 
-
-
-# ─── 维护清理 ────────────────────────────────────────────
+# ─── 一键删除 ────────────────────────────────────────────
 
 write_cleanup_script(){
   cat > /usr/local/bin/docker-cleanup.sh <<'CMDEOF'
@@ -452,39 +553,6 @@ CMDEOF
   chmod +x /usr/local/bin/docker-cleanup.sh
 }
 
-run_full_cleanup(){
-  need_docker || return 1
-  ask_yn "清空日志并清理停止容器、未使用镜像、构建缓存和未使用卷？" "y" || return 0
-  local logfile="/var/log/docker-cleanup.log"
-  local now
-  now=$(date '+%Y-%m-%d %H:%M:%S')
-  echo "[$now] 手动清理开始..." >> "$logfile"
-  clear_all_container_logs
-  docker container prune -f >> "$logfile" 2>&1
-  docker image prune -a -f >> "$logfile" 2>&1
-  docker builder prune -a -f >> "$logfile" 2>&1
-  docker volume prune -f >> "$logfile" 2>&1
-  echo "[$now] 手动清理完成" >> "$logfile"
-  ok "清理完成"
-  pause
-}
-
-view_cleanup_history(){
-  ui_header "清理历史"
-  local logfile="/var/log/docker-cleanup.log"
-  if [ ! -s "$logfile" ]; then
-    warn "暂无清理记录"
-    pause
-    return
-  fi
-  local cnt
-  cnt=$(wc -l < "$logfile")
-  echo "  共 $cnt 条记录，显示最近 60 条"
-  echo "  ───────────────────────────────"
-  tail -60 "$logfile" | sed 's/^/  /'
-  pause
-}
-
 setup_auto_cleanup(){
   ui_header "定时维护"
   local cron_time
@@ -499,7 +567,7 @@ setup_auto_cleanup(){
   [ -z "$choice" ] && choice="1"
   case "$choice" in
     4) local job; job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh" || true); [ -z "$job" ] && warn "未设置" || ok "$job"; pause; return 0 ;;
-    5) crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -; ok "已删除"; pause; return 0 ;;
+    5) remove_cleanup_cron; ok "已删除"; pause; return 0 ;;
     6) write_cleanup_script; /usr/local/bin/docker-cleanup.sh; ok "已执行"; pause; return 0 ;;
     0) return 0 ;;
     1) cron_time="0 3 * * *" ;;
@@ -508,28 +576,84 @@ setup_auto_cleanup(){
     *) echo "  输入 1-6"; return 1 ;;
   esac
   write_cleanup_script
-  crontab -l 2>/dev/null | grep -v "docker-cleanup.sh" | crontab -
+  remove_cleanup_cron
   (crontab -l 2>/dev/null; echo "$cron_time /usr/local/bin/docker-cleanup.sh") | crontab -
   ok "已设置"
   pause
 }
 
-maintenance_menu(){
-  while true; do
-    ui_header "维护清理"
-    echo "  [1]  一键清理"
-    echo "  [2]  清理历史"
-    echo "  [3]  定时任务"
-    echo "  [0]  返回"
-    read -rp "  请选择 [0-3]: " c
-    case "$c" in
-      1) run_full_cleanup ;;
-      2) view_cleanup_history ;;
-      3) setup_auto_cleanup ;;
-      0) return ;;
-      *) echo "  输入 0-3" ;;
-    esac
-  done
+delete_all_data(){
+  ui_header "一键删除"
+  local deleted_any=0
+
+  if ask_yn "删除 Docker 项目？" "y"; then
+    local dirs files=() items=() item selected dir name port
+    dirs=$(collect_compose_files)
+    for item in $dirs; do files+=("$item"); done
+    if [ ${#files[@]} -eq 0 ]; then
+      warn "没有 Docker 项目"
+    else
+      for item in "${files[@]}"; do
+        name=$(basename "$(dirname "$item")")
+        port=$(extract_first_host_port "$item" || true)
+        [ -z "$port" ] && port="未识别"
+        items+=("$name | $port | $(dirname "$item")")
+      done
+      if select_from_list "选择要删除的 Docker 项目" "${items[@]}"; then
+        selected="$SELECTED_ITEM"
+        dir="$(echo "$selected" | awk -F' \\| ' '{print $3}')"
+        name=$(basename "$dir")
+        if ask_yn "删除项目 $name？" "y"; then
+          docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
+          rm -rf -- "$dir" && ok "$name 已删除"
+          deleted_any=1
+        fi
+      fi
+    fi
+  fi
+
+  if ask_yn "删除 Nginx 站点？" "y"; then
+    local sites=() f conf info name selected
+    for f in /etc/nginx/sites-enabled/*; do
+      [ -L "$f" ] || [ -f "$f" ] || continue
+      conf=$(readlink -f "$f" 2>/dev/null || echo "$f")
+      info=$(extract_nginx_site_info "$conf")
+      sites+=("$info")
+    done
+    if [ ${#sites[@]} -eq 0 ]; then
+      warn "没有站点"
+    else
+      if select_from_list "选择要删除的 Nginx 站点" "${sites[@]}"; then
+        selected="$SELECTED_ITEM"
+        name=$(echo "$selected" | cut -d'|' -f1)
+        if ask_yn "删除站点 $name？" "y"; then
+          rm -f "/etc/nginx/sites-enabled/$name" "/etc/nginx/sites-available/$name"
+          ok "$name 已删除"
+          deleted_any=1
+        fi
+      fi
+    fi
+  fi
+
+  if ask_yn "删除 HTTPS 证书？" "y"; then
+    local certs=() cert selected
+    for cert in /etc/letsencrypt/live/*/; do [ -d "$cert" ] && certs+=("$(basename "$cert")"); done
+    if [ ${#certs[@]} -eq 0 ]; then
+      warn "没有证书"
+    else
+      if select_from_list "选择要删除的证书" "${certs[@]}"; then
+        selected="$SELECTED_ITEM"
+        if ask_yn "删除证书 $selected？" "y"; then
+          certbot delete --cert-name "$selected" -n >/dev/null 2>&1 && ok "$selected 已删除" || warn "$selected 删除失败或已不存在"
+          deleted_any=1
+        fi
+      fi
+    fi
+  fi
+
+  [ "$deleted_any" -eq 0 ] && warn "本次没有删除任何内容" || ok "一键删除流程完成"
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+  pause
 }
 
 # ─── Nginx 管理 ──────────────────────────────────────────
@@ -612,9 +736,6 @@ NGINX
   fi
 }
 
-
-
-
 ensure_connection_upgrade_map(){
   local conf="/etc/nginx/nginx.conf" tmp testout line inserted=0
   [ -f "$conf" ] || { err "未找到 $conf"; return 1; }
@@ -648,9 +769,6 @@ ensure_connection_upgrade_map(){
   cat "$tmp" > "$conf"
   rm -f "$tmp"
 }
-
-
-
 
 check_connection_upgrade_map(){
   ui_header "检测 map 配置"
@@ -699,9 +817,6 @@ manage_connection_upgrade_map(){
     esac
   done
 }
-
-
-
 
 nginx_config_test(){
   ui_header "Nginx 配置测试"
@@ -826,14 +941,19 @@ server {
 }
 NGINX
     fi
+    if nginx -t; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+      ok "Nginx 已重载"
+    else
+      err "Nginx 配置有误，暂不申请证书"
+      nginx -t 2>&1 | head -5 | sed 's/^/  /'
+      pause
+      return 1
+    fi
     certbot_get "$domain" && apply_cert_to_nginx "$name" "$CERTBOT_DOMAIN"
   fi
   pause
 }
-
-
-
-
 
 list_nginx_sites(){
   ui_header "Nginx 站点"
@@ -842,15 +962,19 @@ list_nginx_sites(){
     [ "$(ls /etc/nginx/conf.d/*.conf 2>/dev/null | wc -l)" -eq 0 ] && warn "没有站点"
     pause; return
   fi
-  local count=0 f
+  local count=0 f conf info name domain port https
+  echo "  名称                 域名                      端口       协议"
+  echo "  ─────────────────────────────────────────────────────────────"
   for f in /etc/nginx/sites-enabled/*; do
     [ -L "$f" ] || [ -f "$f" ] || continue
-    local name state
-    name=$(basename "$f")
-    local conf
     conf=$(readlink -f "$f" 2>/dev/null || echo "$f")
+    info=$(extract_nginx_site_info "$conf")
+    name=$(echo "$info" | cut -d'|' -f1)
+    domain=$(echo "$info" | cut -d'|' -f2)
+    port=$(echo "$info" | cut -d'|' -f3)
+    https=$(echo "$info" | cut -d'|' -f4)
     count=$((count+1))
-    echo "  $name"
+    printf "  %-20s %-25s %-10s %s\n" "$name" "$domain" "$port" "$https"
   done
   [ "$count" -eq 0 ] && warn "没有站点"
   pause
@@ -899,9 +1023,6 @@ nginx_menu(){
     esac
   done
 }
-
-
-
 
 get_certbot_email(){
   local f email
@@ -966,9 +1087,6 @@ certbot_get(){
     || { err "证书申请失败"; CERTBOT_DOMAIN=""; pause; return 1; }
 }
 
-
-
-
 cert_actions_menu(){
   local c="$1"
   ui_header "证书: $c"
@@ -976,18 +1094,27 @@ cert_actions_menu(){
   echo "  证书文件: /etc/letsencrypt/live/$c/fullchain.pem"
   echo "  私钥文件: /etc/letsencrypt/live/$c/privkey.pem"
   echo
-  local not_before not_after issuer subject
-  not_before=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -startdate 2>/dev/null | cut -d= -f2)
-  not_after=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+  local not_before_raw not_after_raw not_before not_after issuer subject remaining days
+  not_before_raw=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -startdate 2>/dev/null | cut -d= -f2)
+  not_after_raw=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+  not_before=$(format_cert_date "$not_before_raw")
+  not_after=$(format_cert_date "$not_after_raw")
   issuer=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -issuer 2>/dev/null | sed 's/issuer= //')
   subject=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -subject 2>/dev/null | sed 's/subject= //')
   echo "  域名: ${subject##*= }"
   echo "  颁发者: ${issuer##*= }"
   echo "  生效: ${not_before:-未知}"
-  echo "  到期: ${not_after:-未知}"
-  local remaining
+  if days=$(cert_days_left "$not_after_raw" 2>/dev/null); then
+    if [ "$days" -lt 0 ]; then
+      echo "  到期: ${not_after:-未知}（已过期）"
+    else
+      echo "  到期: ${not_after:-未知}（剩余 ${days} 天）"
+    fi
+  else
+    echo "  到期: ${not_after:-未知}"
+  fi
   remaining=$(openssl x509 -in "/etc/letsencrypt/live/$c/fullchain.pem" -noout -checkend 0 2>/dev/null && echo "有效" || echo "已过期")
-  echo "  状态: $([ "$remaining" = "有效" ] && echo "有效")$([ "$remaining" = "已过期" ] && echo "已过期")"
+  echo "  状态: $remaining"
   pause
 }
 
@@ -1028,11 +1155,19 @@ certbot_menu(){
         select_from_list "选择证书" "${certs[@]}" || continue
         cert_actions_menu "$SELECTED_ITEM" ;;
       3)
-        local certs=() cert
+        local certs=() cert answer
         for cert in /etc/letsencrypt/live/*/; do [ -d "$cert" ] && certs+=("$(basename "$cert")"); done
         [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; pause; continue; }
         select_from_list "选择要删除的证书" "${certs[@]}" || continue
-        ask_yn "确认删除证书 $SELECTED_ITEM？" "y" || continue
+        while true; do
+          read -rp "  输入 y 确认删除证书 $SELECTED_ITEM: " answer
+          case "$answer" in
+            y|Y|yes) break ;;
+            n|N|no|"") warn "已取消"; answer=""; break ;;
+            *) echo "    请输入 y 或 n" ;;
+          esac
+        done
+        [ -z "$answer" ] && continue
         certbot delete --cert-name "$SELECTED_ITEM" && ok "$SELECTED_ITEM 已删除"
         pause ;;
       4)
@@ -1057,7 +1192,6 @@ certbot_menu(){
   done
 }
 
-
 # ─── 系统健康检查 ────────────────────────────────────────
 
 health_check(){
@@ -1070,12 +1204,13 @@ health_check(){
   local d=$(docker info 2>/dev/null | grep "Docker Root Dir" | awk '{print $NF}')
   [ -n "$d" ] && echo "  Docker 磁盘: $(df -h "$d" 2>/dev/null | awk 'NR==2{print $4}') 空闲"
   echo "  SSL:"
+  local found_cert=0 cert
   for cert in /etc/letsencrypt/live/*/fullchain.pem; do
     [ -f "$cert" ] || continue
-    local exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
-    local name=$(basename "$(dirname "$cert")")
-    echo "    $name: 到期 $exp"
+    found_cert=1
+    show_cert_summary_line "$cert"
   done
+  [ "$found_cert" -eq 0 ] && echo "    无证书"
   echo "  定时清理: $(has_auto_cleanup && ok "已设置" || warn "未设置")"
   pause
 }
@@ -1139,8 +1274,6 @@ docker_menu(){
   done
 }
 
-
-
 # ─── 主菜单 ──────────────────────────────────────────────
 
 main_menu(){
@@ -1152,7 +1285,7 @@ main_menu(){
     echo "  [3]  Docker 管理"
     echo "  [4]  Nginx 管理"
     echo "  [5]  HTTPS 证书"
-    echo "  [6]  维护清理"
+    echo "  [6]  一键删除"
     echo "  [7]  系统健康检查"
     echo "  [0]  退出"
     read -rp "  请选择 [0-7]: " c
@@ -1162,7 +1295,7 @@ main_menu(){
       3) docker_menu ;;
       4) nginx_menu ;;
       5) certbot_menu ;;
-      6) maintenance_menu ;;
+      6) delete_all_data ;;
       7) health_check ;;
       0) echo; exit 0 ;;
       *) echo "  输入 0-7" ;;
