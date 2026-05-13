@@ -293,9 +293,14 @@ test_web_filter(){
 }
 
 write_smart_web_login(){
-	local name="$1" path="$2" mode="$3" bt="$4" mr="$5" ft="$6" port="$7" action="$8"
-	local rx
+	local name="$1" path="$2" mode="$3" bt="$4" mr="$5" ft="$6" port="$7" action="$8" custom_path="$9" custom_codes="${10}"
+	local rx esc_path
 	case "$mode" in
+		custom)
+			esc_path=$(printf '%s' "$custom_path" | sed 's/[.[\*^$()+?{}|]/\\&/g')
+			[ -z "$custom_codes" ] && custom_codes="200|401|403|429"
+			rx="^<HOST> - .* \"POST ${esc_path} HTTP/[^\\\"]+\" (${custom_codes}) .*$"
+			;;
 		openlist|alist)
 			rx='^<HOST> - .* "POST /api/auth/login HTTP/[^\"]+" 200 .*$'
 			;;
@@ -330,6 +335,15 @@ banaction = $action
 EOF
 }
 
+smart_web_candidates(){
+	local path="$1"
+	[ -f "$path" ] || return
+	awk -F'"' '/POST/ {
+		split($2,a," "); p=a[2]; code=$3; gsub(/^[ \t]+|[ \t]+$/, "", code); split(code,c," "); sc=c[1];
+		if (p ~ /(login|signin|auth|token|session|user|admin|api|panel|xui|signin|password)/) print p, sc
+	}' "$path" 2>/dev/null | awk '{k=$1" "$2; cnt[k]++} END{for(k in cnt) print cnt[k], k}' | sort -nr | head -15
+}
+
 smart_web_detect(){
 	local path="$1" text urls
 	[ -f "$path" ] || { echo "normal|未找到日志文件"; return; }
@@ -339,15 +353,86 @@ smart_web_detect(){
 	if printf '%s\n' "$urls" | grep -Eq 'POST /api/user/login|/api/user'; then echo "qinglong|检测到 /api/user/login，适合青龙面板"; return; fi
 	if printf '%s\n' "$urls" | grep -Eq 'POST /app/api/login|POST /api/login'; then echo "sui|检测到 /app/api/login 或 /api/login，适合 S-UI/X-UI 类面板"; return; fi
 	if printf '%s\n' "$urls" | grep -Eqi 'xui|/login|/panel|/server/status'; then echo "xui|检测到面板/登录相关路径，适合 X-UI/3X-UI 类面板"; return; fi
-	if printf '%s\n' "$urls" | grep -Eqi 'POST .*login|POST .*signin|POST .*auth'; then echo "auto|检测到通用登录路径，使用宽松模板"; return; fi
+	if [ -n "$(smart_web_candidates "$path" | head -1)" ]; then echo "custom|发现未知服务登录/API候选路径，可按编号生成精确规则"; return; fi
 	echo "normal|未明显检测到登录失败路径，使用 401/403/429 保守模板"
+}
+
+select_web_log(){
+	local logs="$1" def="$2" sel i item
+	read -r -p "日志编号/路径 [1]: " sel; sel=${sel:-1}
+	if [[ "$sel" =~ ^[0-9]+$ ]]; then
+		item=$(printf '%s\n' "$logs" | awk -v n="$sel" 'NR==n{print; exit}')
+		[ -n "$item" ] && echo "$item" || echo "$def"
+	else
+		echo "$sel"
+	fi
+}
+
+select_web_candidate(){
+	local path="$1" rows sel line p sc codes
+	rows=$(smart_web_candidates "$path")
+	[ -z "$rows" ] && return 1
+	echo -e "${X}候选 POST 路径:${N}"
+	printf '%s\n' "$rows" | awk '{printf "  %d. %s  状态:%s  次数:%s\n", NR, $2, $3, $1}'
+	read -r -p "路径编号/手动路径 [1]: " sel; sel=${sel:-1}
+	if [[ "$sel" =~ ^[0-9]+$ ]]; then
+		line=$(printf '%s\n' "$rows" | awk -v n="$sel" 'NR==n{print; exit}')
+		p=$(printf '%s' "$line" | awk '{print $2}')
+		sc=$(printf '%s' "$line" | awk '{print $3}')
+	else
+		p="$sel"; sc="200"
+	fi
+	[ -z "$p" ] && return 1
+	read -r -p "匹配状态码 [${sc}|401|403|429]: " codes; codes=${codes:-${sc}|401|403|429}
+	echo "$p|$codes"
 }
 
 show_login_paths(){
 	local path="$1"
 	[ -f "$path" ] || return
 	echo -e "${X}最近可疑登录/API路径:${N}"
-	awk -F'"' '/POST/ && $2 ~ /(login|signin|auth|api|user|admin|panel|xui)/ {print "  " $1 "\"" $2 "\" " $3}' "$path" 2>/dev/null | tail -10
+	awk -F'"' '/POST/ && $2 ~ /(login|signin|auth|api|user|admin|panel|xui|token|session)/ {print "  " $1 "\"" $2 "\" " $3}' "$path" 2>/dev/null | tail -10
+}
+
+select_jail(){
+	local js jl="" i=1 s tj
+	js=$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/{gsub(/,/," ",$2);print $2}')
+	[ -z "$js" ] && return 1
+	for j in $js; do echo "  $i. $j"; jl="$jl $j"; i=$((i+1)); done
+	read -r -p "输入 Jail 编号或名称: " s
+	[[ "$s" =~ ^[0-9]+$ ]] && tj=$(echo "$jl" | awk -v n="$s" '{print $n}') || tj="$s"
+	[ -n "$tj" ] && echo "$tj"
+}
+
+verify_jail_effect(){
+	f2b_ping || { echo -e "${R}Fail2ban 未运行${N}"; return; }
+	echo -e "${C}--- 选择要验证的 Jail ---${N}"
+	local jail logpath banned chain
+	jail=$(select_jail) || { echo -e "${Y}无启用 Jail${N}"; return; }
+	[ -z "$jail" ] && return
+	echo -e "\n${C}=== Jail 状态: ${jail} ===${N}"
+	fail2ban-client status "$jail" 2>&1 | f2b_tr
+	logpath=$(awk -F= '/^[[:space:]]*logpath[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "/etc/fail2ban/jail.d/${jail}.local" 2>/dev/null)
+	if [ -n "$logpath" ]; then
+		echo -e "\n${C}=== 绑定日志 ===${N}"
+		echo "${logpath}"
+		for lf in $logpath; do [ -f "$lf" ] && { echo -e "${X}最近相关日志:${N}"; tail -n 20 "$lf" | grep -E 'POST|login|auth|api|Failed|failure|invalid|UFW|sshd' | tail -10; break; }; done
+	fi
+	echo -e "\n${C}=== Fail2ban 最近记录 ===${N}"
+	if [ -f /var/log/fail2ban.log ]; then
+		grep -E "($jail|Found|Ban|Unban|ERROR|WARNING)" /var/log/fail2ban.log | tail -30
+	else
+		journalctl -u fail2ban -n 80 --no-pager 2>/dev/null | grep -E "($jail|Found|Ban|Unban|ERROR|WARNING)" | tail -30
+	fi
+	echo -e "\n${C}=== 防火墙封禁链 ===${N}"
+	chain="f2b-${jail}"
+	if command -v iptables >/dev/null 2>&1; then
+		iptables -S 2>/dev/null | grep -E "${chain}|f2b-" | tail -30 || echo "未看到 iptables f2b 规则"
+	fi
+	if command -v nft >/dev/null 2>&1; then
+		nft list ruleset 2>/dev/null | grep -E "${jail}|f2b" | tail -30 || true
+	fi
+	echo -e "\n${Y}判断:${N} 如果 Total failed 增加，说明已识别失败；Currently banned/Banned IP 有内容且防火墙链有规则，说明封禁已生效。"
 }
 
 manage_fail2ban(){
@@ -358,9 +443,10 @@ manage_fail2ban(){
 		echo -e "  ${Y}1.${N} SSH 防护"
 		echo -e "  ${Y}2.${N} UFW 扫描防护"
 		echo -e "  ${Y}3.${N} 智能 Web 防护"
-		echo -e "  ${Y}4.${N} 运行状态"
-		echo -e "  ${Y}5.${N} Jail 详情"
-		echo -e "  ${Y}6.${N} 清除封禁"
+		echo -e "  ${Y}4.${N} 验证生效"
+		echo -e "  ${Y}5.${N} 运行状态"
+		echo -e "  ${Y}6.${N} Jail 详情"
+		echo -e "  ${Y}7.${N} 清除封禁"
 		echo -e "  ${X}0. 返回主菜单${N}"
 		read -r -p "请选择: " c
 		case $c in
@@ -390,31 +476,42 @@ manage_fail2ban(){
 			3)
 				echo -e "\n${C}--- 智能 Web 防护 ---${N}"
 				echo -e "${X}自动发现日志:${N}"
-				local logs i=1 def_log det mode desc; logs=$(autodetect_web_logs)
-				if [ -n "$logs" ]; then echo "$logs" | while read -r l; do echo "  $i. $l"; i=$((i+1)); done; def_log=$(echo "$logs" | head -1); else echo "  未发现常见 Web 访问日志"; fi
-				read -r -p "日志路径 [${def_log:-/var/log/nginx/access.log}]: " lp; lp=${lp:-${def_log:-/var/log/nginx/access.log}}
+				local logs i=1 def_log det mode desc sel_path sel_codes picked; logs=$(autodetect_web_logs)
+				if [ -n "$logs" ]; then echo "$logs" | while read -r l; do echo "  $i. $l"; i=$((i+1)); done; def_log=$(echo "$logs" | head -1); else echo "  未发现常见 Web 访问日志"; logs="/var/log/nginx/access.log"; def_log="/var/log/nginx/access.log"; fi
+				lp=$(select_web_log "$logs" "$def_log")
 				show_login_paths "$lp"
 				det=$(smart_web_detect "$lp"); mode=${det%%|*}; desc=${det#*|}
 				echo -e "${G}识别结果:${N} $desc"
-				echo -e "模板: 1.自动推荐(${mode})  2.OpenList/Alist  3.S-UI/X-UI  4.青龙  5.通用401/403  6.宽松200/401"
+				echo -e "模板: 1.自动推荐(${mode})  2.按候选路径  3.OpenList/Alist  4.S-UI/X-UI  5.青龙  6.通用401/403  7.宽松200/401"
 				read -r -p "选择模板 [1]: " tpl
-				case "$tpl" in 2) mode="openlist";; 3) mode="xui";; 4) mode="qinglong";; 5) mode="normal";; 6) mode="auto";; *) :;; esac
+				case "$tpl" in
+					2) mode="custom";; 3) mode="openlist";; 4) mode="xui";; 5) mode="qinglong";; 6) mode="normal";; 7) mode="auto";; *) :;;
+				esac
+				if [ "$mode" = "custom" ]; then
+					picked=$(select_web_candidate "$lp") || { echo -e "${R}未选择有效路径${N}"; pause; continue; }
+					sel_path=${picked%%|*}; sel_codes=${picked#*|}
+				fi
 				read -r -p "Jail 名称 [web-${mode}]: " name; name=${name:-web-${mode}}
 				read -r -p "保护端口 [http,https]: " pt; pt=${pt:-http,https}
 				read -r -p "封禁时长 [1h]: " bt; bt=${bt:-1h}
 				read -r -p "统计窗口 [10m]: " ft; ft=${ft:-10m}
 				read -r -p "最大失败 [5]: " mr; mr=${mr:-5}
 				read -r -p "封禁动作 [iptables-multiport]: " act; act=${act:-iptables-multiport}
-				[ "$mode" = "auto" ] || [ "$mode" = "openlist" ] || [ "$mode" = "xui" ] || [ "$mode" = "sui" ] || [ "$mode" = "qinglong" ] && echo -e "${Y}提示:${N} 部分面板登录失败返回 200，可能也会统计正常登录接口；建议先用较高 maxretry，预检命中后再应用。"
+				[ "$mode" = "auto" ] || [ "$mode" = "openlist" ] || [ "$mode" = "xui" ] || [ "$mode" = "sui" ] || [ "$mode" = "custom" ] || [ "$mode" = "qinglong" ] && echo -e "${Y}提示:${N} 部分服务登录失败返回 200；已先预检命中情况，建议确认路径准确再应用。"
 				echo -e "日志:${C}${lp}${N} 模板:${C}${mode}${N} Jail:${C}${name}${N} 封禁:${C}${bt}${N} 窗口:${C}${ft}${N} 重试:${C}${mr}${N}"
-				confirm "生成并预检?" && { write_smart_web_login "$name" "$lp" "$mode" "$bt" "$mr" "$ft" "$pt" "$act"; test_web_filter "$name" "$lp"; confirm "应用?" && restart_f2b; }
+				[ "$mode" = "custom" ] && echo -e "路径:${C}${sel_path}${N} 状态码:${C}${sel_codes}${N}"
+				confirm "生成并预检?" && { write_smart_web_login "$name" "$lp" "$mode" "$bt" "$mr" "$ft" "$pt" "$act" "$sel_path" "$sel_codes"; test_web_filter "$name" "$lp"; confirm "应用?" && restart_f2b; }
 				pause;;
 			4)
+				echo -e "\n${C}--- 验证生效 ---${N}"
+				verify_jail_effect
+				pause;;
+			5)
 				echo -e "\n${C}--- 运行状态 ---${N}"
 				f2b_ping || { echo -e "${Y}尝试修复...${N}\n"; restart_f2b; }
 				fail2ban-client status 2>&1 | f2b_tr
 				pause;;
-			5)
+			6)
 				f2b_ping || { echo -e "${R}未运行${N}"; pause; continue; }
 				echo -e "\n${C}--- Jail 详情 ---${N}"
 				local js jl="" i=1; js=$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/{gsub(/,/," ",$2);print $2}')
@@ -424,7 +521,7 @@ manage_fail2ban(){
 				local tj=""; [[ "$s" =~ ^[0-9]+$ ]] && tj=$(echo "$jl" | awk -v n="$s" '{print $n}') || tj="$s"
 				[ -n "$tj" ] && fail2ban-client status "$tj" 2>&1 | f2b_tr
 				pause;;
-			6)
+			7)
 				f2b_ping || { echo -e "${R}未运行${N}"; pause; continue; }
 				confirm "解封所有 IP?" && { fail2ban-client unban --all; echo -e "${G}已解封${N}"; }
 				pause;;
