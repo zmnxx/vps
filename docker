@@ -148,7 +148,6 @@ extract_first_host_port(){
   if [ -n "$line" ]; then
     candidate=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*"?//; s/"?[[:space:]]*$//')
     candidate=${candidate%%/*}
-    candidate=${candidate%%:*:*:*}
     if echo "$candidate" | grep -Eq '^[0-9]+:[0-9]+$'; then
       port=${candidate%%:*}
       valid_port "$port" && { echo "$port"; return 0; }
@@ -160,7 +159,6 @@ extract_first_host_port(){
     fi
   fi
 
-  line=$(grep -E '^[[:space:]]*(container_name|hostname|network_mode|restart|image|command):' "$f" -n 2>/dev/null | head -1 || true)
   candidate=$(awk '
     BEGIN{in_env=0}
     /^[[:space:]]*environment:[[:space:]]*$/ {in_env=1; next}
@@ -175,15 +173,8 @@ extract_first_host_port(){
       sub(/.*=/, "", v)
       if (v ~ /^[0-9]+$/) { print v; exit }
     }
-    in_env && /^[[:space:]]*[A-Za-z0-9_]+[[:space:]]*:[[:space:]]*127\.0\.0\.1[[:space:]]*$/ { next }
     in_env && /^[^[:space:]-]/ {in_env=0}
   ' "$f" 2>/dev/null | head -1 || true)
-  valid_port "$candidate" && { echo "$candidate"; return 0; }
-
-  candidate=$(grep -Eo '127\.0\.0\.1:[0-9]{1,5}:[0-9]{1,5}' "$f" 2>/dev/null | head -1 | cut -d: -f2 || true)
-  valid_port "$candidate" && { echo "$candidate"; return 0; }
-
-  candidate=$(grep -Eo '(^|[^0-9])([1-9][0-9]{1,4})[:]([1-9][0-9]{1,4})([^0-9]|$)' "$f" 2>/dev/null | head -1 | sed -E 's/.*[^0-9]([0-9]+):([0-9]+).*/\1/' || true)
   valid_port "$candidate" && { echo "$candidate"; return 0; }
 
   return 1
@@ -362,14 +353,18 @@ list_projects(){
   local dirs dir count=0
   dirs=$(collect_compose_files)
   [ -z "$dirs" ] && { warn "未找到 docker-compose.yml"; return 0; }
+  echo "  项目                 端口       状态"
+  echo "  ─────────────────────────────────────────"
   for dir in $dirs; do
-    local name status file
+    local name status file port
     file="$dir"
     name=$(basename "$(dirname "$file")")
     status=$(docker compose -f "$file" ps --format '{{.Name}} {{.State}}' 2>/dev/null | head -1 || true)
     [ -z "$status" ] && status="未启动"
+    port=$(extract_first_host_port "$file" || true)
+    [ -z "$port" ] && port="未识别"
     count=$((count+1))
-    printf "  [%s] %-18s %s\n" "$count" "$name" "$status"
+    printf "  %-20s %-10s %s\n" "$name" "$port" "$status"
   done
 }
 
@@ -560,49 +555,80 @@ setup_auto_cleanup(){
 
 delete_all_data(){
   ui_header "一键删除"
-  warn "将删除 Docker 项目目录、容器、镜像、卷、Nginx 站点配置、Let's Encrypt 证书，不做备份"
-  local dirs certs sites dir cert site count_dirs=0 count_certs=0 count_sites=0
-  dirs=$(collect_compose_files)
-  for dir in $dirs; do count_dirs=$((count_dirs+1)); done
-  for cert in /etc/letsencrypt/live/*; do [ -d "$cert" ] && count_certs=$((count_certs+1)); done
-  for site in /etc/nginx/sites-enabled/*; do [ -e "$site" ] && count_sites=$((count_sites+1)); done
-  echo "  将处理项目: $count_dirs 个"
-  echo "  将处理证书: $count_certs 个"
-  echo "  将处理站点: $count_sites 个"
-  ask_yn "确认一键删除？" "y" || return 0
-  ask_yn "确认不备份并立即删除？" "y" || return 0
+  local deleted_any=0
 
-  for dir in $dirs; do
-    local projdir
-    projdir=$(dirname "$dir")
-    docker compose -f "$dir" down -v 2>/dev/null || true
-    rm -rf -- "$projdir"
-  done
+  if ask_yn "删除 Docker 项目？" "y"; then
+    while true; do
+      local dirs files=() items=() item selected dir name port
+      dirs=$(collect_compose_files)
+      for item in $dirs; do files+=("$item"); done
+      if [ ${#files[@]} -eq 0 ]; then
+        warn "没有 Docker 项目"
+        break
+      fi
+      for item in "${files[@]}"; do
+        name=$(basename "$(dirname "$item")")
+        port=$(extract_first_host_port "$item" || true)
+        [ -z "$port" ] && port="未识别"
+        items+=("$name | $port | $(dirname "$item")")
+      done
+      select_from_list "选择要删除的 Docker 项目" "${items[@]}" || break
+      selected="$SELECTED_ITEM"
+      dir="$(echo "$selected" | awk -F' \| ' '{print $3}')"
+      name=$(basename "$dir")
+      ask_yn "删除项目 $name？" "y" || break
+      ask_yn "同时删除容器和数据卷？" "y" || break
+      docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
+      rm -rf -- "$dir" && ok "$name 已删除"
+      deleted_any=1
+      ask_yn "继续删除其他 Docker 项目？" "y" || break
+    done
+  fi
 
-  docker ps -aq >/dev/null 2>&1 && docker rm -f $(docker ps -aq 2>/dev/null) 2>/dev/null || true
-  docker images -q >/dev/null 2>&1 && docker rmi -f $(docker images -q 2>/dev/null | sort -u) 2>/dev/null || true
-  docker volume ls -q >/dev/null 2>&1 && docker volume rm $(docker volume ls -q 2>/dev/null) 2>/dev/null || true
-  docker network prune -f >/dev/null 2>&1 || true
-  docker builder prune -a -f >/dev/null 2>&1 || true
+  if ask_yn "删除 Nginx 站点？" "y"; then
+    while true; do
+      local sites=() f conf info name selected
+      for f in /etc/nginx/sites-enabled/*; do
+        [ -L "$f" ] || [ -f "$f" ] || continue
+        conf=$(readlink -f "$f" 2>/dev/null || echo "$f")
+        info=$(extract_nginx_site_info "$conf")
+        sites+=("$info")
+      done
+      [ ${#sites[@]} -eq 0 ] && { warn "没有站点"; break; }
+      select_from_list "选择要删除的 Nginx 站点" "${sites[@]}" || break
+      selected="$SELECTED_ITEM"
+      name=$(echo "$selected" | cut -d'|' -f1)
+      ask_yn "删除站点 $name？" "y" || break
+      rm -f "/etc/nginx/sites-enabled/$name" "/etc/nginx/sites-available/$name"
+      ok "$name 已删除"
+      deleted_any=1
+      ask_yn "继续删除其他 Nginx 站点？" "y" || break
+    done
+  fi
 
-  for site in /etc/nginx/sites-enabled/*; do
-    [ -e "$site" ] || continue
-    local name
-    name=$(basename "$site")
-    rm -f "/etc/nginx/sites-enabled/$name" "/etc/nginx/sites-available/$name"
-  done
+  if ask_yn "删除 HTTPS 证书？" "y"; then
+    while true; do
+      local certs=() cert answer
+      for cert in /etc/letsencrypt/live/*/; do [ -d "$cert" ] && certs+=("$(basename "$cert")"); done
+      [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; break; }
+      select_from_list "选择要删除的证书" "${certs[@]}" || break
+      while true; do
+        read -rp "  输入 y 确认删除证书 $SELECTED_ITEM: " answer
+        case "$answer" in
+          y|Y|yes) break ;;
+          n|N|no|"") warn "已取消"; answer=""; break ;;
+          *) echo "    请输入 y 或 n" ;;
+        esac
+      done
+      [ -z "$answer" ] && break
+      certbot delete --cert-name "$SELECTED_ITEM" && ok "$SELECTED_ITEM 已删除"
+      deleted_any=1
+      ask_yn "继续删除其他证书？" "y" || break
+    done
+  fi
 
-  for cert in /etc/letsencrypt/live/*; do
-    [ -d "$cert" ] || continue
-    certbot delete --cert-name "$(basename "$cert")" >/dev/null 2>&1 || true
-  done
-  rm -rf /etc/letsencrypt/live/* /etc/letsencrypt/archive/* /etc/letsencrypt/renewal/*.conf 2>/dev/null || true
-
-  remove_cleanup_cron
-  rm -f /usr/local/bin/docker-cleanup.sh
-
+  [ "$deleted_any" -eq 0 ] && warn "本次没有删除任何内容"
   nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
-  ok "一键删除完成"
   pause
 }
 
