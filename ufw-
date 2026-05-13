@@ -398,8 +398,10 @@ select_jail(){
 	local js jl="" i=1 s tj
 	js=$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/{gsub(/,/," ",$2);print $2}')
 	[ -z "$js" ] && return 1
+	echo -e "${X}当前可验证的 Jail:${N}"
 	for j in $js; do echo "  $i. $j"; jl="$jl $j"; i=$((i+1)); done
-	read -r -p "输入 Jail 编号或名称: " s
+	read -r -p "输入 Jail 编号或名称 [1]: " s
+	s=${s:-1}
 	[[ "$s" =~ ^[0-9]+$ ]] && tj=$(echo "$jl" | awk -v n="$s" '{print $n}') || tj="$s"
 	[ -n "$tj" ] && echo "$tj"
 }
@@ -407,32 +409,50 @@ select_jail(){
 verify_jail_effect(){
 	f2b_ping || { echo -e "${R}Fail2ban 未运行${N}"; return; }
 	echo -e "${C}--- 选择要验证的 Jail ---${N}"
-	local jail logpath banned chain
+	local jail logpath status_txt total_failed curr_failed curr_banned banned_ips chain recent_hits
 	jail=$(select_jail) || { echo -e "${Y}无启用 Jail${N}"; return; }
 	[ -z "$jail" ] && return
-	echo -e "\n${C}=== Jail 状态: ${jail} ===${N}"
-	fail2ban-client status "$jail" 2>&1 | f2b_tr
+	status_txt=$(fail2ban-client status "$jail" 2>&1)
+	total_failed=$(printf '%s\n' "$status_txt" | awk -F'\t' '/Total failed:/{print $2; exit}')
+	curr_failed=$(printf '%s\n' "$status_txt" | awk -F'\t' '/Currently failed:/{print $2; exit}')
+	curr_banned=$(printf '%s\n' "$status_txt" | awk -F'\t' '/Currently banned:/{print $2; exit}')
+	banned_ips=$(printf '%s\n' "$status_txt" | awk -F'\t' '/Banned IP list:/{print $2; exit}')
+	echo -e "\n${C}=== 验证结果：${jail} ===${N}"
+	echo -e "识别失败次数: ${Y}${total_failed:-0}${N}   当前等待封禁: ${Y}${curr_failed:-0}${N}"
+	echo -e "当前封禁数量: ${Y}${curr_banned:-0}${N}   已封禁IP: ${Y}${banned_ips:-无}${N}"
 	logpath=$(awk -F= '/^[[:space:]]*logpath[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "/etc/fail2ban/jail.d/${jail}.local" 2>/dev/null)
+	if [ -z "$logpath" ]; then
+		logpath=$(printf '%s\n' "$status_txt" | awk -F'\t' '/File list:/{print $2; exit}')
+	fi
+	echo -e "\n${C}=== 绑定日志 ===${N}"
+	echo "${logpath:-systemd/journal}"
 	if [ -n "$logpath" ]; then
-		echo -e "\n${C}=== 绑定日志 ===${N}"
-		echo "${logpath}"
-		for lf in $logpath; do [ -f "$lf" ] && { echo -e "${X}最近相关日志:${N}"; tail -n 20 "$lf" | grep -E 'POST|login|auth|api|Failed|failure|invalid|UFW|sshd' | tail -10; break; }; done
+		for lf in $logpath; do [ -f "$lf" ] && {
+			echo -e "${C}=== 最近相关访问 ===${N}"
+			recent_hits=$(tail -n 50 "$lf" | grep -E 'POST|login|auth|api|Failed|failure|invalid|UFW|sshd' | tail -10)
+			[ -n "$recent_hits" ] && printf '%s\n' "$recent_hits" || echo "最近没看到明显相关请求"
+			break
+		}; done
 	fi
-	echo -e "\n${C}=== Fail2ban 最近记录 ===${N}"
+	echo -e "\n${C}=== Fail2ban 最近动作 ===${N}"
 	if [ -f /var/log/fail2ban.log ]; then
-		grep -E "($jail|Found|Ban|Unban|ERROR|WARNING)" /var/log/fail2ban.log | tail -30
+		grep -E "($jail|Found|Ban|Unban|ERROR|WARNING)" /var/log/fail2ban.log | tail -20
 	else
-		journalctl -u fail2ban -n 80 --no-pager 2>/dev/null | grep -E "($jail|Found|Ban|Unban|ERROR|WARNING)" | tail -30
+		journalctl -u fail2ban -n 80 --no-pager 2>/dev/null | grep -E "($jail|Found|Ban|Unban|ERROR|WARNING)" | tail -20
 	fi
-	echo -e "\n${C}=== 防火墙封禁链 ===${N}"
+	echo -e "\n${C}=== 防火墙封禁规则 ===${N}"
 	chain="f2b-${jail}"
 	if command -v iptables >/dev/null 2>&1; then
-		iptables -S 2>/dev/null | grep -E "${chain}|f2b-" | tail -30 || echo "未看到 iptables f2b 规则"
+		iptables -S 2>/dev/null | grep -E "${chain}|f2b-" | tail -20 || echo "未看到 iptables f2b 规则"
 	fi
 	if command -v nft >/dev/null 2>&1; then
-		nft list ruleset 2>/dev/null | grep -E "${jail}|f2b" | tail -30 || true
+		nft list ruleset 2>/dev/null | grep -E "${jail}|f2b" | tail -20 || true
 	fi
-	echo -e "\n${Y}判断:${N} 如果 Total failed 增加，说明已识别失败；Currently banned/Banned IP 有内容且防火墙链有规则，说明封禁已生效。"
+	echo -e "\n${Y}怎么看:${N}"
+	echo "1) 识别失败次数 > 0 ：说明你刚才输错密码已被识别"
+	echo "2) 当前封禁数量 > 0 或 已封禁IP不为空：说明已经触发封禁"
+	echo "3) 防火墙封禁规则里有 f2b-${jail} 和目标IP：说明封禁已真正下发到防火墙"
+	echo "4) 如果完全没变化，通常是日志路径不对、登录接口路径没匹配到，或次数还没达到 maxretry"
 }
 
 manage_fail2ban(){
