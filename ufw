@@ -1,7 +1,8 @@
 #!/bin/bash
 # ========================
-# VPS 一键管理脚本
+# VPS 一键管理脚本 v2
 # Debian/Ubuntu | UFW+F2B+BBR+SWAP
+# 修复: SSH jail journalmatch 范围过窄、UFW portscan 后端检测不可靠
 # ========================
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[0;34m'; P='\033[0;35m'
@@ -56,7 +57,18 @@ get_ssh_port(){
 	[ -z "$p" ] && p=$(awk 'tolower($1)=="port"&&$2~/^[0-9]+$/{p=$2}END{print p}' /etc/ssh/sshd_config 2>/dev/null)
 	echo "${p:-22}"
 }
-get_sshd_logpath(){ [ -f /var/log/auth.log ] && echo "/var/log/auth.log" || echo "systemd"; }
+get_sshd_logpath(){
+	# 检测实际的 SSH 日志来源
+	if journalctl -u ssh.service -n1 --no-pager 2>/dev/null | grep -q .; then
+		echo "systemd:ssh"
+	elif journalctl -u sshd.service -n1 --no-pager 2>/dev/null | grep -q .; then
+		echo "systemd:sshd"
+	elif [ -f /var/log/auth.log ]; then
+		echo "/var/log/auth.log"
+	else
+		echo "systemd:auto"
+	fi
+}
 bbr_ok(){
 	local v; read -r v _ < /proc/version
 	local m="${v%%.*}"; local n="${v#*.}"; n="${n%%.*}"
@@ -200,56 +212,68 @@ manage_ufw(){
 
 write_sshd_jail(){
 	local bt="$1" mr="$2" pt="$3" lp="$4"
-	if [ "$lp" = "systemd" ]; then
-		cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+	local backend="" journalmatch=""
+	# 根据 get_sshd_logpath 返回格式选择后端
+	case "$lp" in
+		systemd:*)
+			backend="backend = systemd"
+			local unit="${lp#systemd:}"
+			[ "$unit" = "auto" ] && journalmatch="" || journalmatch="journalmatch = _SYSTEMD_UNIT=${unit}.service"
+			;;
+		*)
+			backend="logpath = $lp"
+			;;
+	esac
+	cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
 port = $pt
 filter = sshd
-backend = systemd
-journalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service
+$backend
+${journalmatch:+$journalmatch}
 maxretry = $mr
 bantime = $bt
 findtime = 10m
 EOF
-	else
-		cat > /etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $pt
-filter = sshd
-logpath = $lp
-maxretry = $mr
-bantime = $bt
-findtime = 10m
-EOF
-	fi
 }
 
 write_portscan(){
-	local bt="$1" mr="$2" be="" src="logpath = /var/log/ufw.log"
+	local bt="$1" mr="$2" be="" src=""
+
+	# 写入 filter
 	cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
 [Definition]
 failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
 ignoreregex =
 EOF
-	if command -v journalctl >/dev/null 2>&1; then
-		be="backend = systemd"
-		src="journalmatch = _TRANSPORT=kernel"
-	else
-		touch /var/log/ufw.log 2>/dev/null
-	fi
-	cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
+
+	# 检测实际日志来源
+	if journalctl _TRANSPORT=kernel -n5 --no-pager 2>/dev/null | grep -qi 'UFW'; then
+		# Debian 13+ 使用 systemd journal
+		cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
 [ufw-port-scan]
 enabled = true
 filter = ufw-port-scan
-$be
-$src
+backend = systemd
+journalmatch = _TRANSPORT=kernel
 maxretry = $mr
 bantime = $bt
 findtime = 10m
 banaction = iptables-allports
 EOF
+	else
+		touch /var/log/ufw.log 2>/dev/null
+		cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
+[ufw-port-scan]
+enabled = true
+filter = ufw-port-scan
+logpath = /var/log/ufw.log
+maxretry = $mr
+bantime = $bt
+findtime = 10m
+banaction = iptables-allports
+EOF
+	fi
 }
 
 manage_fail2ban(){
@@ -271,9 +295,10 @@ manage_fail2ban(){
 				read -r -p "SSH 端口 [${dp}]: " pt; pt=${pt:-$dp}
 				read -r -p "封禁时长 [1h]: " bt; bt=${bt:-1h}
 				read -r -p "最大尝试 [5]: " mr; mr=${mr:-5}
-				read -r -p "日志路径 [${dl}]: " lp; lp=${lp:-$dl}
-				[ "$lp" != "systemd" ] && [ ! -f "$lp" ] && touch "$lp" 2>/dev/null
-				echo -e "端口:${C}${pt}${N} 封禁:${C}${bt}${N} 重试:${C}${mr}${N} 日志:${C}${lp}${N}"
+				local lp_display=""; case "$dl" in systemd:*) lp_display="systemd";; *) lp_display="$dl";; esac
+				read -r -p "日志路径 [${lp_display}]: " lp; lp=${lp:-$dl}
+				[[ "$lp" != systemd:* ]] && [ ! -f "$lp" ] && touch "$lp" 2>/dev/null
+				echo -e "端口:${C}${pt}${N} 封禁:${C}${bt}${N} 重试:${C}${mr}${N} 日志:${C}${lp_display}${N}"
 				confirm "应用?" && { write_sshd_jail "$bt" "$mr" "$pt" "$lp"; restart_f2b; }
 				pause;;
 			2)
