@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker+Nginx+HTTPS 工具箱 v43
+# Docker+Nginx+HTTPS 工具箱 v44
 
 set -o pipefail
 
@@ -8,7 +8,7 @@ YELLOW='\033[1;33m'; BLUE='\033[1;34m'
 CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="v43"
+VERSION="v44"
 CONF_DIR="/root/.docker-nginx-tool"
 CONF_FILE="$CONF_DIR/config"
 DEFAULT_BASE="/docker"
@@ -16,6 +16,8 @@ LAST_BASE="$DEFAULT_BASE"
 
 detect_os(){
   . /etc/os-release
+  OS_ID="$ID"
+  OS_VER="$VERSION_ID"
   case "$ID" in
     debian|ubuntu) return 0 ;;
     *) err "仅支持 Debian/Ubuntu（当前: $ID）"; exit 1 ;;
@@ -23,12 +25,12 @@ detect_os(){
 }
 
 OS_NAME=""
+OS_ID=""
+OS_VER=""
 get_os_name(){
-  local id ver
-  . /etc/os-release
-  id="$ID"
-  ver=$(echo "$VERSION_ID" | cut -d. -f1)
-  [ "$id" = "debian" ] && OS_NAME="Debian $ver" || OS_NAME="$id $ver"
+  local ver
+  ver=$(echo "$OS_VER" | cut -d. -f1)
+  [ "$OS_ID" = "debian" ] && OS_NAME="Debian $ver" || OS_NAME="$OS_ID $ver"
 }
 
 ok()    { echo -e "  ${GREEN}[OK]${NC} $1"; }
@@ -101,6 +103,7 @@ valid_domain(){
 }
 
 SELECTED_ITEM=""
+NGINX_TESTED_OK=""
 select_from_list(){
   local title="$1"; shift
   local items=("$@") n idx
@@ -349,17 +352,14 @@ create_docker_project(){
 }
 
 select_compose_dir(){
-  local dirs
+  local dirs items=() item
   dirs=$(collect_compose_files)
   if [ -z "$dirs" ]; then
     warn "未找到 docker-compose.yml"
     ask_yn "创建新项目？" "y" && { create_docker_project; dirs=$(collect_compose_files); }
     [ -z "$dirs" ] && return 1
   fi
-  local files=() item
-  for item in $dirs; do files+=("$item"); done
-  local items=()
-  for item in "${files[@]}"; do items+=("$(dirname "$item")"); done
+  for item in $dirs; do items+=("$(dirname "$item")"); done
   select_from_list "选择项目目录" "${items[@]}" || return 1
   SELECTED_DIR="$SELECTED_ITEM"
   return 0
@@ -675,7 +675,7 @@ delete_all_data(){
       if select_from_list "选择要删除的证书" "${certs[@]}"; then
         selected="$SELECTED_ITEM"
         if ask_yn "删除证书 $selected？" "y"; then
-          certbot delete --cert-name "$selected" -n >/dev/null 2>&1 && ok "$selected 已删除" || warn "$selected 删除失败或已不存在"
+          certbot delete --cert-name "$selected" -n && ok "$selected 已删除" || err "$selected 删除失败"
           deleted_any=1
         fi
       fi
@@ -709,7 +709,6 @@ apply_cert_to_nginx(){
   valid_port "$port" || { err "端口无效"; return 1; }
 
   ensure_connection_upgrade_map
-  cp "$conffile" "$conffile.bak.$(date +%Y%m%d%H%M%S)"
   cat > "$conffile" <<NGINX
 server {
     listen 80;
@@ -761,10 +760,12 @@ NGINX
   if nginx -t 2>/dev/null; then
     systemctl reload nginx && ok "证书已应用到 $conf，并已重载 Nginx" || err "重载失败"
   else
-    err "SSL 配置有误，已保留备份：$conffile.bak.*"
+    err "SSL 配置有误，已自动删除"
+    rm -f "$conffile" "/etc/nginx/sites-enabled/$conf" 2>/dev/null
     nginx -t 2>&1 | head -5 | sed 's/^/  /'
     return 1
   fi
+  pause
 }
 
 ensure_connection_upgrade_map(){
@@ -1012,10 +1013,12 @@ find_site_by_domain(){
 # ─── HTTPS 证书 ──────────────────────────────────────────
 
 certbot_get(){
-  need_nginx || return 1
   ui_header "申请 SSL 证书"
-  local domain="${1:-}" domains=() email old_email webroot="/var/www/html" input
-  mkdir -p "$webroot"
+  local domain="${1:-}" domains=() email old_email input method
+  echo "  选择验证方式："
+  echo "  [1] HTTP 验证（需开放 80 端口，默认）"
+  echo "  [2] DNS 验证（Cloudflare，可开小黄云）"
+  read -rp "  请选择 [1/2]: " method
   if [ -n "$domain" ]; then
     read -rp "  域名（默认 $domain）: " input
     [ -n "$input" ] && domain="$input"
@@ -1035,21 +1038,44 @@ certbot_get(){
     read -rp "  邮箱（默认 admin@$cert_name）: " email
     [ -z "$email" ] && email="admin@$cert_name"
   fi
-  if [ "$NGINX_TESTED_OK" != "1" ]; then
-    if nginx -t; then
-      ok "Nginx 配置正确"
-      NGINX_TESTED_OK="1"
-    else
-      err "Nginx 配置有误"
-      pause
-      return 1
-    fi
-  fi
   local args=()
   for d in "${domains[@]}"; do args+=( -d "$d" ); done
-  certbot certonly --webroot -w "$webroot" "${args[@]}" -n --agree-tos --email "$email" \
-    && { ok "证书已申请: $cert_name"; CERTBOT_DOMAIN="$cert_name"; } \
-    || { err "证书申请失败"; CERTBOT_DOMAIN=""; pause; return 1; }
+  if [ "$method" = "2" ]; then
+    if ! cmd_exists python3-certbot-dns-cloudflare; then
+      info "安装 Cloudflare DNS 插件..."
+      apt-get install -y -qq python3-certbot-dns-cloudflare || { err "安装失败"; pause; return 1; }
+    fi
+    local cf_ini="/root/.secrets/cloudflare.ini"
+    if [ ! -f "$cf_ini" ]; then
+      mkdir -p /root/.secrets
+      echo "  请输入 Cloudflare API Token"
+      echo "  创建方法: Cloudflare 控制台 → 我的资料 → API 令牌 → 创建令牌"
+      echo "  权限: DNS:编辑 （DNS:Edit）"
+      read -rp "  API Token: " cf_token
+      echo "dns_cloudflare_api_token = $cf_token" > "$cf_ini"
+      chmod 600 "$cf_ini"
+    fi
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$cf_ini" "${args[@]}" -n --agree-tos --email "$email" \
+      && { ok "证书已申请: $cert_name（DNS 验证）"; CERTBOT_DOMAIN="$cert_name"; } \
+      || { err "证书申请失败，检查 DNS 或 API Token"; CERTBOT_DOMAIN=""; pause; return 1; }
+  else
+    need_nginx || return 1
+    local webroot="/var/www/html"
+    mkdir -p "$webroot"
+    if [ "$NGINX_TESTED_OK" != "1" ]; then
+      if nginx -t; then
+        ok "Nginx 配置正确"
+        NGINX_TESTED_OK="1"
+      else
+        err "Nginx 配置有误"
+        pause
+        return 1
+      fi
+    fi
+    certbot certonly --webroot -w "$webroot" "${args[@]}" -n --agree-tos --email "$email" \
+      && { ok "证书已申请: $cert_name"; CERTBOT_DOMAIN="$cert_name"; } \
+      || { err "证书申请失败"; CERTBOT_DOMAIN=""; pause; return 1; }
+  fi
 }
 
 cert_actions_menu(){
@@ -1125,15 +1151,10 @@ certbot_menu(){
         select_from_list "选择证书" $(list_certs) || continue
         cert_actions_menu "$SELECTED_ITEM" ;;
       3)
-        local answer
         list_certs >/dev/null || { pause; continue; }
         select_from_list "选择要删除的证书" $(list_certs) || continue
-        while true; do
-          read -rp "  输入 y 确认删除证书 $SELECTED_ITEM: " answer
-          case "$answer" in y|Y|yes) break ;; n|N|no|"") warn "已取消"; answer=""; break ;; *) echo "    请输入 y 或 n" ;; esac
-        done
-        [ -z "$answer" ] && continue
-        certbot delete --cert-name "$SELECTED_ITEM" && ok "$SELECTED_ITEM 已删除"
+        ask_yn "删除证书 $SELECTED_ITEM？" "y" || continue
+        certbot delete --cert-name "$SELECTED_ITEM" -n && ok "$SELECTED_ITEM 已删除" || err "$SELECTED_ITEM 删除失败"
         pause ;;
       4)
         list_certs >/dev/null || { pause; continue; }
