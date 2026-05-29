@@ -16,7 +16,7 @@ log-level: warning
 ipv6: false
 unified-delay: true
 tcp-concurrent: true
-keep-alive-interval: 15
+keep-alive-interval: 30
 keep-alive-idle: 600
 find-process-mode: strict
 global-client-fingerprint: chrome
@@ -123,7 +123,7 @@ dns:
 
 # ==================== 实验性功能 ====================
 experimental:
-  quic-go-disable-gso: true
+  quic-go-disable-gso: false
 
 # ==================== 流量嗅探 ====================
 sniffer:
