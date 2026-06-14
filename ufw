@@ -24,7 +24,13 @@ swap_st(){ local t s; t=$(free | awk '/Swap/{print $2}'); if [ "${t:-0}" -gt 0 ]
 
 get_ssh_port(){ local p; p=$(sshd -T 2>/dev/null | awk '/^port/{print $2;exit}'); [ -z "$p" ] && p=$(awk 'tolower($1)=="port"&&$2~/^[0-9]+$/{p=$2}END{print p}' /etc/ssh/sshd_config 2>/dev/null); echo "${p:-22}"; }
 get_sshd_logpath(){ if journalctl -u ssh.service -n1 --no-pager 2>/dev/null | grep -q .; then echo "systemd:ssh"; elif journalctl -u sshd.service -n1 --no-pager 2>/dev/null | grep -q .; then echo "systemd:sshd"; elif [ -f /var/log/auth.log ]; then echo "/var/log/auth.log"; elif [ -f /var/log/secure ]; then echo "/var/log/secure"; else echo "systemd:auto"; fi; }
-bbr_ok(){ sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; }
+bbr_ok(){
+	if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+		return 0
+	fi
+	modprobe tcp_bbr >/dev/null 2>&1 || true
+	sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
+}
 
 detect_ufw_logsrc(){
 	if [ -s /var/log/ufw.log ] && grep -q 'UFW' /var/log/ufw.log 2>/dev/null; then echo "file:/var/log/ufw.log"; return; fi
@@ -216,7 +222,14 @@ manage_swap(){
 }
 
 uninstall(){
-	clear; echo -e "${R}=== 卸载与清理 ===${N}\n"; has_cmd ufw && echo "  ${Y}1.${N} 卸载 UFW"; has_cmd fail2ban-client && echo "  ${Y}2.${N} 卸载 Fail2ban"; echo "  ${Y}3.${N} 清理 BBR 参数"; echo "  ${Y}4.${N} 清理 SWAP"; echo "  ${R}5.${N} 一键全部卸载"; echo -e "  ${X}0. 返回主菜单${N}"; read -r -p "请选择: " c
+	clear; echo -e "${R}=== 卸载与清理 ===${N}\n"
+	has_cmd ufw && echo -e "  ${Y}1.${N} 卸载 UFW"
+	has_cmd fail2ban-client && echo -e "  ${Y}2.${N} 卸载 Fail2ban"
+	echo -e "  ${Y}3.${N} 清理 BBR 参数"
+	echo -e "  ${Y}4.${N} 清理 SWAP"
+	echo -e "  ${R}5.${N} 一键全部卸载"
+	echo -e "  ${X}0. 返回主菜单${N}"
+	read -r -p "请选择: " c
 	case $c in
 		1) has_cmd ufw || { echo -e "${R}未安装${N}"; pause; return; }; confirm "卸载 UFW? (将关闭防火墙并删除规则)" || return; echo "y" | ufw disable >/dev/null 2>&1; ufw reset >/dev/null 2>&1; apt-get purge -y ufw >/dev/null 2>&1; echo -e "${G}UFW 已卸载${N}"; pause ;;
 		2) has_cmd fail2ban-client || { echo -e "${R}未安装${N}"; pause; return; }; confirm "卸载 Fail2ban? (将删除所有配置)" || return; systemctl stop fail2ban >/dev/null 2>&1; systemctl disable fail2ban >/dev/null 2>&1; apt-get purge -y fail2ban >/dev/null 2>&1; rm -rf /etc/fail2ban /var/log/fail2ban.log; echo -e "${G}Fail2ban 已卸载${N}"; pause ;;
