@@ -42,7 +42,55 @@ detect_ufw_logsrc(){
 }
 logrotate_state(){ local name="$1"; grep -Riq "$name" /etc/logrotate.d /etc/logrotate.conf 2>/dev/null && echo "已配置" || echo "未发现"; }
 get_f2b_banaction(){ if fail2ban-client -V 2>/dev/null | grep -qi nftables; then echo "nftables-multiport"; elif [ -d /etc/fail2ban/action.d ] && ls /etc/fail2ban/action.d/nftables*.conf >/dev/null 2>&1; then echo "nftables-multiport"; elif has_cmd nft && nft list ruleset >/dev/null 2>&1; then echo "nftables-multiport"; else echo "iptables-allports"; fi; }
-get_ufw_jail_logref(){ if [ -f /etc/fail2ban/jail.d/ufw-block-abuse.local ]; then awk -F'= ' '/^(logpath|backend|journalmatch) = /{print $1":"$2}' /etc/fail2ban/jail.d/ufw-block-abuse.local; fi; }
+get_ufw_jail_files(){
+	find /etc/fail2ban/jail.d -maxdepth 1 -type f \( -name '*ufw*.local' -o -name '*ufw*.conf' \) 2>/dev/null | sort
+}
+get_jail_name(){ awk 'match($0,/^\[[^]]+\]$/){gsub(/\[|\]/,"",$0);print;exit}' "$1" 2>/dev/null; }
+get_jail_value(){ awk -F= -v key="$2" 'tolower($1) ~ "^[[:space:]]*" key "[[:space:]]*$" {v=$2; sub(/^[[:space:]]*/,"",v); sub(/[[:space:]]*$/, "", v); print v; exit}' "$1" 2>/dev/null; }
+get_ufw_jail_logref(){
+	local f name logpath backend journalmatch found=false
+	for f in $(get_ufw_jail_files); do
+		name=$(get_jail_name "$f")
+		logpath=$(get_jail_value "$f" logpath)
+		backend=$(get_jail_value "$f" backend)
+		journalmatch=$(get_jail_value "$f" journalmatch)
+		[ -z "$name$logpath$backend$journalmatch" ] && continue
+		found=true
+		echo "jail:${name:-$(basename "$f")}" 
+		[ -n "$logpath" ] && echo "logpath:$logpath"
+		[ -n "$backend" ] && echo "backend:$backend"
+		[ -n "$journalmatch" ] && echo "journalmatch:$journalmatch"
+	done
+	$found || return 1
+}
+ufw_jail_matches_src(){
+	local file="$1" usrc="$2" logpath backend journalmatch
+	logpath=$(get_jail_value "$file" logpath)
+	backend=$(get_jail_value "$file" backend)
+	journalmatch=$(get_jail_value "$file" journalmatch)
+	case "$usrc" in
+		file:*) [ "$logpath" = "${usrc#file:}" ] ;;
+		systemd:*) [ "$backend" = "systemd" ] && { [ -z "$journalmatch" ] || echo "$journalmatch" | grep -Eq '(^|[[:space:]])_TRANSPORT=kernel([[:space:]]|$)|(^|[[:space:]])_KERNEL_DEVICE='; } ;;
+		*) return 1 ;;
+	esac
+}
+show_ufw_jail_health(){
+	local usrc="$1" f name total=0 matched=0
+	for f in $(get_ufw_jail_files); do
+		name=$(get_jail_name "$f")
+		name=${name:-$(basename "$f")}
+		total=$((total+1))
+		if ufw_jail_matches_src "$f" "$usrc"; then
+			matched=$((matched+1))
+			echo -e "联动校验[$name]: ${G}一致${N}"
+		else
+			echo -e "联动校验[$name]: ${R}不一致${N}（UFW 与 Fail2ban 读取源不同，可能导致不封禁）"
+		fi
+	done
+	[ "$total" -eq 0 ] && echo -e "联动校验: ${Y}未发现 UFW 联动 jail${N}"
+	[ "$total" -gt 1 ] && echo -e "${Y}提示: 发现 ${total} 个 UFW 联动 jail，建议只保留一个，避免重复封禁和排查混乱${N}"
+	[ "$matched" -gt 0 ]
+}
 show_log_health(){
 	echo -e "\n${C}--- 日志联动检查 ---${N}"
 	local usrc fp
@@ -58,11 +106,8 @@ show_log_health(){
 	local ref; ref=$(get_ufw_jail_logref)
 	if [ -n "$ref" ]; then
 		echo -e "UFW 联动 jail 读取源:\n$ref"
-		case "$usrc" in
-			file:*) echo "$ref" | grep -q "logpath:${usrc#file:}" && echo -e "联动校验: ${G}一致${N}" || echo -e "联动校验: ${R}不一致${N}（UFW 与 Fail2ban 读取源不同，可能导致不封禁）" ;;
-			systemd:*) echo "$ref" | grep -q 'backend:systemd' && echo -e "联动校验: ${G}一致${N}" || echo -e "联动校验: ${R}不一致${N}（UFW 与 Fail2ban 读取源不同，可能导致不封禁）" ;;
-		esac
 	fi
+	show_ufw_jail_health "$usrc"
 	case "$usrc" in file:/var/log/ufw.log) if ! grep -Riq '/var/log/ufw\.log\|ufw' /etc/logrotate.d /etc/logrotate.conf 2>/dev/null; then echo -e "${Y}提示: 未发现 /var/log/ufw.log 的 logrotate 规则，长期运行建议补充轮转${N}"; fi ;; esac
 }
 
