@@ -46,7 +46,23 @@ get_ufw_jail_files(){
 	find /etc/fail2ban/jail.d -maxdepth 1 -type f \( -name '*ufw*.local' -o -name '*ufw*.conf' \) 2>/dev/null | sort
 }
 get_jail_name(){ awk 'match($0,/^\[[^]]+\]$/){gsub(/\[|\]/,"",$0);print;exit}' "$1" 2>/dev/null; }
-get_jail_value(){ awk -F= -v key="$2" 'tolower($1) ~ "^[[:space:]]*" key "[[:space:]]*$" {v=$2; sub(/^[[:space:]]*/,"",v); sub(/[[:space:]]*$/, "", v); print v; exit}' "$1" 2>/dev/null; }
+get_jail_value(){
+	awk -v key="$2" '
+		{
+			line=$0
+			low=line
+			keyeq=tolower(key) "="
+			gsub(/[[:space:]]+/, "", low)
+			if (index(tolower(low), keyeq) == 1) {
+				sub(/^[^=]*=/, "", line)
+				sub(/^[[:space:]]*/, "", line)
+				sub(/[[:space:]]*$/, "", line)
+				print line
+				exit
+			}
+		}
+	' "$1" 2>/dev/null
+}
 get_ufw_jail_logref(){
 	local f name logpath backend journalmatch found=false
 	for f in $(get_ufw_jail_files); do
@@ -70,8 +86,12 @@ ufw_jail_matches_src(){
 	journalmatch=$(get_jail_value "$file" journalmatch)
 	case "$usrc" in
 		file:*) [ "$logpath" = "${usrc#file:}" ] ;;
-		systemd:*) [ "$backend" = "systemd" ] && { [ -z "$journalmatch" ] || echo "$journalmatch" | grep -Eq '(^|[[:space:]])_TRANSPORT=kernel([[:space:]]|$)|(^|[[:space:]])_KERNEL_DEVICE='; } ;;
-		*) return 1 ;;
+		systemd:*)
+			[ "$backend" = "systemd" ] && {
+				[ -z "$journalmatch" ] \
+				|| echo "$journalmatch" | grep -Eq '(^|[[:space:]])_TRANSPORT=kernel([[:space:]]|$)|(^|[[:space:]])_KERNEL_DEVICE=|(^|[[:space:]])SYSLOG_IDENTIFIER=kernel([[:space:]]|$)'
+			}
+			;;		*) return 1 ;;
 	esac
 }
 show_ufw_jail_health(){
