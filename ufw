@@ -1,8 +1,8 @@
 #!/bin/bash
 # ========================
-# VPS 一键管理脚本 v3
+# VPS 一键管理脚本 v2
 # Debian/Ubuntu | UFW+F2B+BBR+SWAP
-# 优化: 强制 systemd journal、智能检测、配置验证
+# 修复: SSH jail journalmatch 范围过窄、UFW portscan 后端检测不可靠
 # ========================
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[0;34m'; P='\033[0;35m'
@@ -57,146 +57,34 @@ get_ssh_port(){
 	[ -z "$p" ] && p=$(awk 'tolower($1)=="port"&&$2~/^[0-9]+$/{p=$2}END{print p}' /etc/ssh/sshd_config 2>/dev/null)
 	echo "${p:-22}"
 }
-
+get_sshd_logpath(){
+	# 检测实际的 SSH 日志来源
+	if journalctl -u ssh.service -n1 --no-pager 2>/dev/null | grep -q .; then
+		echo "systemd:ssh"
+	elif journalctl -u sshd.service -n1 --no-pager 2>/dev/null | grep -q .; then
+		echo "systemd:sshd"
+	elif [ -f /var/log/auth.log ]; then
+		echo "/var/log/auth.log"
+	else
+		echo "systemd:auto"
+	fi
+}
 bbr_ok(){
 	local v; read -r v _ < /proc/version
 	local m="${v%%.*}"; local n="${v#*.}"; n="${n%%.*}"
 	[ "$m" -gt 4 ] || { [ "$m" -eq 4 ] && [ "$n" -ge 9 ]; } 2>/dev/null
 }
 
-# ================= systemd journal 检测 =================
-
-check_journal_available(){
-	systemctl is-active systemd-journald >/dev/null 2>&1
-}
-
-detect_ufw_journal(){
-	if ! check_journal_available; then
-		echo -e "${R}错误: systemd-journald 未运行${N}" >&2
-		return 1
-	fi
-	
-	if journalctl _TRANSPORT=kernel -n 50 --no-pager 2>/dev/null | grep -qi '\[UFW'; then
-		echo "systemd:kernel"
-		return 0
-	fi
-	
-	echo -e "${Y}提示: journal 中暂无 UFW 日志（可能还没有阻断事件）${N}" >&2
-	echo "systemd:kernel"
-	return 0
-}
-
-detect_ssh_journal(){
-	if ! check_journal_available; then
-		echo -e "${R}错误: systemd-journald 未运行${N}" >&2
-		return 1
-	fi
-	
-	if journalctl -u sshd.service -n 1 --no-pager 2>/dev/null | grep -q .; then
-		echo "systemd:sshd"
-		return 0
-	fi
-	
-	if journalctl -u ssh.service -n 1 --no-pager 2>/dev/null | grep -q .; then
-		echo "systemd:ssh"
-		return 0
-	fi
-	
-	if journalctl _COMM=sshd -n 1 --no-pager 2>/dev/null | grep -q .; then
-		echo "systemd:sshd"
-		return 0
-	fi
-	
-	echo -e "${Y}提示: 未检测到 SSH 日志，使用默认配置${N}" >&2
-	echo "systemd:sshd"
-	return 0
-}
-
-trigger_ufw_test(){
-	echo -e "${C}正在触发 UFW 测试日志...${N}"
-	
-	timeout 1 curl -s localhost:19999 >/dev/null 2>&1 || true
-	timeout 1 nc -z localhost 19998 >/dev/null 2>&1 || true
-	
-	sleep 1
-	
-	if journalctl _TRANSPORT=kernel -n 10 --no-pager 2>/dev/null | grep -qi '\[UFW'; then
-		echo -e "${G}✓ UFW 日志已生成${N}"
-		return 0
-	else
-		echo -e "${Y}⚠ 未检测到 UFW 日志，可能需要等待真实阻断事件${N}"
-		return 1
-	fi
-}
-
-check_journal_persistence(){
-	if [ -d /var/log/journal ]; then
-		local size; size=$(du -sh /var/log/journal 2>/dev/null | awk '{print $1}')
-		echo -e "${G}已持久化${N} (占用: ${size})"
-	else
-		echo -e "${Y}未持久化${N} (仅内存，重启后丢失)"
-	fi
-}
-
 # ================= Fail2ban 工具 =================
 
 f2b_ping(){ fail2ban-client ping >/dev/null 2>&1; }
 
-verify_f2b_filter(){
-	local jail="$1"
-	local filter_path="/etc/fail2ban/filter.d/${jail}.conf"
-	
-	[ ! -f "$filter_path" ] && { echo -e "${R}Filter 不存在: $filter_path${N}"; return 1; }
-	
-	echo -e "${C}正在验证 filter: $jail${N}"
-	
-	local log_source=""
-	case "$jail" in
-		sshd)
-			log_source="journalctl -u sshd.service -u ssh.service -n 100 --no-pager 2>/dev/null"
-			;;
-		ufw-port-scan)
-			log_source="journalctl _TRANSPORT=kernel -n 100 --no-pager 2>/dev/null"
-			;;
-		*)
-			echo -e "${Y}未知 jail: $jail${N}"
-			return 1
-			;;
-	esac
-	
-	local tmp_log="/tmp/f2b_verify_${jail}.log"
-	eval "$log_source" > "$tmp_log" 2>/dev/null
-	
-	if [ ! -s "$tmp_log" ]; then
-		echo -e "${Y}⚠ 暂无日志数据，无法验证${N}"
-		rm -f "$tmp_log"
-		return 1
-	fi
-
-	local result
-	result=$(fail2ban-regex "$tmp_log" "$filter_path" 2>&1)
-	
-	local matched
-	matched=$(echo "$result" | grep -oP 'Lines: \K[0-9]+' | head -1)
-	
-	if [ -n "$matched" ] && [ "$matched" -gt 0 ]; then
-		echo -e "${G}✓ Filter 验证成功，匹配 $matched 条${N}"
-		echo -e "\n${C}最近匹配示例:${N}"
-		echo "$result" | grep -A 3 "Failregex" | head -8
-		rm -f "$tmp_log"
-		return 0
-	else
-		echo -e "${R}✗ Filter 未匹配到任何日志${N}"
-		echo -e "${Y}可能原因: 1.还没有相关事件 2.filter 正则有误${N}"
-		rm -f "$tmp_log"
-		return 1
-	fi
-}
-
 restart_f2b(){
 	echo -e "${C}正在检查配置并启动 Fail2ban...${N}"
 	mkdir -p /run/fail2ban /var/run/fail2ban /var/lib/fail2ban /etc/fail2ban/jail.d
+	touch /var/log/ufw.log 2>/dev/null
 
+	# 检测 --test 兼容性
 	local to=""; fail2ban-client --help 2>/dev/null | grep -q test && to="--test" || to="-t"
 	if ! fail2ban-client $to >/tmp/f2b-test.log 2>&1; then
 		echo -e "${R}配置检测失败：${N}"; cat /tmp/f2b-test.log; return 1
@@ -221,61 +109,6 @@ f2b_tr(){
 		-e 's/Banned IP list:/封禁 IP:/g'
 }
 
-# ================= Fail2ban 配置写入 =================
-
-write_sshd_jail(){
-	local bt="$1" mr="$2" pt="$3" lp="$4"
-	local backend="" journalmatch=""
-	
-	case "$lp" in
-		systemd:*)
-			backend="backend = systemd"
-			local unit="${lp#systemd:}"
-			journalmatch="journalmatch = _SYSTEMD_UNIT=${unit}.service"
-			;;
-		*)
-			echo -e "${R}错误: 仅支持 systemd journal${N}"
-			return 1
-			;;
-	esac
-	
-	cat > /etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $pt
-filter = sshd
-$backend
-$journalmatch
-maxretry = $mr
-bantime = $bt
-findtime = 10m
-EOF
-	echo -e "${G}已写入 SSH jail 配置${N}"
-}
-
-write_portscan(){
-	local bt="$1" mr="$2"
-	
-	cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
-[Definition]
-failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
-ignoreregex =
-EOF
-
-	cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
-[ufw-port-scan]
-enabled = true
-filter = ufw-port-scan
-backend = systemd
-journalmatch = _TRANSPORT=kernel
-maxretry = $mr
-bantime = $bt
-findtime = 10m
-banaction = iptables-allports
-EOF
-	echo -e "${G}已写入端口扫描防护配置${N}"
-}
-
 # ================= 基础安装 =================
 
 install_basics(){
@@ -295,29 +128,20 @@ install_basics(){
 		echo -e "当前 SSH 监听端口: ${Y}${dp}${N}"
 		read -r -p "放行 SSH 端口 [默认: ${dp}]: " sp; sp=${sp:-$dp}
 		if [[ "$sp" =~ ^[0-9]+$ ]]; then
-			ufw allow "$sp/tcp" >/dev/null 2>&1
-			ufw allow 80/tcp >/dev/null 2>&1
-			ufw allow 443/tcp >/dev/null 2>&1
+			ufw allow "$sp/tcp" >/dev/null 2>&1; ufw allow 80/tcp >/dev/null 2>&1; ufw allow 443/tcp >/dev/null 2>&1
 			echo -e "${G}已放行 SSH/$sp、80、443${N}"
 		else echo -e "${R}端口无效，跳过${N}"; fi
 
-		confirm "启动 UFW 防火墙?" && {
-			echo "y" | ufw enable >/dev/null 2>&1
-			ufw logging low >/dev/null 2>&1
-			echo -e "${G}已启动 (日志级别: low)${N}"
-		}
+		confirm "启动 UFW 防火墙?" && { echo "y" | ufw enable >/dev/null 2>&1; ufw logging on >/dev/null 2>&1; echo -e "${G}已启动${N}"; }
 	fi
 
 	if [ "$f2" != true ]; then
 		echo -e "\n${Y}» 正在安装 Fail2ban...${N}"
-		$CMD fail2ban >/dev/null 2>&1
-		echo -e "${G}Fail2ban 安装成功！${N}"
-		mkdir -p /etc/fail2ban/jail.d
-		svc_enable fail2ban
+		$CMD fail2ban >/dev/null 2>&1; echo -e "${G}Fail2ban 安装成功！${N}"
+		mkdir -p /etc/fail2ban/jail.d; svc_enable fail2ban
 	fi
 
 	echo -e "\n${G}基础安装完成！${N} SSH端口: ${Y}$(get_ssh_port)${N}"
-	echo -e "${C}提示: 所有日志使用 systemd journal，无需担心磁盘撑爆${N}"
 	pause
 }
 
@@ -366,7 +190,7 @@ manage_ufw(){
 			4)
 				echo -e "\n${C}--- 开关 ---${N}"; echo -e "  ${Y}1.${N} 开启  ${Y}2.${N} 关闭  ${Y}3.${N} 重载"
 				read -r -p "选择: " op
-				case $op in 1) confirm "开启?" && { echo "y" | ufw enable >/dev/null 2>&1; ufw logging low >/dev/null 2>&1; echo -e "${G}已开启${N}"; } ;;
+				case $op in 1) confirm "开启?" && { echo "y" | ufw enable >/dev/null 2>&1; ufw logging on >/dev/null 2>&1; echo -e "${G}已开启${N}"; } ;;
 					2) confirm "关闭?" && { echo "y" | ufw disable >/dev/null 2>&1; echo -e "${Y}已关闭${N}"; } ;;
 					3) ufw reload && echo -e "${G}已重载${N}";; esac
 				pause;;
@@ -375,22 +199,9 @@ manage_ufw(){
 				echo -e "当前: ${C}${ip6}${N}"; confirm "切换?" && { sed -i "s/^IPV6=.*/IPV6=$([ "$ip6" = "yes" ] && echo no || echo yes)/" /etc/default/ufw; ufw reload 2>/dev/null; echo -e "${G}已切换${N}"; }
 				pause;;
 			6)
-				echo -e "\n${C}--- 日志级别 ---${N}"
-				echo -e "  ${Y}1.${N} off  ${Y}2.${N} low (推荐)  ${Y}3.${N} medium  ${Y}4.${N} high"
-				echo -e "${Y}提示: 如果启用了 fail2ban 端口扫描防护，日志级别至少为 low${N}"
+				echo -e "\n${C}--- 日志级别 ---${N}"; echo -e "  ${Y}1.${N} off  ${Y}2.${N} low  ${Y}3.${N} medium  ${Y}4.${N} high"
 				read -r -p "选择 [2]: " lv
-				case "$lv" in
-					1)
-						if [ -f /etc/fail2ban/jail.d/ufw-port-scan.local ]; then
-							echo -e "${R}警告: 检测到端口扫描防护已启用，关闭日志会导致 fail2ban 失效${N}"
-							confirm "仍然关闭?" || { echo -e "${Y}已取消${N}"; pause; continue; }
-						fi
-						ufw logging off;;
-					2|"") ufw logging low;;
-					3) ufw logging medium;;
-					4) ufw logging high;;
-					*) echo -e "${R}无效${N}"; pause; continue;;
-				esac
+				case "$lv" in 1) ufw logging off;; 2|"") ufw logging low;; 3) ufw logging medium;; 4) ufw logging high;; *) echo -e "${R}无效${N}"; esac
 				echo -e "${G}已设置${N}"; pause;;
 			0) break;; *) echo -e "${R}无效选项${N}"; sleep 1;;
 		esac
@@ -398,6 +209,72 @@ manage_ufw(){
 }
 
 # ================= Fail2ban 管理 =================
+
+write_sshd_jail(){
+	local bt="$1" mr="$2" pt="$3" lp="$4"
+	local backend="" journalmatch=""
+	# 根据 get_sshd_logpath 返回格式选择后端
+	case "$lp" in
+		systemd:*)
+			backend="backend = systemd"
+			local unit="${lp#systemd:}"
+			[ "$unit" = "auto" ] && journalmatch="" || journalmatch="journalmatch = _SYSTEMD_UNIT=${unit}.service"
+			;;
+		*)
+			backend="logpath = $lp"
+			;;
+	esac
+	cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = $pt
+filter = sshd
+$backend
+${journalmatch:+$journalmatch}
+maxretry = $mr
+bantime = $bt
+findtime = 10m
+EOF
+}
+
+write_portscan(){
+	local bt="$1" mr="$2" be="" src=""
+
+	# 写入 filter
+	cat > /etc/fail2ban/filter.d/ufw-port-scan.conf <<'EOF'
+[Definition]
+failregex = .*\[UFW BLOCK\].*SRC=<HOST>.*
+ignoreregex =
+EOF
+
+	# 检测实际日志来源
+	if journalctl _TRANSPORT=kernel -n5 --no-pager 2>/dev/null | grep -qi 'UFW'; then
+		# Debian 13+ 使用 systemd journal
+		cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
+[ufw-port-scan]
+enabled = true
+filter = ufw-port-scan
+backend = systemd
+journalmatch = _TRANSPORT=kernel
+maxretry = $mr
+bantime = $bt
+findtime = 10m
+banaction = iptables-allports
+EOF
+	else
+		touch /var/log/ufw.log 2>/dev/null
+		cat > /etc/fail2ban/jail.d/ufw-port-scan.local <<EOF
+[ufw-port-scan]
+enabled = true
+filter = ufw-port-scan
+logpath = /var/log/ufw.log
+maxretry = $mr
+bantime = $bt
+findtime = 10m
+banaction = iptables-allports
+EOF
+	fi
+}
 
 manage_fail2ban(){
 	has_cmd fail2ban-client || { echo -e "${R}未安装 Fail2ban${N}"; pause; return; }
@@ -409,60 +286,31 @@ manage_fail2ban(){
 		echo -e "  ${Y}3.${N} 运行状态概览"
 		echo -e "  ${Y}4.${N} 监狱详情查看"
 		echo -e "  ${Y}5.${N} 一键清除所有封禁 IP"
-		echo -e "  ${Y}6.${N} 诊断 UFW+F2B 集成状态"
 		echo -e "  ${X}0. 返回主菜单${N}"
 		read -r -p "请选择: " c
 		case $c in
 			1)
 				echo -e "\n${C}--- SSH 防护配置 ---${N}"
-				local dp dl; dp=$(get_ssh_port); dl=$(detect_ssh_journal)
-				echo -e "检测到 SSH 端口: ${Y}${dp}${N}"
-				echo -e "检测到日志位置: ${C}systemd journal${N}"
+				local dp dl; dp=$(get_ssh_port); dl=$(get_sshd_logpath)
 				read -r -p "SSH 端口 [${dp}]: " pt; pt=${pt:-$dp}
 				read -r -p "封禁时长 [1h]: " bt; bt=${bt:-1h}
 				read -r -p "最大尝试 [5]: " mr; mr=${mr:-5}
-				echo -e "\n配置: 端口=${C}${pt}${N} 封禁=${C}${bt}${N} 重试=${C}${mr}${N}"
-				confirm "应用?" && {
-					write_sshd_jail "$bt" "$mr" "$pt" "$dl"
-					restart_f2b
-					sleep 2
-					verify_f2b_filter "sshd"
-				}
+				local lp_display=""; case "$dl" in systemd:*) lp_display="systemd";; *) lp_display="$dl";; esac
+				read -r -p "日志路径 [${lp_display}]: " lp; lp=${lp:-$dl}
+				[[ "$lp" != systemd:* ]] && [ ! -f "$lp" ] && touch "$lp" 2>/dev/null
+				echo -e "端口:${C}${pt}${N} 封禁:${C}${bt}${N} 重试:${C}${mr}${N} 日志:${C}${lp_display}${N}"
+				confirm "应用?" && { write_sshd_jail "$bt" "$mr" "$pt" "$lp"; restart_f2b; }
 				pause;;
 			2)
 				has_cmd ufw || { echo -e "${R}未安装 UFW${N}"; pause; continue; }
 				echo -e "\n${C}--- 端口扫描防护 ---${N}"
-				
-				local ufw_enabled; ufw_enabled=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2)
-				if [ "${ufw_enabled^^}" != "YES" ]; then
-					echo -e "${R}警告: UFW 未启用，端口扫描防护无法工作${N}"
-					confirm "是否先启用 UFW?" && {
-						echo "y" | ufw enable >/dev/null 2>&1
-						ufw logging low >/dev/null 2>&1
-						echo -e "${G}UFW 已启用${N}"
-					} || { echo -e "${Y}已取消${N}"; pause; continue; }
-				fi
-				
-				local log_level; log_level=$(ufw status verbose 2>/dev/null | awk '/Logging:/{print tolower($2)}')
-				if [ "$log_level" = "off" ]; then
-					echo -e "${R}警告: UFW 日志已关闭，fail2ban 无法读取日志${N}"
-					confirm "是否自动开启日志 (级别: low)?" && {
-						ufw logging low >/dev/null 2>&1
-						echo -e "${G}已开启 UFW 日志${N}"
-					} || { echo -e "${Y}已取消${N}"; pause; continue; }
-				fi
-
 				read -r -p "封禁时长 [12h]: " bt; bt=${bt:-12h}
-				read -r -p "触发阈值 (10分钟内触发次数) [10]: " mr; mr=${mr:-10}
-				echo -e "\n配置: 封禁=${C}${bt}${N} 阈值=${C}${mr}${N}"
+				read -r -p "触发阈值 [10]: " mr; mr=${mr:-10}
+				echo -e "封禁:${C}${bt}${N} 阈值:${C}${mr}${N}"
 				confirm "应用?" && {
 					ufw logging on >/dev/null 2>&1
 					write_portscan "$bt" "$mr"
 					restart_f2b
-					sleep 2
-					trigger_ufw_test
-					sleep 1
-					verify_f2b_filter "ufw-port-scan"
 				}
 				pause;;
 			3)
@@ -483,92 +331,6 @@ manage_fail2ban(){
 			5)
 				f2b_ping || { echo -e "${R}未运行${N}"; pause; continue; }
 				confirm "解封所有 IP?" && { fail2ban-client unban --all; echo -e "${G}已解封${N}"; }
-				pause;;
-			6)
-				echo -e "\n${C}=== 诊断 UFW + Fail2ban 集成状态 ===${N}\n"
-				
-				echo -e "${B}1. systemd-journald 状态:${N}"
-				if check_journal_available; then
-					echo -e "   ${G}✓ 正常运行${N}"
-					echo -e "   持久化: $(check_journal_persistence)"
-					journalctl --disk-usage 2>/dev/null | sed 's/^/   /'
-				else
-					echo -e "   ${R}✗ 未运行${N}"
-				fi
-				
-				echo -e "\n${B}2. UFW 状态:${N}"
-				if has_cmd ufw; then
-					local ufw_enabled; ufw_enabled=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2)
-					if [ "${ufw_enabled^^}" = "YES" ]; then
-						echo -e "   ${G}✓ 已启用${N}"
-						local log_level; log_level=$(ufw status verbose 2>/dev/null | awk '/Logging:/{print tolower($2)}')
-						echo -e "   日志级别: ${C}${log_level}${N}"
-						if [ "$log_level" = "off" ]; then
-							echo -e "   ${R}⚠ 日志已关闭，fail2ban 无法工作${N}"
-						fi
-					else
-						echo -e "   ${Y}✗ 未启用${N}"
-					fi
-				else
-					echo -e "   ${R}✗ 未安装${N}"
-				fi
-				
-				echo -e "\n${B}3. UFW 日志在 journal 中:${N}"
-				if journalctl _TRANSPORT=kernel -n 50 --no-pager 2>/dev/null | grep -qi '\[UFW'; then
-					echo -e "   ${G}✓ 检测到 UFW 日志${N}"
-					echo -e "   最近 3 条:"
-					journalctl _TRANSPORT=kernel --no-pager -n 50 2>/dev/null | grep -i '\[UFW' | head -3 | sed 's/^/   /'
-				else
-					echo -e "   ${Y}⚠ 未检测到日志（可能还没有阻断事件）${N}"
-				fi
-				
-				echo -e "\n${B}4. Fail2ban 状态:${N}"
-				if f2b_ping; then
-					echo -e "   ${G}✓ 正常运行${N}"
-					fail2ban-client status 2>/dev/null | grep "Number of jail" | sed 's/^/   /'
-				else
-					echo -e "   ${R}✗ 未运行${N}"
-				fi
-
-				echo -e "\n${B}5. 已启用的 Jail 配置:${N}"
-				if f2b_ping; then
-					local jails; jails=$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/{gsub(/,/," ",$2);print $2}')
-					if [ -n "$jails" ]; then
-						for jail in $jails; do
-							echo -e "   ${C}[$jail]${N}"
-							if [ -f "/etc/fail2ban/jail.d/${jail}.local" ]; then
-								grep -E "^(backend|logpath|journalmatch)" "/etc/fail2ban/jail.d/${jail}.local" 2>/dev/null | sed 's/^/     /'
-							else
-								echo -e "     ${Y}配置文件不存在${N}"
-							fi
-						done
-					else
-						echo -e "   ${Y}无启用 Jail${N}"
-					fi
-				else
-					echo -e "   ${Y}fail2ban 未运行${N}"
-				fi
-				
-				echo -e "\n${B}6. 集成检查结果:${N}"
-				local issues=0
-				
-				! check_journal_available && { echo -e "   ${R}✗ systemd-journald 未运行${N}"; issues=$((issues+1)); }
-				
-				if has_cmd ufw; then
-					local ufw_enabled; ufw_enabled=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2)
-					[ "${ufw_enabled^^}" != "YES" ] && { echo -e "   ${R}✗ UFW 未启用${N}"; issues=$((issues+1)); }
-					
-					local log_level; log_level=$(ufw status verbose 2>/dev/null | awk '/Logging:/{print tolower($2)}')
-					[ "$log_level" = "off" ] && [ -f /etc/fail2ban/jail.d/ufw-port-scan.local ] && {
-						echo -e "   ${R}✗ UFW 日志关闭但端口扫描防护已启用${N}"
-						issues=$((issues+1))
-					}
-				fi
-				
-				! f2b_ping && { echo -e "   ${R}✗ fail2ban 未运行${N}"; issues=$((issues+1)); }
-				
-				[ $issues -eq 0 ] && echo -e "   ${G}✓ 所有检查通过${N}"
-				
 				pause;;
 			0) break;;
 			*) echo -e "${R}无效选项${N}"; sleep 1;;
@@ -635,7 +397,6 @@ EOF
 		esac
 	done
 }
-
 # ================= SWAP =================
 
 manage_swap(){
@@ -651,36 +412,41 @@ manage_swap(){
 		read -r -p "请选择: " c
 		case $c in
 			1)
-				echo -e "\n${C}--- 配置 SWAP ---${N}"
-				local t; t=$(free | awk '/Swap/{print $2}')
-				[ "${t:-0}" -gt 0 ] && echo -e "${Y}已存在 SWAP ($(free -h | awk '/Swap/{print $2}'))${N}"
-				read -r -p "大小 (MB, 推荐: 内存×1.5) [2048]: " sz; sz=${sz:-2048}
-				[[ ! "$sz" =~ ^[0-9]+$ ]] && { echo -e "${R}无效${N}"; pause; continue; }
-				read -r -p "积极性 (0-100, 低=少用, 推荐: 10) [10]: " sw; sw=${sw:-10}
-				[[ ! "$sw" =~ ^[0-9]+$ ]] || [ "$sw" -gt 100 ] && { echo -e "${R}无效${N}"; pause; continue; }
-				confirm "创建 ${sz}MB SWAP (积极性: ${sw})?" && {
-					[ "${t:-0}" -gt 0 ] && { swapoff -a 2>/dev/null; rm -f /swapfile; }
-					dd if=/dev/zero of=/swapfile bs=1M count="$sz" status=progress 2>/dev/null
-					chmod 600 /swapfile; mkswap /swapfile >/dev/null 2>&1; swapon /swapfile
-					grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-					sysctl vm.swappiness="$sw" >/dev/null 2>&1
-					grep -q 'vm.swappiness' /etc/sysctl.conf && sed -i "s/^vm.swappiness=.*/vm.swappiness=$sw/" /etc/sysctl.conf || echo "vm.swappiness=$sw" >> /etc/sysctl.conf
-					echo -e "${G}已创建 ${sz}MB SWAP${N}"
-				}
-				pause;;
+				echo -e "\n${C}--- 创建 SWAP ---${N}"
+				if [ "$(free | awk '/Swap/{print $2}')" -gt 0 ]; then
+					echo -e "${Y}检测到已有 SWAP，继续将重建${N}"
+					confirm "确认?" || { pause; continue; }
+				fi
+				# 关闭所有现有 swapfile
+				for sf in $(swapon --show=NAME --noheadings 2>/dev/null | grep -v '^/dev/'); do
+					[ -n "$sf" ] && swapoff "$sf" 2>/dev/null && rm -f "$sf"
+				done
+				sed -i '/swap/d' /etc/fstab
+				read -r -p "大小 (如 1G, 512M, 默认 1G): " raw; raw=${raw:-1G}
+				local sz
+				if [[ "$raw" =~ ^([0-9]+)([gG])$ ]]; then sz=$((${BASH_REMATCH[1]}*1024))
+				elif [[ "$raw" =~ ^([0-9]+)([mM])$ ]]; then sz=${BASH_REMATCH[1]}
+				elif [[ "$raw" =~ ^[0-9]+$ ]]; then sz=$raw
+				else echo -e "${R}格式无效${N}"; pause; continue; fi
+				read -r -p "swappiness (0-100, 默认 10): " sv; sv=${sv:-10}
+				echo -e "\n${C}创建 ${sz}MB SWAP...${N}"
+				fallocate -l "${sz}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$sz" status=progress 2>/dev/null
+				chmod 600 /swapfile; mkswap /swapfile >/dev/null; swapon /swapfile
+				echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+				sed -i '/vm.swappiness/d' /etc/sysctl.conf; echo "vm.swappiness=$sv" >> /etc/sysctl.conf
+				sysctl -p >/dev/null; echo -e "${G}创建成功！${N}"; pause;;
 			2)
-				echo -e "\n${C}=== SWAP 详情 ===${N}"
-				free -h | grep -E 'total|Swap'
-				[ -f /swapfile ] && { echo -e "\n文件: /swapfile"; ls -lh /swapfile | awk '{print "大小: "$5}'; }
-				echo -e "积极性: $(cat /proc/sys/vm/swappiness 2>/dev/null)"
+				echo -e "\n${C}=== 内存 ===${N}"; free -h
+				echo -e "\n${C}=== SWAP 挂载 ===${N}"; swapon --show 2>/dev/null || echo "无 SWAP"
 				pause;;
 			3)
-				local t; t=$(free | awk '/Swap/{print $2}')
-				[ "${t:-0}" -eq 0 ] && { echo -e "${Y}未启用 SWAP${N}"; pause; continue; }
+				[ "$(free | awk '/Swap/{print $2}')" -eq 0 ] && { echo -e "${Y}无 SWAP${N}"; pause; continue; }
 				confirm "彻底删除?" && {
-					swapoff -a 2>/dev/null; rm -f /swapfile
-					sed -i '/\/swapfile/d' /etc/fstab
-					echo -e "${G}已删除${N}"
+					for sf in $(swapon --show=NAME --noheadings 2>/dev/null | grep -v '^/dev/'); do
+						[ -n "$sf" ] && swapoff "$sf" 2>/dev/null && rm -f "$sf"
+					done
+					sed -i '/swap/d' /etc/fstab; sed -i '/vm.swappiness/d' /etc/sysctl.conf
+					sysctl -p >/dev/null 2>&1; echo -e "${G}已删除${N}"
 				}
 				pause;;
 			0) break;; *) echo -e "${R}无效${N}"; sleep 1;;
@@ -688,45 +454,90 @@ manage_swap(){
 	done
 }
 
-# ================= 主菜单 =================
+# ================= 卸载 =================
 
-main_menu(){
-	while true; do
-		clear
-		echo -e "${B}╔════════════════════════════════════════╗${N}"
-		echo -e "${B}║${N}     ${P}VPS 一键管理脚本 v3${N}             ${B}║${N}"
-		echo -e "${B}╚════════════════════════════════════════╝${N}\n"
-		
-		echo -e "${C}» 状态概览${N}"
-		echo -e "  UFW:      $(ufw_st)"
-		echo -e "  Fail2ban: $(f2b_st)"
-		echo -e "  BBR:      $(bbr_st)"
-		echo -e "  SWAP:     $(swap_st)"
-		if ! check_journal_available; then
-			echo -e "\n${R}⚠ 警告: systemd-journald 未运行${N}"
-		fi
-		echo ""
-		
-		echo -e "${C}» 功能菜单${N}"
-		echo -e "  ${G}1.${N} 基础安装 (UFW + Fail2ban)"
-		echo -e "  ${G}2.${N} UFW 防火墙管理"
-		echo -e "  ${G}3.${N} Fail2ban 安全管理"
-		echo -e "  ${G}4.${N} BBR 加速管理"
-		echo -e "  ${G}5.${N} SWAP 虚拟内存管理"
-		echo -e "  ${X}0. 退出${N}"
-		echo ""
-		read -r -p "请选择: " c
-		
-		case $c in
-			1) install_basics;;
-			2) manage_ufw;;
-			3) manage_fail2ban;;
-			4) manage_bbr;;
-			5) manage_swap;;
-			0) echo -e "${C}再见！${N}"; exit 0;;
-			*) echo -e "${R}无效选项${N}"; sleep 1;;
-		esac
-	done
+uninstall(){
+	clear; echo -e "${R}=== 卸载与清理 ===${N}\n"
+	has_cmd ufw && echo "  ${Y}1.${N} 卸载 UFW"
+	has_cmd fail2ban-client && echo "  ${Y}2.${N} 卸载 Fail2ban"
+	echo "  ${Y}3.${N} 清理 BBR 参数"
+	echo "  ${Y}4.${N} 清理 SWAP"
+	echo "  ${R}5.${N} 一键全部卸载"
+	echo -e "  ${X}0. 返回主菜单${N}"
+	read -r -p "请选择: " c
+	case $c in
+		1)
+			has_cmd ufw || { echo -e "${R}未安装${N}"; pause; return; }
+			confirm "卸载 UFW? (将关闭防火墙并删除规则)" || return
+			echo "y" | ufw disable >/dev/null 2>&1; ufw reset >/dev/null 2>&1
+			apt-get purge -y ufw >/dev/null 2>&1; echo -e "${G}UFW 已卸载${N}"
+			pause;;
+		2)
+			has_cmd fail2ban-client || { echo -e "${R}未安装${N}"; pause; return; }
+			confirm "卸载 Fail2ban? (将删除所有配置)" || return
+			systemctl stop fail2ban >/dev/null 2>&1; systemctl disable fail2ban >/dev/null 2>&1
+			apt-get purge -y fail2ban >/dev/null 2>&1
+			rm -rf /etc/fail2ban /var/log/fail2ban.log; echo -e "${G}Fail2ban 已卸载${N}"
+			pause;;
+		3)
+			confirm "清理所有 BBR/TCP 调优参数? (恢复 cubic 默认)" || return
+			sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
+			sysctl -p >/dev/null 2>&1; echo -e "${G}已清理${N}"
+			pause;;
+		4)
+			confirm "清理所有 SWAP?" || return
+			for sf in $(swapon --show=NAME --noheadings 2>/dev/null | grep -v '^/dev/'); do
+				[ -n "$sf" ] && swapoff "$sf" 2>/dev/null && rm -f "$sf"
+			done
+			sed -i '/swap/d' /etc/fstab; sed -i '/vm.swappiness/d' /etc/sysctl.conf
+			sysctl -p >/dev/null 2>&1; echo -e "${G}已清理${N}"
+			pause;;
+		5)
+			echo -e "${R}即将执行: 卸载 UFW + Fail2ban + 清理 BBR + SWAP${N}"
+			confirm "确认?" || return; confirm "再次确认? (不可逆)" || return
+			# UFW
+			has_cmd ufw && { echo "y" | ufw disable >/dev/null 2>&1; ufw reset >/dev/null 2>&1; apt-get purge -y ufw >/dev/null 2>&1; echo -e "UFW: ${G}已卸载${N}"; }
+			# Fail2ban
+			has_cmd fail2ban-client && { systemctl stop fail2ban >/dev/null 2>&1; apt-get purge -y fail2ban >/dev/null 2>&1; rm -rf /etc/fail2ban /var/log/fail2ban.log; echo -e "Fail2ban: ${G}已卸载${N}"; }
+			# BBR
+			sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
+			sysctl -p >/dev/null 2>&1; echo -e "BBR: ${G}已清理${N}"
+			# SWAP
+			for sf in $(swapon --show=NAME --noheadings 2>/dev/null | grep -v '^/dev/'); do
+				[ -n "$sf" ] && swapoff "$sf" 2>/dev/null && rm -f "$sf"
+			done
+			sed -i '/swap/d' /etc/fstab; sed -i '/vm.swappiness/d' /etc/sysctl.conf
+			sysctl -p >/dev/null 2>&1; echo -e "SWAP: ${G}已清理${N}"
+			echo -e "\n${G}全部完成！${N}"; pause;;
+		0) return;;
+		*) echo -e "${R}无效${N}"; sleep 1;;
+	esac
 }
 
-main_menu
+# ================= 主菜单 =================
+
+while true; do
+	clear
+	echo -e "${C}========================================${N}"
+	echo -e "${B}      VPS 一键综合管理脚本              ${N}"
+	echo -e "${C}========================================${N}\n"
+	echo -e "  ${X}系统状态:${N}"
+	echo -e "    UFW      : $(ufw_st)"
+	echo -e "    Fail2ban : $(f2b_st)"
+	echo -e "    BBR      : $(bbr_st)"
+	echo -e "    SWAP     : $(swap_st)\n"
+	echo -e "${C}----------------------------------------${N}\n"
+	echo -e "  ${Y}1.${N} 基础安装"
+	echo -e "  ${Y}2.${N} UFW 防火墙管理"
+	echo -e "  ${Y}3.${N} Fail2ban 安全管理"
+	echo -e "  ${Y}4.${N} BBR 加速管理"
+	echo -e "  ${Y}5.${N} SWAP 虚拟内存管理"
+	echo -e "  ${Y}6.${N} ${R}卸载与清理${N}"
+	echo -e "  ${R}0. 退出${N}"
+	echo -e "${C}========================================${N}"
+	read -r -p "请选择: " c
+	case $c in 1) install_basics;; 2) manage_ufw;; 3) manage_fail2ban;; 4) manage_bbr;; 5) manage_swap;;
+		6) uninstall;; 0) echo -e "\n${G}再见！${N}"; exit 0;;
+		*) echo -e "\n${R}无效${N}"; sleep 1;;
+	esac
+done
