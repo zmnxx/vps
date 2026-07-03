@@ -1,11 +1,11 @@
 const { type, name } = $arguments;
 
 const compatible_outbound = {
-  tag: "兼容兜底",
+  tag: "COMPATIBLE",
   type: "direct",
 };
 
-let compatible = false;
+let compatible;
 let config = JSON.parse($files[0]);
 
 let proxies = await produceArtifact({
@@ -15,23 +15,66 @@ let proxies = await produceArtifact({
   produceType: "internal",
 });
 
-// 把订阅节点写入 sing-box 出站列表
 config.outbounds.push(...proxies);
 
-const proxyTags = getTags(proxies);
-
-// 简约分组：手动选择 = 自动选择 + 全部节点；自动选择 = 全部节点测速
-for (const outbound of config.outbounds) {
-  if (outbound.tag === "手动选择") {
-    outbound.outbounds.push(...proxyTags);
+config.outbounds.map((i) => {
+  // all: 所有节点
+  if (["all"].includes(i.tag)) {
+    i.outbounds.push(...getTags(proxies));
   }
-  if (outbound.tag === "自动选择") {
-    outbound.outbounds.push(...proxyTags);
+  // all-auto: 所有节点自动测速
+  if (["all-auto"].includes(i.tag)) {
+    i.outbounds.push(...getTags(proxies));
   }
-}
+  // hk-auto: 香港节点
+  if (["hk-auto"].includes(i.tag)) {
+    i.outbounds.push(
+      ...getTags(
+        proxies,
+        /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(hk|hong.*kong)\b|港|香港|🇭🇰)/i,
+      ),
+    );
+  }
+  // tw-auto: 台湾节点
+  if (["tw-auto"].includes(i.tag)) {
+    i.outbounds.push(
+      ...getTags(
+        proxies,
+        /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(tw|taiwan)\b|🇹🇼|台|台湾)/i,
+      ),
+    );
+  }
+  // jp-auto: 日本节点
+  if (["jp-auto"].includes(i.tag)) {
+    i.outbounds.push(
+      ...getTags(
+        proxies,
+        /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(jp|japan)\b|日本|日|🇯🇵)/i,
+      ),
+    );
+  }
+  // sg-auto: 新加坡节点
+  if (["sg-auto"].includes(i.tag)) {
+    i.outbounds.push(
+      ...getTags(
+        proxies,
+        /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(sg|singapore)\b|🇸🇬|新加坡|新)/i,
+      ),
+    );
+  }
+  // us-auto: 美国节点
+  if (["us-auto"].includes(i.tag)) {
+    i.outbounds.push(
+      ...getTags(
+        proxies,
+        /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(us|united.*states)\b|美|美国|🇺🇸)/i,
+      ),
+    );
+  }
+});
 
-// 防止订阅为空或规则筛选为空导致配置不可用
-for (const outbound of config.outbounds) {
+// 对空的 outbound 自动创建 COMPATIBLE(direct) 防止报错
+config.outbounds.forEach((outbound) => {
   if (Array.isArray(outbound.outbounds) && outbound.outbounds.length === 0) {
     if (!compatible) {
       config.outbounds.push(compatible_outbound);
@@ -39,10 +82,12 @@ for (const outbound of config.outbounds) {
     }
     outbound.outbounds.push(compatible_outbound.tag);
   }
-}
+});
 
 $content = JSON.stringify(config, null, 2);
 
 function getTags(proxies, regex) {
-  return (regex ? proxies.filter((p) => regex.test(p.tag)) : proxies).map((p) => p.tag);
+  return (regex ? proxies.filter((p) => regex.test(p.tag)) : proxies).map(
+    (p) => p.tag,
+  );
 }
