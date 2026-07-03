@@ -147,12 +147,13 @@
     },
     {
       "tag": "自动选择",
-      "type": "selector",
-      "outbounds": [
-        "all"
-      ],
-      "default": "all",
-      "interrupt_exist_connections": true
+      "type": "urltest",
+      "outbounds": [],
+      "interrupt_exist_connections": true,
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 70,
+      "idle_timeout": "30m"
     },
     {
       "tag": "谷歌",
@@ -201,9 +202,7 @@
     {
       "tag": "all",
       "type": "selector",
-      "outbounds": [
-        "direct"
-      ]
+      "outbounds": []
     },
     {
       "tag": "direct",
