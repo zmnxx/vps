@@ -18,8 +18,8 @@ let proxies = await produceArtifact({
 config.outbounds.push(...proxies);
 
 config.outbounds.map((i) => {
-  // all 和 自动选择: 所有节点
-  if (["all", "自动选择"].includes(i.tag)) {
+  // Proxy 和 自动选择: 所有节点
+  if (["Proxy", "自动选择"].includes(i.tag)) {
     i.outbounds.push(...getTags(proxies));
   }
 });
