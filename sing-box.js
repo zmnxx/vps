@@ -22,10 +22,6 @@ config.outbounds.map((i) => {
   if (["all"].includes(i.tag)) {
     i.outbounds.push(...getTags(proxies));
   }
-  // all-auto: 所有节点自动测速
-  if (["all-auto"].includes(i.tag)) {
-    i.outbounds.push(...getTags(proxies));
-  }
 });
 
 // 对空的 outbound 自动创建 COMPATIBLE(direct) 防止报错
