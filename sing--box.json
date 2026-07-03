@@ -386,4 +386,432 @@
       "store_dns": true
     }
   }
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns_proxy",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "兜底"
+      },
+      {
+        "type": "https",
+        "tag": "dns_proxy_backup",
+        "server": "8.8.8.8",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "兜底"
+      },
+      {
+        "type": "https",
+        "tag": "dns_direct",
+        "server": "223.5.5.5",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "https",
+        "tag": "dns_direct_backup",
+        "server": "1.12.12.12",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "local",
+        "tag": "dns_local"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns_fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "clash_mode": "AllowAds",
+        "action": "route",
+        "server": "dns_proxy"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "clash_mode": "Global",
+        "action": "route",
+        "server": "dns_fakeip"
+      },
+      {
+        "domain_suffix": [
+          ".lan",
+          ".local",
+          ".localhost",
+          ".home.arpa",
+          "miwifi.com",
+          "tplogin.cn",
+          "tplinkwifi.net",
+          "tendawifi.com",
+          "router.asus.com",
+          "pixman.io"
+        ],
+        "rule_set": "private",
+        "action": "route",
+        "server": "dns_local"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "clash_mode": "AllowAds",
+            "invert": true
+          },
+          {
+            "rule_set": "ads"
+          }
+        ],
+        "action": "reject"
+      },
+      {
+        "rule_set": [
+          "cn_domain",
+          "apple_cn",
+          "category_games_cn"
+        ],
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "rule_set": "proxy_domain",
+        "action": "route",
+        "server": "dns_fakeip"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "dns_fakeip",
+        "rewrite_ttl": 1
+      }
+    ],
+    "final": "dns_proxy",
+    "strategy": "prefer_ipv4",
+    "optimistic": true,
+    "timeout": "10s",
+    "client_subnet": "2400:3200::/32"
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com",
+    "server_port": 123,
+    "interval": "30m"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.18.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 9000,
+      "auto_route": true,
+      "stack": "mixed",
+      "loopback_address": [
+        "10.7.0.1"
+      ],
+      "route_exclude_address": [
+        "192.168.0.0/16",
+        "fc00::/7"
+      ],
+      "platform": {
+        "http_proxy": {
+          "enabled": true,
+          "server": "127.0.0.1",
+          "server_port": 7890
+        }
+      }
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "Proxy",
+      "type": "selector",
+      "outbounds": []
+    },
+    {
+      "tag": "手动选择",
+      "type": "selector",
+      "outbounds": [
+        "Proxy",
+        "自动选择",
+        "direct"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "自动选择",
+      "type": "urltest",
+      "outbounds": [],
+      "interrupt_exist_connections": true,
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 70,
+      "idle_timeout": "30m"
+    },
+    {
+      "tag": "谷歌",
+      "type": "selector",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "direct"
+      ],
+      "default": "手动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "电报",
+      "type": "selector",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "direct"
+      ],
+      "default": "手动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "国内",
+      "type": "selector",
+      "outbounds": [
+        "direct",
+        "手动选择",
+        "自动选择"
+      ],
+      "default": "direct",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "兜底",
+      "type": "selector",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "direct"
+      ],
+      "default": "手动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "http_clients": [
+    {
+      "tag": "rule-set-http"
+    }
+  ],
+  "route": {
+    "default_http_client": "rule-set-http",
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic",
+          "dns"
+        ],
+        "timeout": "500ms"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "protocol": "dns"
+          },
+          {
+            "port": 53
+          }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "clash_mode": "Global",
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "clash_mode": "AllowAds",
+            "invert": true
+          },
+          {
+            "rule_set": "ads"
+          }
+        ],
+        "action": "reject",
+        "method": "default"
+      },
+      {
+        "rule_set": [
+          "google_domain",
+          "google_ip"
+        ],
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "rule_set": [
+          "telegram_domain",
+          "telegram_ip"
+        ],
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "action": "resolve"
+      },
+      {
+        "rule_set": [
+          "apple_cn",
+          "category_games_cn",
+          "cn_domain",
+          "cn_ip"
+        ],
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "private",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "proxy_domain",
+        "action": "route",
+        "outbound": "兜底"
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "ads",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads.srs"
+      },
+      {
+        "tag": "private",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs"
+      },
+      {
+        "tag": "apple_cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-cn.srs"
+      },
+      {
+        "tag": "category_games_cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-games@cn.srs"
+      },
+      {
+        "tag": "cn_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/cn.srs"
+      },
+      {
+        "tag": "cn_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs"
+      },
+      {
+        "tag": "google_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs"
+      },
+      {
+        "tag": "google_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geoip/google.srs"
+      },
+      {
+        "tag": "telegram_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs"
+      },
+      {
+        "tag": "telegram_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geoip/telegram.srs"
+      },
+      {
+        "tag": "proxy_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs"
+      }
+    ],
+    "final": "兜底",
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "dns_direct"
+    }
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "default_mode": "Rule",
+      "external_ui": "metacubexd",
+      "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+      "external_ui_download_detour": "direct"
+    },
+    "cache_file": {
+      "enabled": true,
+      "store_dns": true
+    }
+  }
 }
