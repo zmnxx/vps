@@ -35,6 +35,14 @@ config.outbounds.forEach((outbound) => {
   }
 });
 
+// 清理 default 字段中引用了已不存在的 outbound 的残留
+const allTags = new Set(config.outbounds.map((o) => o.tag));
+config.outbounds.forEach((outbound) => {
+  if (outbound.default && !allTags.has(outbound.default)) {
+    delete outbound.default;
+  }
+});
+
 $content = JSON.stringify(config, null, 2);
 
 function getTags(proxies, regex) {
