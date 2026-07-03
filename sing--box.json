@@ -148,8 +148,10 @@
     {
       "tag": "自动选择",
       "type": "selector",
-      "outbounds": [],
-      "default": "all-auto",
+      "outbounds": [
+        "all"
+      ],
+      "default": "all",
       "interrupt_exist_connections": true
     },
     {
@@ -199,7 +201,9 @@
     {
       "tag": "all",
       "type": "selector",
-      "outbounds": []
+      "outbounds": [
+        "direct"
+      ]
     },
     {
       "tag": "direct",
