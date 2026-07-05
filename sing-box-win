@@ -1,0 +1,451 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "dns_direct",
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "udp",
+        "tag": "dns_direct_backup",
+        "server": "119.29.29.29"
+      },
+      {
+        "type": "https",
+        "tag": "dns_proxy",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "server_name": "cloudflare-dns.com"
+        },
+        "detour": "兜底"
+      },
+      {
+        "type": "https",
+        "tag": "dns_proxy_backup",
+        "server": "8.8.8.8",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "server_name": "dns.google"
+        },
+        "detour": "兜底"
+      },
+      {
+        "type": "local",
+        "tag": "dns_local"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns_fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "domain": [
+          "localhost",
+          "localhost.ptlogin2.qq.com",
+          "dns.msftncsi.com",
+          "www.msftncsi.com",
+          "www.msftconnecttest.com",
+          "time-ios.apple.com",
+          "lens.l.google.com"
+        ],
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "domain_suffix": [
+          "lan",
+          "local",
+          "localhost",
+          "home.arpa",
+          "ntp.org.cn",
+          "pool.ntp.org"
+        ],
+        "action": "route",
+        "server": "dns_local"
+      },
+      {
+        "domain_keyword": [
+          "stun"
+        ],
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "rule_set": [
+          "private_domain",
+          "cn_domain",
+          "apple_cn"
+        ],
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "rule_set": [
+          "google_domain",
+          "telegram_domain",
+          "gfw_domain"
+        ],
+        "action": "route",
+        "server": "dns_fakeip"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "dns_fakeip",
+        "rewrite_ttl": 1
+      }
+    ],
+    "final": "dns_proxy",
+    "strategy": "prefer_ipv4",
+    "disable_cache": false,
+    "disable_expire": false,
+    "independent_cache": false,
+    "optimistic": true,
+    "timeout": "10s",
+    "reverse_mapping": true
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com",
+    "server_port": 123,
+    "interval": "30m"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.18.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 9000,
+      "dns_mode": "hijack",
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed",
+      "route_exclude_address": [
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "fe80::/10",
+        "fc00::/7"
+      ],
+      "platform": {
+        "http_proxy": {
+          "enabled": true,
+          "server": "127.0.0.1",
+          "server_port": 7890
+        }
+      }
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890,
+      "set_system_proxy": false
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "Proxy",
+      "type": "selector",
+      "outbounds": []
+    },
+    {
+      "tag": "手动选择",
+      "type": "selector",
+      "outbounds": [
+        "Proxy",
+        "自动选择",
+        "direct"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "自动选择",
+      "type": "urltest",
+      "outbounds": [],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "10m",
+      "tolerance": 70,
+      "idle_timeout": "30m",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "去广告",
+      "type": "selector",
+      "outbounds": [
+        "block",
+        "direct"
+      ],
+      "default": "block"
+    },
+    {
+      "tag": "国内",
+      "type": "selector",
+      "outbounds": [
+        "direct",
+        "手动选择",
+        "自动选择"
+      ],
+      "default": "direct",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "谷歌",
+      "type": "selector",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "direct"
+      ],
+      "default": "手动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "电报",
+      "type": "selector",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "direct"
+      ],
+      "default": "手动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "兜底",
+      "type": "selector",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "direct"
+      ],
+      "default": "手动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    },
+    {
+      "tag": "block",
+      "type": "block"
+    }
+  ],
+  "http_clients": [
+    {
+      "tag": "rule-set-http",
+      "version": 2,
+      "headers": {
+        "User-Agent": "sing-box"
+      }
+    }
+  ],
+  "route": {
+    "default_http_client": "rule-set-http",
+    "default_domain_resolver": {
+      "server": "dns_direct"
+    },
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "timeout": "500ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "ads",
+        "action": "route",
+        "outbound": "去广告"
+      },
+      {
+        "rule_set": [
+          "private_domain",
+          "private_ip"
+        ],
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "apple_cn",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "google_domain",
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "rule_set": "telegram_domain",
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "rule_set": "cn_domain",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "gfw_domain",
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "action": "resolve"
+      },
+      {
+        "rule_set": "google_ip",
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "rule_set": "telegram_ip",
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "rule_set": "cn_ip",
+        "action": "route",
+        "outbound": "国内"
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "ads",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "google_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "telegram_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/telegram.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "telegram_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "cn_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "cn_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "private_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "private_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/private.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "apple_cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-cn.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "gfw_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/gfw.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      },
+      {
+        "tag": "google_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs",
+        "http_client": "rule-set-http",
+        "update_interval": "24h"
+      }
+    ],
+    "final": "兜底"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "default_mode": "Rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "store_fakeip": true,
+      "store_dns": true
+    }
+  }
+}
