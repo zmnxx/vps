@@ -1,37 +1,13 @@
-/**
- * Sub-Store sing-box 1.14.0 配置生成脚本
- *
- * 使用方法：
- * 1. 在 Sub-Store 中编辑你的订阅或组合订阅
- * 2. 展开「同步」设置：
- *    - 「远程脚本」填入本脚本的 raw 链接
- *    - 「远程配置/文件」填入 sing-box.json 模板的 raw 链接
- * 3. 同步时目标平台选择 sing-box，下载即可获得完整配置
- *
- * 策略组（极简版）：
- *   代理      - 手动选择（所有节点 + 自动选择 + 直连）
- *   自动选择  - 自动测速（所有有效节点）
- *   国内      - 国内分流（默认直连）
- *   兜底      - 兜底分流（默认走代理，所有未匹配的流量走这里）
- *
- * 分流逻辑：广告拦截 → 私有直连 → 国内直连 → 其余走兜底(代理)
- *
- * 手机/电脑通用，无需修改。
- */
-
 const { type, name } = $arguments;
 
-// 兜底兼容出站：当某分组无匹配节点时，用直连兜底
-const compatible_outbound = {
-  tag: "兼容兜底",
+const compatibleOutbound = {
+  tag: "COMPATIBLE",
   type: "direct",
 };
-let compatible;
 
-// 读取模板 JSON
 let config = JSON.parse($files[0]);
+let compatibleAdded = false;
 
-// 生成 sing-box 格式节点
 let proxies = await produceArtifact({
   name,
   type: /^1$|col/i.test(type) ? "collection" : "subscription",
@@ -39,41 +15,48 @@ let proxies = await produceArtifact({
   produceType: "internal",
 });
 
+const proxyTags = getTags(proxies);
+
+// 所有真实节点统一追加到 outbounds；Sub-Store 负责把订阅转换成 sing-box 出站。
 config.outbounds.push(...proxies);
 
-function getTags(proxies, regex) {
-  return (regex ? proxies.filter((p) => regex.test(p.tag)) : proxies).map(
-    (p) => p.tag
-  );
+for (const outbound of config.outbounds) {
+  if (!Array.isArray(outbound.outbounds)) continue;
+
+  // Proxy：全部节点显示在这里，并把“自动选择”放在第一项便于手动切换。
+  if (outbound.tag === "Proxy") {
+    outbound.outbounds = unique(["自动选择", ...proxyTags]);
+  }
+
+  // 自动选择：只放真实节点，不嵌套选择器。
+  if (outbound.tag === "自动选择") {
+    outbound.outbounds = proxyTags.slice();
+  }
+
+  // 其他分组默认选择 Proxy；国内默认 direct 已在模板中设置。
+  if (["谷歌", "兜底"].includes(outbound.tag)) {
+    outbound.outbounds = unique(["Proxy", "自动选择", "direct", ...proxyTags]);
+    outbound.default = "Proxy";
+  }
 }
 
-// 过滤信息类节点
-const validProxies = proxies.filter(
-  (p) =>
-    !/(网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|官网|主页)/i.test(
-      p.tag
-    )
-);
-
-// 填充节点到对应分组
-config.outbounds.map((i) => {
-  if (i.tag === "自动选择") {
-    i.outbounds.push(...getTags(validProxies));
-  }
-  if (i.tag === "代理") {
-    i.outbounds.push(...getTags(validProxies));
-  }
-});
-
-// 空出站兜底
-config.outbounds.forEach((outbound) => {
+// 若订阅为空，给 urltest/selector 填入兼容出站，避免 sing-box 因空 outbounds 报错。
+for (const outbound of config.outbounds) {
   if (Array.isArray(outbound.outbounds) && outbound.outbounds.length === 0) {
-    if (!compatible) {
-      config.outbounds.push(compatible_outbound);
-      compatible = true;
+    if (!compatibleAdded) {
+      config.outbounds.push(compatibleOutbound);
+      compatibleAdded = true;
     }
-    outbound.outbounds.push(compatible_outbound.tag);
+    outbound.outbounds.push(compatibleOutbound.tag);
   }
-});
+}
 
 $content = JSON.stringify(config, null, 2);
+
+function getTags(proxies, regex) {
+  return (regex ? proxies.filter((p) => regex.test(p.tag)) : proxies).map((p) => p.tag);
+}
+
+function unique(arr) {
+  return [...new Set(arr.filter(Boolean))];
+}
