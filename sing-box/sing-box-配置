@@ -14,11 +14,10 @@
         "detour": "代理"
       },
       {
-        "type": "https",
+        "type": "udp",
         "tag": "国内DNS",
         "server": "223.5.5.5",
-        "server_port": 443,
-        "path": "/dns-query"
+        "server_port": 53
       },
       {
         "type": "local",
@@ -43,20 +42,32 @@
         "server": "虚假IP"
       },
       {
-        "query_type": ["A", "AAAA"],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
         "rule_set": "私有域名",
         "action": "route",
         "server": "本地DNS"
       },
       {
-        "query_type": ["A", "AAAA"],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
         "rule_set": "国内域名",
         "action": "route",
         "server": "国内DNS"
       },
       {
-        "query_type": ["A", "AAAA"],
-        "rule_set": ["谷歌域名", "国外域名"],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "rule_set": [
+          "谷歌域名",
+          "国外域名"
+        ],
         "action": "route",
         "server": "虚假IP"
       },
@@ -73,7 +84,10 @@
         "server": "国内DNS"
       },
       {
-        "query_type": ["A", "AAAA"],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
         "action": "route",
         "server": "虚假IP"
       }
@@ -95,15 +109,18 @@
   },
   "http_clients": [
     {
-      "tag": "代理下载",
-      "detour": "代理"
+      "tag": "直连下载",
+      "detour": "直连"
     }
   ],
   "inbounds": [
     {
       "type": "tun",
       "tag": "tun入站",
-      "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
+      "address": [
+        "172.18.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
       "mtu": 9000,
       "auto_route": true,
       "strict_route": true,
@@ -222,7 +239,10 @@
         "outbound": "直连"
       },
       {
-        "rule_set": ["谷歌域名", "谷歌IP"],
+        "rule_set": [
+          "谷歌域名",
+          "谷歌IP"
+        ],
         "action": "route",
         "outbound": "谷歌"
       },
@@ -242,56 +262,56 @@
         "type": "remote",
         "tag": "广告终结",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-singbox.srs",
+        "url": "https://fastly.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "国内域名",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "国内IP",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "私有域名",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "谷歌域名",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "谷歌IP",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "国外域名",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
         "update_interval": "1d0s"
       }
     ],
     "final": "兜底",
     "auto_detect_interface": true,
     "default_domain_resolver": "国内DNS",
-    "default_http_client": "代理下载",
+    "default_http_client": "直连下载",
     "find_process": false
   },
   "experimental": {
