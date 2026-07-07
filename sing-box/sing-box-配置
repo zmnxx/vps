@@ -129,9 +129,6 @@
       "auto_route": true,
       "strict_route": true,
       "stack": "mixed",
-      "sniff": true,
-      "sniff_override_destination": true,
-      "domain_strategy": "prefer_ipv4",
       "platform": {
         "http_proxy": {
           "enabled": true,
@@ -144,10 +141,7 @@
       "type": "mixed",
       "tag": "mixed-in",
       "listen": "127.0.0.1",
-      "listen_port": 7890,
-      "sniff": true,
-      "sniff_override_destination": true,
-      "domain_strategy": "prefer_ipv4"
+      "listen_port": 7890
     }
   ],
   "outbounds": [
@@ -231,7 +225,20 @@
         "outbound": "国内"
       },
       {
-        "action": "sniff"
+        "inbound": [
+          "tun-in",
+          "mixed-in"
+        ],
+        "action": "resolve",
+        "strategy": "prefer_ipv4"
+      },
+      {
+        "inbound": [
+          "tun-in",
+          "mixed-in"
+        ],
+        "action": "sniff",
+        "timeout": "1s"
       },
       {
         "rule_set": "广告",
