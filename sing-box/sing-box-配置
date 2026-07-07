@@ -1,6 +1,6 @@
 {
   "log": {
-    "level": "info",
+    "level": "warn",
     "timestamp": true
   },
   "dns": {
@@ -104,7 +104,7 @@
   "ntp": {
     "enabled": true,
     "interval": "30m0s",
-    "server": "time.aliyun.com",
+    "server": "203.107.6.88",
     "server_port": 123
   },
   "http_clients": [
@@ -122,7 +122,6 @@
       ],
       "mtu": 9000,
       "auto_route": true,
-      "strict_route": true,
       "stack": "mixed",
       "platform": {
         "http_proxy": {
@@ -212,6 +211,10 @@
         "network": "icmp",
         "action": "reject",
         "method": "default"
+      },
+      {
+        "port": 7,
+        "action": "reject"
       },
       {
         "ip_is_private": true,
