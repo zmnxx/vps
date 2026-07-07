@@ -55,6 +55,12 @@
         "server": "国内DNS"
       },
       {
+        "query_type": ["A", "AAAA"],
+        "rule_set": ["谷歌域名", "国外域名"],
+        "action": "route",
+        "server": "虚假IP"
+      },
+      {
         "rule_set": "国外域名",
         "invert": true,
         "action": "evaluate",
@@ -127,6 +133,17 @@
         "直连"
       ],
       "default": "自动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "谷歌",
+      "outbounds": [
+        "代理",
+        "自动选择",
+        "直连"
+      ],
+      "default": "代理",
       "interrupt_exist_connections": true
     },
     {
@@ -205,6 +222,11 @@
         "outbound": "直连"
       },
       {
+        "rule_set": ["谷歌域名", "谷歌IP"],
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
         "rule_set": "国内域名",
         "action": "route",
         "outbound": "国内"
@@ -242,6 +264,20 @@
         "tag": "私有域名",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "谷歌域名",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "谷歌IP",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs",
         "update_interval": "1d0s"
       },
       {
