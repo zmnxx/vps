@@ -7,26 +7,26 @@
     "servers": [
       {
         "type": "https",
-        "tag": "dns_proxy",
+        "tag": "远程DNS",
         "server": "1.1.1.1",
         "server_port": 443,
         "path": "/dns-query",
-        "detour": "Proxy"
+        "detour": "代理"
       },
       {
         "type": "https",
-        "tag": "dns_direct",
+        "tag": "国内DNS",
         "server": "223.5.5.5",
         "server_port": 443,
         "path": "/dns-query"
       },
       {
         "type": "local",
-        "tag": "local"
+        "tag": "本地DNS"
       },
       {
         "type": "fakeip",
-        "tag": "fakeip",
+        "tag": "虚假IP",
         "inet4_range": "198.18.0.0/15",
         "inet6_range": "fc00::/18"
       }
@@ -35,50 +35,50 @@
       {
         "clash_mode": "Direct",
         "action": "route",
-        "server": "local"
+        "server": "本地DNS"
       },
       {
         "clash_mode": "Global",
         "action": "route",
-        "server": "fakeip"
+        "server": "虚假IP"
       },
       {
         "query_type": ["A", "AAAA"],
-        "rule_set": "private",
+        "rule_set": "私有域名",
         "action": "route",
-        "server": "local"
+        "server": "本地DNS"
       },
       {
         "query_type": ["A", "AAAA"],
-        "rule_set": ["cn_domain", "apple_cn", "google_cn"],
+        "rule_set": ["国内域名", "苹果中国", "谷歌中国"],
         "action": "route",
-        "server": "dns_direct"
+        "server": "国内DNS"
       },
       {
         "query_type": ["A", "AAAA"],
-        "rule_set": ["google_domain", "telegram_domain", "geolocation_not_cn"],
+        "rule_set": ["谷歌域名", "电报域名", "国外域名"],
         "action": "route",
-        "server": "fakeip"
+        "server": "虚假IP"
       },
       {
-        "rule_set": "geolocation_not_cn",
+        "rule_set": "国外域名",
         "invert": true,
         "action": "evaluate",
-        "server": "dns_direct"
+        "server": "国内DNS"
       },
       {
-        "rule_set": "cn_ip",
+        "rule_set": "国内IP",
         "match_response": true,
         "action": "route",
-        "server": "dns_direct"
+        "server": "国内DNS"
       },
       {
         "query_type": ["A", "AAAA"],
         "action": "route",
-        "server": "fakeip"
+        "server": "虚假IP"
       }
     ],
-    "final": "dns_proxy",
+    "final": "远程DNS",
     "strategy": "prefer_ipv4",
     "optimistic": {
       "enabled": true,
@@ -95,14 +95,14 @@
   },
   "http_clients": [
     {
-      "tag": "proxy_client",
-      "detour": "Proxy"
+      "tag": "代理下载",
+      "detour": "代理"
     }
   ],
   "inbounds": [
     {
       "type": "tun",
-      "tag": "tun-in",
+      "tag": "tun入站",
       "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
       "mtu": 9000,
       "auto_route": true,
@@ -118,7 +118,7 @@
     },
     {
       "type": "mixed",
-      "tag": "mixed-in",
+      "tag": "混合入站",
       "listen": "0.0.0.0",
       "listen_port": 7890,
       "set_system_proxy": false
@@ -127,61 +127,61 @@
   "outbounds": [
     {
       "type": "selector",
-      "tag": "Proxy",
+      "tag": "代理",
       "outbounds": [
-        "Auto",
-        "DIRECT"
+        "自动选择",
+        "直连"
       ],
-      "default": "Auto",
+      "default": "自动选择",
       "interrupt_exist_connections": true
     },
     {
       "type": "selector",
-      "tag": "Google",
+      "tag": "谷歌",
       "outbounds": [
-        "Proxy",
-        "Auto",
-        "DIRECT"
+        "代理",
+        "自动选择",
+        "直连"
       ],
-      "default": "Proxy",
+      "default": "代理",
       "interrupt_exist_connections": true
     },
     {
       "type": "selector",
-      "tag": "Telegram",
+      "tag": "电报",
       "outbounds": [
-        "Proxy",
-        "Auto",
-        "DIRECT"
+        "代理",
+        "自动选择",
+        "直连"
       ],
-      "default": "Proxy",
+      "default": "代理",
       "interrupt_exist_connections": true
     },
     {
       "type": "selector",
-      "tag": "Domestic",
+      "tag": "国内",
       "outbounds": [
-        "DIRECT",
-        "Proxy",
-        "Auto"
+        "直连",
+        "代理",
+        "自动选择"
       ],
-      "default": "DIRECT",
+      "default": "直连",
       "interrupt_exist_connections": true
     },
     {
       "type": "selector",
-      "tag": "Final",
+      "tag": "兜底",
       "outbounds": [
-        "Proxy",
-        "Auto",
-        "DIRECT"
+        "代理",
+        "自动选择",
+        "直连"
       ],
-      "default": "Proxy",
+      "default": "代理",
       "interrupt_exist_connections": true
     },
     {
       "type": "urltest",
-      "tag": "Auto",
+      "tag": "自动选择",
       "outbounds": [],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m0s",
@@ -191,7 +191,7 @@
     },
     {
       "type": "direct",
-      "tag": "DIRECT"
+      "tag": "直连"
     }
   ],
   "route": {
@@ -204,136 +204,141 @@
         "action": "hijack-dns"
       },
       {
+        "network": "icmp",
+        "action": "reject",
+        "method": "default"
+      },
+      {
         "ip_is_private": true,
         "action": "route",
-        "outbound": "DIRECT"
+        "outbound": "直连"
       },
       {
         "clash_mode": "Direct",
         "action": "route",
-        "outbound": "DIRECT"
+        "outbound": "直连"
       },
       {
         "clash_mode": "Global",
         "action": "route",
-        "outbound": "Proxy"
+        "outbound": "代理"
       },
       {
-        "rule_set": "ads",
+        "rule_set": "广告",
         "action": "reject"
       },
       {
-        "rule_set": "private",
+        "rule_set": "私有域名",
         "action": "route",
-        "outbound": "DIRECT"
+        "outbound": "直连"
       },
       {
-        "rule_set": "google_domain",
+        "rule_set": "谷歌域名",
         "action": "route",
-        "outbound": "Google"
+        "outbound": "谷歌"
       },
       {
-        "rule_set": "telegram_domain",
+        "rule_set": "电报域名",
         "action": "route",
-        "outbound": "Telegram"
+        "outbound": "电报"
       },
       {
-        "rule_set": "telegram_ip",
+        "rule_set": "电报IP",
         "action": "route",
-        "outbound": "Telegram"
+        "outbound": "电报"
       },
       {
-        "rule_set": ["cn_domain", "apple_cn", "google_cn"],
+        "rule_set": ["国内域名", "苹果中国", "谷歌中国"],
         "action": "route",
-        "outbound": "Domestic"
+        "outbound": "国内"
       },
       {
-        "rule_set": "cn_ip",
+        "rule_set": "国内IP",
         "action": "route",
-        "outbound": "Domestic"
+        "outbound": "国内"
       },
       {
-        "rule_set": "geolocation_not_cn",
+        "rule_set": "国外域名",
         "action": "route",
-        "outbound": "Final"
+        "outbound": "兜底"
       }
     ],
     "rule_set": [
       {
         "type": "remote",
-        "tag": "geolocation_not_cn",
+        "tag": "国外域名",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "cn_domain",
+        "tag": "国内域名",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "cn_ip",
+        "tag": "国内IP",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "private",
+        "tag": "私有域名",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "google_domain",
+        "tag": "谷歌域名",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "google_cn",
+        "tag": "谷歌中国",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google@cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "apple_cn",
+        "tag": "苹果中国",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-cn.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "telegram_domain",
+        "tag": "电报域名",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "telegram_ip",
+        "tag": "电报IP",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geoip/telegram.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
-        "tag": "ads",
+        "tag": "广告",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads@cn.srs",
         "update_interval": "1d0s"
       }
     ],
-    "final": "Final",
+    "final": "兜底",
     "auto_detect_interface": true,
-    "default_domain_resolver": "dns_direct",
-    "default_http_client": "proxy_client",
+    "default_domain_resolver": "国内DNS",
+    "default_http_client": "代理下载",
     "find_process": false
   },
   "experimental": {
