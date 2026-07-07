@@ -50,15 +50,9 @@
       },
       {
         "query_type": ["A", "AAAA"],
-        "rule_set": ["国内域名", "苹果中国", "谷歌中国"],
+        "rule_set": "国内域名",
         "action": "route",
         "server": "国内DNS"
-      },
-      {
-        "query_type": ["A", "AAAA"],
-        "rule_set": ["谷歌域名", "电报域名", "国外域名"],
-        "action": "route",
-        "server": "虚假IP"
       },
       {
         "rule_set": "国外域名",
@@ -137,28 +131,6 @@
     },
     {
       "type": "selector",
-      "tag": "谷歌",
-      "outbounds": [
-        "代理",
-        "自动选择",
-        "直连"
-      ],
-      "default": "代理",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
-      "tag": "电报",
-      "outbounds": [
-        "代理",
-        "自动选择",
-        "直连"
-      ],
-      "default": "代理",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
       "tag": "国内",
       "outbounds": [
         "直连",
@@ -224,7 +196,7 @@
         "outbound": "代理"
       },
       {
-        "rule_set": "广告",
+        "rule_set": "广告终结",
         "action": "reject"
       },
       {
@@ -233,22 +205,7 @@
         "outbound": "直连"
       },
       {
-        "rule_set": "谷歌域名",
-        "action": "route",
-        "outbound": "谷歌"
-      },
-      {
-        "rule_set": "电报域名",
-        "action": "route",
-        "outbound": "电报"
-      },
-      {
-        "rule_set": "电报IP",
-        "action": "route",
-        "outbound": "电报"
-      },
-      {
-        "rule_set": ["国内域名", "苹果中国", "谷歌中国"],
+        "rule_set": "国内域名",
         "action": "route",
         "outbound": "国内"
       },
@@ -256,26 +213,21 @@
         "rule_set": "国内IP",
         "action": "route",
         "outbound": "国内"
-      },
-      {
-        "rule_set": "国外域名",
-        "action": "route",
-        "outbound": "兜底"
       }
     ],
     "rule_set": [
       {
         "type": "remote",
-        "tag": "国外域名",
+        "tag": "广告终结",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
+        "url": "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-singbox.srs",
         "update_interval": "1d0s"
       },
       {
         "type": "remote",
         "tag": "国内域名",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/cn.srs",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
         "update_interval": "1d0s"
       },
       {
@@ -294,44 +246,9 @@
       },
       {
         "type": "remote",
-        "tag": "谷歌域名",
+        "tag": "国外域名",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs",
-        "update_interval": "1d0s"
-      },
-      {
-        "type": "remote",
-        "tag": "谷歌中国",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google@cn.srs",
-        "update_interval": "1d0s"
-      },
-      {
-        "type": "remote",
-        "tag": "苹果中国",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-cn.srs",
-        "update_interval": "1d0s"
-      },
-      {
-        "type": "remote",
-        "tag": "电报域名",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs",
-        "update_interval": "1d0s"
-      },
-      {
-        "type": "remote",
-        "tag": "电报IP",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geoip/telegram.srs",
-        "update_interval": "1d0s"
-      },
-      {
-        "type": "remote",
-        "tag": "广告",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads@cn.srs",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
         "update_interval": "1d0s"
       }
     ],
