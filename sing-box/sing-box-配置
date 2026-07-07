@@ -109,8 +109,7 @@
   },
   "http_clients": [
     {
-      "tag": "直连下载",
-      "detour": "直连"
+      "tag": "直连下载"
     }
   ],
   "inbounds": [
