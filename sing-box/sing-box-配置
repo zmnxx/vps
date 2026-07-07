@@ -1,0 +1,353 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns_proxy",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "Proxy"
+      },
+      {
+        "type": "https",
+        "tag": "dns_direct",
+        "server": "223.5.5.5",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "local",
+        "tag": "local"
+      },
+      {
+        "type": "fakeip",
+        "tag": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "server": "local"
+      },
+      {
+        "clash_mode": "Global",
+        "action": "route",
+        "server": "fakeip"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "rule_set": "private",
+        "action": "route",
+        "server": "local"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "rule_set": ["cn_domain", "apple_cn", "google_cn"],
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "rule_set": ["google_domain", "telegram_domain", "geolocation_not_cn"],
+        "action": "route",
+        "server": "fakeip"
+      },
+      {
+        "rule_set": "geolocation_not_cn",
+        "invert": true,
+        "action": "evaluate",
+        "server": "dns_direct"
+      },
+      {
+        "rule_set": "cn_ip",
+        "match_response": true,
+        "action": "route",
+        "server": "dns_direct"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "action": "route",
+        "server": "fakeip"
+      }
+    ],
+    "final": "dns_proxy",
+    "strategy": "prefer_ipv4",
+    "optimistic": {
+      "enabled": true,
+      "timeout": "3d"
+    },
+    "timeout": "10s",
+    "reverse_mapping": true
+  },
+  "ntp": {
+    "enabled": true,
+    "interval": "30m0s",
+    "server": "time.aliyun.com",
+    "server_port": 123
+  },
+  "http_clients": [
+    {
+      "tag": "proxy_client",
+      "detour": "Proxy"
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed",
+      "platform": {
+        "http_proxy": {
+          "enabled": true,
+          "server": "127.0.0.1",
+          "server_port": 7890
+        }
+      }
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "listen_port": 7890,
+      "set_system_proxy": false
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "Proxy",
+      "outbounds": [
+        "Auto",
+        "DIRECT"
+      ],
+      "default": "Auto",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "Google",
+      "outbounds": [
+        "Proxy",
+        "Auto",
+        "DIRECT"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "Telegram",
+      "outbounds": [
+        "Proxy",
+        "Auto",
+        "DIRECT"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "Domestic",
+      "outbounds": [
+        "DIRECT",
+        "Proxy",
+        "Auto"
+      ],
+      "default": "DIRECT",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "Final",
+      "outbounds": [
+        "Proxy",
+        "Auto",
+        "DIRECT"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "urltest",
+      "tag": "Auto",
+      "outbounds": [],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m0s",
+      "tolerance": 50,
+      "idle_timeout": "30m0s",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "direct",
+      "tag": "DIRECT"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "clash_mode": "Global",
+        "action": "route",
+        "outbound": "Proxy"
+      },
+      {
+        "rule_set": "ads",
+        "action": "reject"
+      },
+      {
+        "rule_set": "private",
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": "google_domain",
+        "action": "route",
+        "outbound": "Google"
+      },
+      {
+        "rule_set": "telegram_domain",
+        "action": "route",
+        "outbound": "Telegram"
+      },
+      {
+        "rule_set": "telegram_ip",
+        "action": "route",
+        "outbound": "Telegram"
+      },
+      {
+        "rule_set": ["cn_domain", "apple_cn", "google_cn"],
+        "action": "route",
+        "outbound": "Domestic"
+      },
+      {
+        "rule_set": "cn_ip",
+        "action": "route",
+        "outbound": "Domestic"
+      },
+      {
+        "rule_set": "geolocation_not_cn",
+        "action": "route",
+        "outbound": "Final"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geolocation_not_cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "cn_domain",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/cn.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "cn_ip",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "private",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "google_domain",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "google_cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google@cn.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "apple_cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-cn.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "telegram_domain",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "telegram_ip",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geoip/telegram.srs",
+        "update_interval": "1d0s"
+      },
+      {
+        "type": "remote",
+        "tag": "ads",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads@cn.srs",
+        "update_interval": "1d0s"
+      }
+    ],
+    "final": "Final",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns_direct",
+    "default_http_client": "proxy_client",
+    "find_process": false
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true,
+      "store_dns": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "default_mode": "Rule",
+      "external_ui": "ui",
+      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+    }
+  }
+}
