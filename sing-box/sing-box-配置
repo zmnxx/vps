@@ -1,7 +1,6 @@
 {
   "log": {
-    "level": "warn",
-    "output": "sing-box.log",
+    "level": "info",
     "timestamp": true
   },
   "dns": {
@@ -12,172 +11,122 @@
       },
       {
         "type": "local",
-        "tag": "本地"
+        "tag": "本地",
+        "neighbor_domain": [
+          ".",
+          ".lan"
+        ]
       },
       {
-        "type": "tls",
+        "type": "udp",
         "tag": "阿里",
         "server": "223.5.5.5",
-        "server_port": 853,
-        "tls": {
-          "enabled": true,
-          "server_name": "dns.alidns.com"
-        }
+        "server_port": 53,
+        "detour": "直连"
       },
       {
-        "type": "tls",
+        "type": "udp",
         "tag": "腾讯",
-        "server": "1.12.12.12",
-        "server_port": 853,
-        "tls": {
-          "enabled": true,
-          "server_name": "dot.pub"
-        }
+        "server": "119.29.29.29",
+        "server_port": 53,
+        "detour": "直连"
       },
       {
-        "type": "tls",
+        "type": "https",
         "tag": "谷歌",
         "server": "8.8.8.8",
-        "server_port": 853,
-        "tls": {
-          "enabled": true,
-          "server_name": "dns.google"
-        },
-        "detour": "proxy"
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "Proxy"
       },
       {
-        "type": "tls",
+        "type": "https",
         "tag": "Cloudflare",
         "server": "1.1.1.1",
-        "server_port": 853,
-        "tls": {
-          "enabled": true,
-          "server_name": "one.one.one.one"
-        },
-        "detour": "proxy"
-      },
-      {
-        "type": "udp",
-        "tag": "国内-DNS",
-        "server": "223.5.5.5",
-        "server_port": 53
-      },
-      {
-        "type": "udp",
-        "tag": "国外-DNS",
-        "server": "8.8.8.8",
-        "server_port": 53,
-        "detour": "proxy"
-      },
-      {
-        "type": "fakeip",
-        "tag": "fakeip",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "Proxy"
       }
     ],
     "rules": [
       {
-        "preferred_by": "hosts",
-        "server": "hosts"
+        "preferred_by": [
+          "hosts",
+          "本地"
+        ],
+        "action": "route",
+        "server": "本地"
       },
       {
         "clash_mode": "Direct",
-        "server": "本地"
+        "action": "route",
+        "server": "阿里"
       },
       {
         "clash_mode": "Global",
-        "server": "fakeip"
-      },
-      {
-        "type": "logical",
-        "mode": "and",
-        "rules": [
-          {
-            "clash_mode": "AllowAds",
-            "invert": true
-          },
-          {
-            "rule_set": "ads"
-          }
-        ],
-        "action": "predefined"
+        "action": "route",
+        "server": "谷歌"
       },
       {
         "domain_suffix": [
+          ".lan",
           ".local",
-          ".lan"
-        ],
-        "rule_set": "private",
-        "server": "本地"
-      },
-      {
-        "domain_suffix": [
-          "tplogin.cn",
+          "local",
+          "localhost",
           "router.asus.com",
-          "tendawifi.com",
+          "tplogin.cn",
           "tplinkwifi.net",
           "miwifi.com"
         ],
-        "rule_set": [
-          "国内域名",
-          "apple_cn"
-        ],
         "action": "route",
-        "server": "国内-DNS",
-        "disable_optimistic_cache": false
-      },
-      {
-        "rule_set": "国内域名",
-        "action": "route",
-        "server": "国内-DNS",
-        "disable_optimistic_cache": false
-      },
-      {
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "rule_set": "代理域名",
-        "server": "fakeip"
-      },
-      {
-        "rule_set": "代理域名",
-        "invert": true,
-        "action": "evaluate",
-        "server": "国外-DNS",
-        "client_subnet": "114.114.114.114/24"
-      },
-      {
-        "rule_set": "国内IP",
-        "match_response": true,
         "server": "本地"
       },
       {
-        "query_type": [
-          "A",
-          "AAAA"
+        "rule_set": [
+          "广告"
         ],
-        "server": "fakeip"
+        "action": "predefined",
+        "rcode": "NOERROR"
       },
       {
-        "server": "国外-DNS"
+        "rule_set": [
+          "私有域名",
+          "国内域名",
+          "苹果国内",
+          "微软国内"
+        ],
+        "action": "route",
+        "server": "阿里"
+      },
+      {
+        "rule_set": [
+          "谷歌域名",
+          "代理域名"
+        ],
+        "action": "route",
+        "server": "谷歌"
       }
     ],
-    "final": "国外-DNS",
+    "final": "Cloudflare",
     "strategy": "prefer_ipv4",
-    "optimistic": true
+    "cache_capacity": 4096,
+    "optimistic": {
+      "enabled": true,
+      "timeout": "3d"
+    },
+    "timeout": "5s"
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "ntp.aliyun.com",
+    "server_port": 123,
+    "interval": "30m"
   },
   "http_clients": [
     {
-      "tag": "代理客户端",
+      "tag": "规则下载",
       "version": 2,
-      "headers": {
-        "Authorization": ""
-      },
-      "detour": "proxy",
-      "stream_receive_window": 0,
-      "connection_receive_window": 0
+      "detour": "直连"
     }
   ],
   "inbounds": [
@@ -189,251 +138,259 @@
         "fdfe:dcba:9876::1/126"
       ],
       "mtu": 9000,
+      "dns_mode": "hijack",
       "auto_route": true,
       "strict_route": true,
       "endpoint_independent_nat": false,
-      "udp_timeout": "5m",
-      "sniff": true,
+      "stack": "mixed",
       "platform": {
         "http_proxy": {
           "enabled": true,
           "server": "127.0.0.1",
-          "server_port": 7890
+          "server_port": 7890,
+          "bypass_domain": [
+            "localhost",
+            "127.0.0.1",
+            "*.local",
+            "*.lan"
+          ]
         }
       }
     },
     {
       "type": "mixed",
-      "tag": "入站",
+      "tag": "混合入站",
       "listen": "127.0.0.1",
-      "listen_port": 7890,
-      "sniff": true
+      "listen_port": 7890
     }
   ],
   "outbounds": [
     {
       "type": "selector",
-      "tag": "proxy",
-      "outbounds": [],
-      "default": "自动选择",
-      "interrupt_exist_connections": false
+      "tag": "Proxy",
+      "outbounds": [
+        "自动选择"
+      ],
+      "default": "自动选择"
     },
     {
       "type": "urltest",
       "tag": "自动选择",
-      "outbounds": [],
+      "outbounds": [
+        "直连"
+      ],
       "url": "https://www.gstatic.com/generate_204",
-      "interval": "3m",
+      "interval": "5m",
       "tolerance": 50,
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
       "tag": "国内",
       "outbounds": [
-        "直连"
+        "直连",
+        "Proxy",
+        "自动选择"
       ],
-      "default": "直连",
-      "interrupt_exist_connections": false
+      "default": "直连"
     },
     {
       "type": "selector",
       "tag": "谷歌",
       "outbounds": [
-        "proxy",
-        "自动选择"
+        "Proxy",
+        "自动选择",
+        "直连"
       ],
-      "default": "proxy",
-      "interrupt_exist_connections": false
+      "default": "Proxy"
     },
     {
       "type": "selector",
       "tag": "兜底",
       "outbounds": [
-        "proxy",
+        "Proxy",
         "自动选择",
         "直连"
       ],
-      "default": "proxy",
-      "interrupt_exist_connections": false
+      "default": "Proxy"
     },
     {
       "type": "direct",
       "tag": "直连"
     },
     {
-      "type": "dns",
-      "tag": "dns-out"
-    },
-    {
       "type": "block",
-      "tag": "广告拦截"
+      "tag": "拦截"
     }
   ],
   "route": {
     "rules": [
       {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "protocol": "dns"
+          },
+          {
+            "port": 53
+          }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "network": "icmp",
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
         "ip_is_private": true,
+        "action": "route",
         "outbound": "直连"
       },
       {
         "clash_mode": "Direct",
+        "action": "route",
         "outbound": "直连"
       },
       {
         "clash_mode": "Global",
-        "outbound": "proxy"
+        "action": "route",
+        "outbound": "Proxy"
       },
       {
-        "rule_set": "国内IP",
-        "outbound": "国内"
+        "action": "sniff",
+        "timeout": "300ms"
       },
       {
-        "rule_set": "谷歌域名",
+        "rule_set": [
+          "广告"
+        ],
+        "action": "reject",
+        "method": "default"
+      },
+      {
+        "rule_set": [
+          "私有域名"
+        ],
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "rule_set": [
+          "谷歌域名",
+          "谷歌IP"
+        ],
+        "action": "route",
         "outbound": "谷歌"
       },
       {
-        "rule_set": "广告域名",
-        "outbound": "广告拦截"
-      },
-      {
-        "action": "sniff"
-      },
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
-      {
-        "type": "logical",
-        "mode": "and",
-        "rules": [
-          {
-            "protocol": "stun"
-          },
-          {
-            "rule_set": "国内IP",
-            "invert": true
-          }
+        "rule_set": [
+          "国内域名",
+          "国内IP",
+          "苹果国内",
+          "微软国内"
         ],
-        "action": "reject"
-      },
-      {
-        "domain": "captive.apple.com",
-        "outbound": "直连"
-      },
-      {
-        "domain_suffix": [
-          "tplinkwifi.net",
-          "tplogin.cn",
-          "router.asus.com",
-          "tendawifi.com",
-          "miwifi.com"
-        ],
-        "outbound": "直连"
-      },
-      {
-        "domain_suffix": ".cn",
-        "rule_set": "国内域名",
+        "action": "route",
         "outbound": "国内"
       },
       {
-        "rule_set": "代理域名",
-        "outbound": "proxy"
-      },
-      {
-        "rule_set": "OpenAI域名",
-        "outbound": "proxy"
+        "rule_set": [
+          "代理域名"
+        ],
+        "action": "route",
+        "outbound": "Proxy"
       }
     ],
     "rule_set": [
       {
         "type": "remote",
+        "tag": "广告",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-singbox.srs",
+        "http_client": "规则下载",
+        "update_interval": "12h"
+      },
+      {
+        "type": "remote",
+        "tag": "私有域名",
+        "format": "binary",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
+        "http_client": "规则下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
         "tag": "国内域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       },
       {
         "type": "remote",
         "tag": "国内IP",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       },
       {
         "type": "remote",
         "tag": "代理域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       },
       {
         "type": "remote",
         "tag": "谷歌域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "OpenAI域名",
+        "tag": "谷歌IP",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ai-chat-!cn.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "apple_cn",
+        "tag": "苹果国内",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/apple-cn.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-cn.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "广告域名",
+        "tag": "微软国内",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
-        "http_client": "代理客户端",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "ads",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
-        "http_client": "代理客户端",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "private",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
-        "http_client": "代理客户端",
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/microsoft@cn.srs",
+        "http_client": "规则下载",
         "update_interval": "1d"
       }
     ],
     "final": "兜底",
     "auto_detect_interface": true,
-    "default_domain_resolver": "国内-DNS",
-    "default_http_client": "代理客户端"
+    "default_domain_resolver": "阿里",
+    "default_http_client": "规则下载"
   },
   "experimental": {
     "cache_file": {
       "enabled": true,
-      "store_fakeip": true,
-      "store_dns": true
+      "store_fakeip": false
     },
     "clash_api": {
       "external_controller": "127.0.0.1:9090",
-      "external_ui": "zashboard",
-      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip",
+      "external_ui": "dashboard",
+      "external_ui_download_url": "https://ghfast.top/https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip",
+      "external_ui_download_detour": "直连",
       "secret": "",
       "default_mode": "Rule",
       "access_control_allow_origin": [
