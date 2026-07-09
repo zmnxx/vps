@@ -3,51 +3,37 @@
     "level": "info",
     "timestamp": true
   },
-  "ntp": {
-    "enabled": true,
-    "server": "ntp.aliyun.com",
-    "server_port": 123,
-    "interval": "30m",
-    "detour": "直连"
-  },
   "dns": {
     "servers": [
       {
         "type": "https",
         "tag": "阿里DNS",
-        "server": "223.5.5.5",
-        "server_port": 443,
-        "path": "/dns-query",
+        "server": "https://223.5.5.5/dns-query",
         "detour": "直连"
       },
       {
         "type": "https",
         "tag": "腾讯DNS",
-        "server": "doh.pub",
-        "server_port": 443,
-        "path": "/dns-query",
+        "server": "https://doh.pub/dns-query",
         "detour": "直连"
       },
       {
         "type": "https",
         "tag": "谷歌DNS",
-        "server": "8.8.8.8",
-        "server_port": 443,
-        "path": "/dns-query",
+        "server": "https://8.8.8.8/dns-query",
         "detour": "代理总出口"
       },
       {
         "type": "https",
         "tag": "CloudflareDNS",
-        "server": "1.1.1.1",
-        "server_port": 443,
-        "path": "/dns-query",
+        "server": "https://1.1.1.1/dns-query",
         "detour": "代理总出口"
       },
       {
         "type": "fakeip",
         "tag": "FakeIP",
-        "inet4_range": "198.18.0.0/15"
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
       }
     ],
     "rules": [
@@ -63,18 +49,9 @@
       },
       {
         "clash_mode": "AllowAds",
-        "rule_set": [
-          "广告拦截"
-        ],
-        "action": "route",
-        "server": "阿里DNS"
-      },
-      {
-        "rule_set": [
-          "广告拦截"
-        ],
-        "action": "predefined",
-        "rcode": "NXDOMAIN"
+        "invert": true,
+        "rule_set": "广告拦截",
+        "action": "reject"
       },
       {
         "rule_set": [
@@ -89,20 +66,15 @@
         "domain_suffix": [
           ".local",
           ".lan",
-          "router.asus.com",
-          "tplogin.cn",
           "miwifi.com",
-          "tendawifi.com",
-          "melogin.cn",
-          "falogin.cn"
+          "router.asus.com",
+          "tplogin.cn"
         ],
         "action": "route",
         "server": "阿里DNS"
       },
       {
-        "rule_set": [
-          "代理域名"
-        ],
+        "rule_set": "代理域名",
         "query_type": [
           "A",
           "AAAA"
@@ -111,19 +83,10 @@
         "server": "FakeIP"
       },
       {
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "action": "evaluate",
-        "server": "阿里DNS"
-      },
-      {
+        "rule_set": "中国IP段",
         "match_response": true,
-        "rule_set": [
-          "中国IP段"
-        ],
-        "action": "respond"
+        "action": "route",
+        "server": "阿里DNS"
       },
       {
         "query_type": [
@@ -134,20 +97,18 @@
         "server": "FakeIP"
       }
     ],
-    "final": "阿里DNS",
-    "independent_cache": true
+    "independent_cache": true,
+    "final": "阿里DNS"
   },
   "inbounds": [
     {
       "type": "tun",
-      "tag": "虚拟网卡",
+      "tag": "Tun入口",
       "address": [
         "172.18.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
-      "mtu": 9000,
       "auto_route": true,
-      "strict_route": true,
       "stack": "mixed"
     }
   ],
@@ -156,11 +117,12 @@
       "type": "selector",
       "tag": "代理总出口",
       "outbounds": [
-        "<all_proxy_nodes>",
         "自动选择",
+        "<all_proxy_nodes>",
         "直连"
       ],
-      "default": "自动选择"
+      "default": "自动选择",
+      "interrupt_exist_connections": true
     },
     {
       "type": "urltest",
@@ -184,15 +146,18 @@
         "代理总出口",
         "自动选择"
       ],
-      "default": "直连"
+      "default": "直连",
+      "interrupt_exist_connections": true
     },
     {
       "type": "selector",
       "tag": "谷歌服务",
       "outbounds": [
-        "代理总出口"
+        "代理总出口",
+        "自动选择"
       ],
-      "default": "代理总出口"
+      "default": "代理总出口",
+      "interrupt_exist_connections": true
     },
     {
       "type": "selector",
@@ -201,7 +166,8 @@
         "代理总出口",
         "直连"
       ],
-      "default": "代理总出口"
+      "default": "代理总出口",
+      "interrupt_exist_connections": true
     },
     {
       "type": "block",
@@ -209,19 +175,13 @@
     }
   ],
   "route": {
-    "auto_detect_interface": true,
     "rules": [
       {
-        "type": "logical",
-        "mode": "or",
-        "rules": [
-          {
-            "protocol": "dns"
-          },
-          {
-            "port": 53
-          }
-        ],
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "port": 53,
         "action": "hijack-dns"
       },
       {
@@ -234,16 +194,25 @@
         "mode": "and",
         "rules": [
           {
-            "network": "udp",
-            "port": [
-              443,
-              853
-            ]
+            "port": 853
           },
           {
-            "rule_set": [
-              "中国IP段"
-            ],
+            "rule_set": "中国IP段",
+            "invert": true
+          }
+        ],
+        "action": "reject"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "network": "udp",
+            "port": 443
+          },
+          {
+            "rule_set": "中国IP段",
             "invert": true
           }
         ],
@@ -260,9 +229,7 @@
         "outbound": "直连"
       },
       {
-        "rule_set": [
-          "中国IP段"
-        ],
+        "rule_set": "中国IP段",
         "action": "route",
         "outbound": "直连"
       },
@@ -277,28 +244,16 @@
             "protocol": "stun"
           },
           {
-            "rule_set": [
-              "中国IP段"
-            ],
+            "rule_set": "中国IP段",
             "invert": true
           }
         ],
         "action": "reject"
       },
       {
-        "type": "logical",
-        "mode": "and",
-        "rules": [
-          {
-            "clash_mode": "AllowAds",
-            "invert": true
-          },
-          {
-            "rule_set": [
-              "广告拦截"
-            ]
-          }
-        ],
+        "clash_mode": "AllowAds",
+        "invert": true,
+        "rule_set": "广告拦截",
         "action": "reject"
       },
       {
@@ -310,28 +265,21 @@
         "outbound": "谷歌服务"
       },
       {
-        "rule_set": [
-          "微软中国"
-        ],
+        "rule_set": "微软中国",
         "action": "route",
         "outbound": "微软服务"
       },
       {
-        "rule_set": [
-          "中国域名"
-        ],
+        "rule_set": "中国域名",
         "action": "route",
         "outbound": "直连"
       },
       {
-        "rule_set": [
-          "代理域名"
-        ],
+        "rule_set": "代理域名",
         "action": "route",
         "outbound": "代理总出口"
       }
     ],
-    "final": "兜底策略",
     "rule_set": [
       {
         "type": "remote",
@@ -389,7 +337,10 @@
         "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
         "download_detour": "直连"
       }
-    ]
+    ],
+    "auto_detect_interface": true,
+    "default_domain_resolver": "阿里DNS",
+    "final": "兜底策略"
   },
   "experimental": {
     "clash_api": {
