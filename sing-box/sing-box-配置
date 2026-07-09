@@ -1,6 +1,6 @@
 {
   "log": {
-    "level": "warn",
+    "level": "info",
     "output": "sing-box.log",
     "timestamp": true
   },
@@ -126,8 +126,7 @@
         "fdfe:dcba:9876::1/126"
       ],
       "auto_route": true,
-      "strict_route": true,
-      "stack": "mixed",
+      "stack": "system",
       "loopback_address": "10.7.0.1",
       "platform": {
         "http_proxy": {
@@ -154,8 +153,10 @@
       "type": "urltest",
       "tag": "自动选择",
       "outbounds": [],
-      "interval": "2m0s",
-      "tolerance": 50
+      "interval": "3m0s",
+      "tolerance": 80,
+      "url": "https://www.gstatic.com/generate_204",
+      "idle_timeout": "10m0s"
     },
     {
       "type": "selector",
@@ -244,11 +245,6 @@
         "outbound": "国内"
       },
       {
-        "network": "icmp",
-        "action": "bypass",
-        "outbound": "直连"
-      },
-      {
         "action": "sniff"
       }
     ],
@@ -272,28 +268,28 @@
         "tag": "谷歌域名",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
-        "http_client": "代理HTTP客户端"
+        "http_client": "直连HTTP客户端"
       },
       {
         "type": "remote",
         "tag": "谷歌IP",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
-        "http_client": "代理HTTP客户端"
+        "http_client": "直连HTTP客户端"
       },
       {
         "type": "remote",
         "tag": "电报域名",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/telegram.srs",
-        "http_client": "代理HTTP客户端"
+        "http_client": "直连HTTP客户端"
       },
       {
         "type": "remote",
         "tag": "电报IP",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/telegram.srs",
-        "http_client": "代理HTTP客户端"
+        "http_client": "直连HTTP客户端"
       },
       {
         "type": "remote",
@@ -307,13 +303,13 @@
         "tag": "代理域名",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "http_client": "代理HTTP客户端"
+        "http_client": "直连HTTP客户端"
       }
     ],
     "final": "兜底",
     "auto_detect_interface": true,
     "default_domain_resolver": "直连DNS-阿里",
-    "default_http_client": "代理HTTP客户端"
+    "default_http_client": "直连HTTP客户端"
   },
   "experimental": {
     "cache_file": {
@@ -322,9 +318,9 @@
     },
     "clash_api": {
       "external_controller": "127.0.0.1:9090",
-      "external_ui": "面板",
+      "external_ui": "ui",
       "external_ui_download_url": "https://ghfast.top/https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip",
-      "external_ui_download_detour": "Proxy"
+      "external_ui_download_detour": "直连"
     }
   }
 }
