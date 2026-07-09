@@ -1,127 +1,362 @@
-/**
- * Sub-Store sing-box 模板脚本 (v1.14.0-alpha.41)
- *
- * 优化自: https://cdn.jsdelivr.net/gh/Sheldontao/Scripts@refs/heads/main/sub-store-template/1.12or13/sing-box.js
- *
- * 主要改进:
- * 1. 不分组, 全部节点注入到 "Proxy" (selector) 和 "自动选择" (urltest)
- * 2. 关键字过滤: 剔除机场订阅中的信息节点(剩余流量/套餐到期/官网地址等)
- * 3. 空策略组兜底: 自动填充 COMPATIBLE 直连出站, 避免 selector/urltest 无节点导致启动失败
- * 4. 兼容 sing-box 1.14.0-alpha.41 配置规范
- *
- * Sub-Store 用法:
- *   - 订阅类型: sing-box
- *   - 模板文件: 上传 sing-box-template.json 作为 $files[0]
- *   - 节点注入脚本: 本文件
- *   - arguments: name=你的订阅名&type=sing-box
- */
-
-const { type, name } = $arguments;
-
-// 兜底直连出站: 当策略组为空时自动填充, 防止启动报错
-const compatible_outbound = {
-  tag: "COMPATIBLE",
-  type: "direct",
-};
-
-// ============================================================
-// 关键字过滤: 匹配以下关键词的节点将被剔除
-// 覆盖范围:
-//   - 流量信息: 流量/剩余/已用/余量/GB/TB/MB/KB
-//   - 到期提醒: 到期/过期/续费/重置/expire/expir
-//   - 官网信息: 官网/网址/官址/域名/网址/获取/订阅/说明/群
-//   - 套餐信息: 套餐/会员/购买/机场/plan/account/subscription
-//   - 日期格式: 2024-01-01 等纯日期节点
-//   - 其他杂项: 检测/测试/实验/解锁/remain/reset/traffic
-// ============================================================
-const FILTER_REGEX = /(?:流量|剩余|到期|余量|续费|过期|重置|官网|网址|官址|获取|订阅|说明|套餐|会员|购买|机场|群|域名|解锁|检测|测试|实验|已用|时间|通知|公告|提醒|更新|频道|教程|博客|expire|expir|traffic|remain|reset|account|plan|balance|bandwidth|subscription|notify|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d+\s*(?:GB|TB|MB|KB|gb|tb|mb|kb))/i;
-
-// 备用精确过滤名单: 节点名完全匹配以下字符串的将被剔除
-const EXACT_BLOCKLIST = [
-  "网址",
-  "官网",
-  "流量",
-  "到期",
-  "续费",
-  "套餐",
-  "订阅",
-  "说明",
-];
-
-let compatible;
-let config = JSON.parse($files[0]);
-
-// 通过 Sub-Store API 获取节点列表
-let proxies = await produceArtifact({
-  name,
-  type: /^1$|col/i.test(type) ? "collection" : "subscription",
-  platform: "sing-box",
-  produceType: "internal",
-});
-
-// ============================================================
-// 节点过滤: 剔除信息节点, 只保留真实代理节点
-// ============================================================
-proxies = proxies.filter((p) => {
-  const tag = p.tag || "";
-  // 排除空标签节点
-  if (!tag.trim()) return false;
-  // 排除包含信息关键词的节点
-  if (FILTER_REGEX.test(tag)) return false;
-  // 排除精确匹配黑名单的节点
-  if (EXACT_BLOCKLIST.some((kw) => tag === kw)) return false;
-  // 排除纯数字节点名(一些机场用纯数字做信息节点)
-  if (/^\d+$/.test(tag.trim())) return false;
-  return true;
-});
-
-// ============================================================
-// 节点注入: 全部注入到 Proxy(selector) 和 自动选择(urltest)
-// ============================================================
-const proxyTags = proxies.map((p) => p.tag);
-
-config.outbounds.push(...proxies);
-
-config.outbounds.map((i) => {
-  if (["Proxy"].includes(i.tag)) {
-    // Proxy selector: "自动选择" 放在最前面, 然后是所有真实节点 + 直连
-    i.outbounds = ["自动选择", ...proxyTags, "直连"];
-  }
-  if (["自动选择"].includes(i.tag)) {
-    // urltest: 注入所有真实节点进行延迟测试
-    i.outbounds.push(...proxyTags);
-  }
-});
-
-// ============================================================
-// 空策略组兜底: 检测所有 selector/urltest, 若 outbounds 为空则填充 COMPATIBLE
-// ============================================================
-config.outbounds.forEach((outbound) => {
-  if (
-    (outbound.type === "selector" || outbound.type === "urltest") &&
-    Array.isArray(outbound.outbounds) &&
-    outbound.outbounds.length === 0
-  ) {
-    if (!compatible) {
-      config.outbounds.push(compatible_outbound);
-      compatible = true;
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "阿里DNS",
+        "server": "223.5.5.5",
+        "server_port": 53,
+        "detour": "直连"
+      },
+      {
+        "type": "udp",
+        "tag": "腾讯DNS",
+        "server": "119.29.29.29",
+        "server_port": 53,
+        "detour": "直连"
+      },
+      {
+        "type": "https",
+        "tag": "谷歌DNS",
+        "server": "dns.google",
+        "server_port": 443,
+        "domain_resolver": "阿里DNS",
+        "detour": "Proxy"
+      },
+      {
+        "type": "https",
+        "tag": "CloudflareDNS",
+        "server": "cloudflare-dns.com",
+        "server_port": 443,
+        "domain_resolver": "阿里DNS",
+        "detour": "Proxy"
+      },
+      {
+        "type": "fakeip",
+        "tag": "FakeIP",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "clash_mode": "direct",
+        "action": "route",
+        "server": "阿里DNS"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "server": "谷歌DNS"
+      },
+      {
+        "rule_set": "广告拦截",
+        "action": "reject",
+        "method": "default"
+      },
+      {
+        "rule_set": [
+          "中国域名"
+        ],
+        "action": "route",
+        "server": "阿里DNS"
+      },
+      {
+        "rule_set": [
+          "谷歌域名"
+        ],
+        "action": "route",
+        "server": "谷歌DNS"
+      },
+      {
+        "rule_set": [
+          "微软域名"
+        ],
+        "action": "route",
+        "server": "谷歌DNS"
+      },
+      {
+        "rule_set": [
+          "国外域名"
+        ],
+        "action": "route",
+        "server": "谷歌DNS"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "FakeIP"
+      }
+    ],
+    "final": "谷歌DNS",
+    "strategy": "prefer_ipv4",
+    "optimistic": true,
+    "timeout": "10s",
+    "reverse_mapping": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.18.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 9000,
+      "dns_mode": "hijack",
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system",
+      "endpoint_independent_nat": true,
+      "udp_timeout": "5m"
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890,
+      "set_system_proxy": false
     }
-    outbound.outbounds.push(compatible_outbound.tag);
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "Proxy",
+      "outbounds": [
+        "自动选择"
+      ],
+      "default": "自动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "urltest",
+      "tag": "自动选择",
+      "outbounds": [],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 50,
+      "idle_timeout": "30m",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "广告拦截",
+      "outbounds": [
+        "拒绝",
+        "直连"
+      ],
+      "default": "拒绝",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "国内直连",
+      "outbounds": [
+        "直连"
+      ],
+      "default": "直连",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "微软服务",
+      "outbounds": [
+        "Proxy",
+        "直连"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "谷歌服务",
+      "outbounds": [
+        "Proxy"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "兜底策略",
+      "outbounds": [
+        "Proxy",
+        "直连"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "direct",
+      "tag": "直连"
+    },
+    {
+      "type": "block",
+      "tag": "拒绝"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "clash_mode": "direct",
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "outbound": "Proxy"
+      },
+      {
+        "rule_set": "广告拦截",
+        "action": "route",
+        "outbound": "广告拦截"
+      },
+      {
+        "rule_set": "私有网络",
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "rule_set": [
+          "中国IP",
+          "中国域名"
+        ],
+        "action": "route",
+        "outbound": "国内直连"
+      },
+      {
+        "rule_set": "微软域名",
+        "action": "route",
+        "outbound": "微软服务"
+      },
+      {
+        "rule_set": [
+          "谷歌域名",
+          "谷歌IP"
+        ],
+        "action": "route",
+        "outbound": "谷歌服务"
+      },
+      {
+        "rule_set": "国外域名",
+        "action": "route",
+        "outbound": "Proxy"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "直连"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "中国IP",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "中国域名",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "谷歌域名",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-google.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "谷歌IP",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/you-oops-dev/ipranges-singbox@main/google/google.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "微软域名",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-microsoft@cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "国外域名",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-geolocation-!cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "inline",
+        "tag": "私有网络",
+        "rules": [
+          {
+            "ip_cidr": [
+              "10.0.0.0/8",
+              "172.16.0.0/12",
+              "192.168.0.0/16",
+              "100.64.0.0/10",
+              "127.0.0.0/8",
+              "169.254.0.0/16",
+              "224.0.0.0/4",
+              "fc00::/7",
+              "fe80::/10",
+              "::1/128"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "remote",
+        "tag": "广告拦截",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
+        "update_interval": "1d"
+      }
+    ],
+    "final": "兜底策略",
+    "auto_detect_interface": true,
+    "find_process": false,
+    "default_domain_resolver": "阿里DNS"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "cache_id": "sing-box-profile",
+      "store_fakeip": true,
+      "store_dns": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "ui",
+      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
+      "external_ui_download_detour": "直连",
+      "default_mode": "rule",
+      "access_control_allow_origin": [
+        "*"
+      ],
+      "access_control_allow_private_network": true
+    }
   }
-});
-
-// ============================================================
-// Proxy selector 默认指向 "自动选择"
-// 自动选择 urltest 会自动测速选择最优节点
-// ============================================================
-config.outbounds.forEach((outbound) => {
-  if (
-    outbound.tag === "Proxy" &&
-    outbound.outbounds &&
-    outbound.outbounds.includes("自动选择")
-  ) {
-    outbound.default = "自动选择";
-  }
-});
-
-$content = JSON.stringify(config, null, 2);
+}
