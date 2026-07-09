@@ -11,55 +11,40 @@ let proxies = await produceArtifact({
   produceType: "internal",
 });
 
-// 将所有节点合并加入 outbounds 列表中
-config.outbounds.push(...proxies);
+// 需要剔除的机场订阅信息类关键词（中英文都覆盖）
+const excludeRegex = /网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|expire|traffic|reset|subscription|plan/i;
 
-// 提取所有节点的 tag
-const allProxyTags = proxies.map(p => p.tag);
+// 过滤掉订阅信息类节点，只保留真正的代理节点
+const validProxies = proxies.filter(p => !excludeRegex.test(p.tag));
+const allProxyTags = validProxies.map(p => p.tag);
 
-// 香港节点正则
-const hkRegex = /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(hk|hong.*kong)\b|港|香港|🇭🇰)/i;
-// 台湾节点正则
-const twRegex = /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(tw|taiwan)\b|🇹🇼|台|台湾)/i;
-// 日本节点正则
-const jpRegex = /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(jp|japan)\b|日本|日|🇯🇵)/i;
-// 新加坡节点正则
-const sgRegex = /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(sg|singapore)\b|🇸🇬|新加坡|新)/i;
-// 美国节点正则
-const usRegex = /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|kr|korea|韩国)).*(\b(us|united.*states)\b|美|美国|🇺🇸)/i;
+// 将真实节点合并加入 outbounds 列表
+config.outbounds.push(...validProxies);
 
-const hkTags = proxies.filter(p => hkRegex.test(p.tag)).map(p => p.tag);
-const twTags = proxies.filter(p => twRegex.test(p.tag)).map(p => p.tag);
-const jpTags = proxies.filter(p => jpRegex.test(p.tag)).map(p => p.tag);
-const sgTags = proxies.filter(p => sgRegex.test(p.tag)).map(p => p.tag);
-const usTags = proxies.filter(p => usRegex.test(p.tag)).map(p => p.tag);
-
-// 遍历出站列表，填充 Proxy 组和自动选择组
+// 遍历出站列表，将所有节点填充到 Proxy 组和"自动选择"组中
 config.outbounds.forEach(outbound => {
   if (outbound.tag === "Proxy") {
-    // 所有的节点信息出现在 Proxy 组中
-    // 并在 Proxy 组中也加入“自动选择”作为备选项
+    // 所有的节点信息出现在 Proxy 组中，并在组内放入"自动选择"作为备选项
     outbound.outbounds.push("自动选择", ...allProxyTags);
   }
   if (outbound.tag === "自动选择") {
-    // 自动选择组填入所有的节点
+    // 自动选择组放入所有有效节点（已剔除订阅信息类）
     outbound.outbounds.push(...allProxyTags);
   }
 });
 
-// 处理策略组中可能为空的情况
-const directDirect = {
-  tag: "直连-COMPATIBLE",
-  type: "direct"
-};
-
-config.outbounds.forEach((outbound) => {
+// 兼容处理：如果某个策略组 outbounds 为空，补一个直连标签防止启动报错
+config.outbounds.forEach(outbound => {
   if (Array.isArray(outbound.outbounds) && outbound.outbounds.length === 0) {
     if (!compatible) {
+      const directDirect = {
+        tag: "直连-兼容",
+        type: "direct"
+      };
       config.outbounds.push(directDirect);
       compatible = true;
     }
-    outbound.outbounds.push(directDirect.tag);
+    outbound.outbounds.push("直连-兼容");
   }
 });
 
