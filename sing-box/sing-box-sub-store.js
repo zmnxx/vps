@@ -26,7 +26,7 @@ const compatible_outbound = {
 var compatible;
 var config = JSON.parse($files[0]);
 
-var proxies = await produceArtifact({
+var nodes = await produceArtifact({
   name,
   type: /^1$|col/i.test(type) ? "collection" : "subscription",
   platform: "sing-box",
@@ -36,7 +36,7 @@ var proxies = await produceArtifact({
 // ============================================================
 // 节点过滤: 剔除信息节点, 只保留真实代理节点
 // ============================================================
-proxies = proxies.filter(function (p) {
+nodes = nodes.filter(function (p) {
   var tag = p.tag || "";
   if (!tag.trim()) return false;
   if (/^(?:流量|剩余|到期|余量|续费|过期|重置|官网|网址|官址|获取|订阅|说明|套餐|会员|购买|机场|群|域名|解锁|检测|测试|实验|已用|时间|通知|公告|提醒|更新|频道|教程|博客|expire|expir|traffic|remain|reset|account|plan|balance|bandwidth|subscription|notify)/i.test(tag)) return false;
@@ -49,11 +49,11 @@ proxies = proxies.filter(function (p) {
 // ============================================================
 // 节点注入: 全部注入到 Proxy(selector) 和 自动选择(urltest)
 // ============================================================
-var proxyTags = proxies.map(function (p) {
+var proxyTags = nodes.map(function (p) {
   return p.tag;
 });
 
-config.outbounds.push.apply(config.outbounds, proxies);
+config.outbounds.push.apply(config.outbounds, nodes);
 
 config.outbounds.map(function (i) {
   if (i.tag === "Proxy") {
