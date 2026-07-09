@@ -1,124 +1,127 @@
 /**
- * Sub-Store 节点清洗 + 注入脚本（sing-box 模板）
+ * Sub-Store sing-box 模板脚本 (v1.14.0-alpha.41)
  *
- * 粘贴位置：
- *   Sub-Store → 订阅 → 编辑 → 「节点操作」/「Script」/「脚本操作」
- *   选择类型为「节点过滤脚本」（Node Filter），
- *   将本文件内容粘贴进去保存即可。
+ * 优化自: https://cdn.jsdelivr.net/gh/Sheldontao/Scripts@refs/heads/main/sub-store-template/1.12or13/sing-box.js
  *
- * 工作原理：
- *   Sub-Store 调用导出函数 operator(proxies)，proxies 为解析后的节点数组。
- *   本脚本：
- *     1) 过滤机场返回的「信息节点」（过期、流量、套餐、续费等）。
- *     2) 清洗节点名（去 emoji、多余空白、广告前缀）。
- *     3) 给每个节点补齐 sing-box 必填 type 字段，丢弃非法节点。
- *     4) 返回清洗后的节点数组，由 Sub-Store 注入到模板的 outbounds 占位区。
+ * 主要改进:
+ * 1. 不分组, 全部节点注入到 "Proxy" (selector) 和 "自动选择" (urltest)
+ * 2. 关键字过滤: 剔除机场订阅中的信息节点(剩余流量/套餐到期/官网地址等)
+ * 3. 空策略组兜底: 自动填充 COMPATIBLE 直连出站, 避免 selector/urltest 无节点导致启动失败
+ * 4. 兼容 sing-box 1.14.0-alpha.41 配置规范
  *
- *   若你使用「sing-box 模板」功能，Sub-Store 会把返回的节点标签数组
- *   自动写入 selector / urltest 的 outbounds 字段，无需手动拼接。
+ * Sub-Store 用法:
+ *   - 订阅类型: sing-box
+ *   - 模板文件: 上传 sing-box-template.json 作为 $files[0]
+ *   - 节点注入脚本: 本文件
+ *   - arguments: name=你的订阅名&type=sing-box
  */
 
-// 关键字过滤名单：命中任一关键字的节点视为信息条目，丢弃
-const DIRTY_KEYWORDS = [
-  '过期', '剩余', '到期', '流量', '套餐', '官网', '网址',
-  '续费', '订阅', '购买', '刷新', '群', '官网', '公告',
-  'GB', '包年', '包月', '限时', '优惠', '测试', '官网地址'
-];
+const { type, name } = $arguments;
 
-// sing-box 合法 outbound type
-const VALID_TYPES = [
-  'shadowsocks', 'vmess', 'trojan', 'hysteria', 'hysteria2',
-  'tuic', 'wireguard', 'ssh', 'shadowtls', 'vless', 'anytls',
-  'direct', 'block'
-];
-
-// Sub-Store（mihomo/Clash）类型 → sing-box 类型映射
-const TYPE_MAP = {
-  ss: 'shadowsocks',
-  shadowsocks: 'shadowsocks',
-  vmess: 'vmess',
-  trojan: 'trojan',
-  hysteria: 'hysteria',
-  hysteria2: 'hysteria2',
-  tuic: 'tuic',
-  wireguard: 'wireguard',
-  ssh: 'ssh',
-  shadowtls: 'shadowtls',
-  vless: 'vless',
-  anytls: 'anytls'
+// 兜底直连出站: 当策略组为空时自动填充, 防止启动报错
+const compatible_outbound = {
+  tag: "COMPATIBLE",
+  type: "direct",
 };
 
-/**
- * 清洗节点名：去除 emoji、控制字符、多余空白与常见广告前缀
- */
-function cleanName(name) {
-  if (!name || typeof name !== 'string') return '未命名节点';
-  // 去 emoji 与各类符号
-  let cleaned = name
-    // eslint-disable-next-line no-misleading-character-class
-    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\uFE0F]/gu, '')
-    .replace(/[\u0000-\u001F\u007F]/g, '') // 控制字符
-    .replace(/\s+/g, ' ')
-    .trim();
-  // 去常见广告前缀，如 "【官网】"、"® 广告 |"
-  cleaned = cleaned.replace(/^[【\[（(]? *(官网|广告|促销|最新|高速|推荐|Premium|PRO) *[】\]）)|]?\s*/i, '');
-  return cleaned || '未命名节点';
-}
+// ============================================================
+// 关键字过滤: 匹配以下关键词的节点将被剔除
+// 覆盖范围:
+//   - 流量信息: 流量/剩余/已用/余量/GB/TB/MB/KB
+//   - 到期提醒: 到期/过期/续费/重置/expire/expir
+//   - 官网信息: 官网/网址/官址/域名/网址/获取/订阅/说明/群
+//   - 套餐信息: 套餐/会员/购买/机场/plan/account/subscription
+//   - 日期格式: 2024-01-01 等纯日期节点
+//   - 其他杂项: 检测/测试/实验/解锁/remain/reset/traffic
+// ============================================================
+const FILTER_REGEX = /(?:流量|剩余|到期|余量|续费|过期|重置|官网|网址|官址|获取|订阅|说明|套餐|会员|购买|机场|群|域名|解锁|检测|测试|实验|已用|时间|通知|公告|提醒|更新|频道|教程|博客|expire|expir|traffic|remain|reset|account|plan|balance|bandwidth|subscription|notify|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d+\s*(?:GB|TB|MB|KB|gb|tb|mb|kb))/i;
 
-/**
- * 判断是否为信息节点（需丢弃）
- */
-function isInfoNode(name) {
-  if (!name) return true;
-  const lower = name.toLowerCase();
-  return DIRTY_KEYWORDS.some(kw => name.includes(kw) || lower.includes(kw.toLowerCase()));
-}
+// 备用精确过滤名单: 节点名完全匹配以下字符串的将被剔除
+const EXACT_BLOCKLIST = [
+  "网址",
+  "官网",
+  "流量",
+  "到期",
+  "续费",
+  "套餐",
+  "订阅",
+  "说明",
+];
 
-/**
- * 补齐单个节点的必填字段，返回合法节点对象或 null（非法则丢弃）
- */
-function normalizeNode(node) {
-  if (!node || typeof node !== 'object') return null;
-  // Sub-Store 节点字段可能为 mihomo 风格，需适配
-  let type = (node.type || node.network || '').toLowerCase();
-  type = TYPE_MAP[type] || type;
-  if (!VALID_TYPES.includes(type)) return null; // 非法类型丢弃
+let compatible;
+let config = JSON.parse($files[0]);
 
-  const name = cleanName(node.name || node.tag || node.remarks);
+// 通过 Sub-Store API 获取节点列表
+let proxies = await produceArtifact({
+  name,
+  type: /^1$|col/i.test(type) ? "collection" : "subscription",
+  platform: "sing-box",
+  produceType: "internal",
+});
 
-  // 映射为 sing-box 出站结构（按 type 复制 server 字段）
-  const sb = Object.assign({}, node);
-  sb.type = type;
-  sb.tag = name;
-  // sing-box 用 tag 作为节点名，删除冗余字段
-  delete sb.name;
-  delete sb.remarks;
-  return sb;
-}
+// ============================================================
+// 节点过滤: 剔除信息节点, 只保留真实代理节点
+// ============================================================
+proxies = proxies.filter((p) => {
+  const tag = p.tag || "";
+  // 排除空标签节点
+  if (!tag.trim()) return false;
+  // 排除包含信息关键词的节点
+  if (FILTER_REGEX.test(tag)) return false;
+  // 排除精确匹配黑名单的节点
+  if (EXACT_BLOCKLIST.some((kw) => tag === kw)) return false;
+  // 排除纯数字节点名(一些机场用纯数字做信息节点)
+  if (/^\d+$/.test(tag.trim())) return false;
+  return true;
+});
 
-/**
- * Sub-Store 入口：operator(proxies)
- * proxies: Sub-Store 解析后的节点数组（mihomo/Clash 格式对象）
- * 返回：清洗后的节点数组
- */
-// eslint-disable-next-line no-unused-vars
-function operator(proxies) {
-  const cleaned = (proxies || [])
-    .filter(p => p && !isInfoNode(p.name || p.tag || p.remarks))
-    .map(normalizeNode)
-    .filter(Boolean); // 丢弃非法节点
+// ============================================================
+// 节点注入: 全部注入到 Proxy(selector) 和 自动选择(urltest)
+// ============================================================
+const proxyTags = proxies.map((p) => p.tag);
 
-  if (cleaned.length === 0) {
-    // 兜底：全部被过滤时返回原数组，避免配置空指针
-    return proxies || [];
+config.outbounds.push(...proxies);
+
+config.outbounds.map((i) => {
+  if (["Proxy"].includes(i.tag)) {
+    // Proxy selector: "自动选择" 放在最前面, 然后是所有真实节点 + 直连
+    i.outbounds = ["自动选择", ...proxyTags, "直连"];
   }
-  return cleaned;
-}
+  if (["自动选择"].includes(i.tag)) {
+    // urltest: 注入所有真实节点进行延迟测试
+    i.outbounds.push(...proxyTags);
+  }
+});
 
-// 导出（Sub-Store 同时支持 CommonJS 与全局函数）
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { operator, cleanName, isInfoNode, normalizeNode };
-}
-if (typeof globalThis !== 'undefined') {
-  globalThis.operator = operator;
-}
+// ============================================================
+// 空策略组兜底: 检测所有 selector/urltest, 若 outbounds 为空则填充 COMPATIBLE
+// ============================================================
+config.outbounds.forEach((outbound) => {
+  if (
+    (outbound.type === "selector" || outbound.type === "urltest") &&
+    Array.isArray(outbound.outbounds) &&
+    outbound.outbounds.length === 0
+  ) {
+    if (!compatible) {
+      config.outbounds.push(compatible_outbound);
+      compatible = true;
+    }
+    outbound.outbounds.push(compatible_outbound.tag);
+  }
+});
+
+// ============================================================
+// Proxy selector 默认指向 "自动选择"
+// 自动选择 urltest 会自动测速选择最优节点
+// ============================================================
+config.outbounds.forEach((outbound) => {
+  if (
+    outbound.tag === "Proxy" &&
+    outbound.outbounds &&
+    outbound.outbounds.includes("自动选择")
+  ) {
+    outbound.default = "自动选择";
+  }
+});
+
+$content = JSON.stringify(config, null, 2);
