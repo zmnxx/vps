@@ -3,101 +3,83 @@
     "level": "info",
     "timestamp": true
   },
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com",
+    "server_port": 123,
+    "interval": "30m"
+  },
   "dns": {
     "servers": [
       {
-        "type": "udp",
-        "tag": "阿里DNS",
+        "type": "https",
+        "tag": "Global-DNS",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "domain_resolver": "Boot-DNS"
+      },
+      {
+        "type": "https",
+        "tag": "Google-DNS",
+        "server": "8.8.8.8",
+        "server_port": 443,
+        "domain_resolver": "Boot-DNS"
+      },
+      {
+        "type": "https",
+        "tag": "Alidns-DNS",
         "server": "223.5.5.5",
-        "server_port": 53,
-        "detour": "直连"
+        "server_port": 443,
+        "domain_resolver": "Boot-DNS",
+        "detour": "Direct"
+      },
+      {
+        "type": "https",
+        "tag": "Tencent-DNS",
+        "server": "119.29.29.29",
+        "server_port": 443,
+        "domain_resolver": "Boot-DNS",
+        "detour": "Direct"
       },
       {
         "type": "udp",
-        "tag": "腾讯DNS",
-        "server": "119.29.29.29",
-        "server_port": 53,
-        "detour": "直连"
-      },
-      {
-        "type": "https",
-        "tag": "谷歌DNS",
-        "server": "dns.google",
-        "server_port": 443,
-        "domain_resolver": "阿里DNS",
-        "detour": "Proxy"
-      },
-      {
-        "type": "https",
-        "tag": "CloudflareDNS",
-        "server": "cloudflare-dns.com",
-        "server_port": 443,
-        "domain_resolver": "阿里DNS",
-        "detour": "Proxy"
-      },
-      {
-        "type": "fakeip",
-        "tag": "FakeIP",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
+        "tag": "Boot-DNS",
+        "server": "223.5.5.5",
+        "server_port": 53
       }
     ],
     "rules": [
       {
-        "clash_mode": "direct",
-        "action": "route",
-        "server": "阿里DNS"
+        "server": "Boot-DNS",
+        "action": "route"
       },
       {
-        "clash_mode": "global",
-        "action": "route",
-        "server": "谷歌DNS"
+        "clash_mode": "Direct",
+        "server": "Alidns-DNS",
+        "action": "route"
       },
       {
-        "rule_set": "广告拦截",
-        "action": "reject",
-        "method": "default"
+        "clash_mode": "Global",
+        "server": "Google-DNS",
+        "action": "route"
       },
       {
-        "rule_set": [
-          "中国域名"
-        ],
-        "action": "route",
-        "server": "阿里DNS"
+        "rule_set": "geolocation-!cn",
+        "server": "Google-DNS",
+        "action": "route"
       },
       {
-        "rule_set": [
-          "谷歌域名"
-        ],
-        "action": "route",
-        "server": "谷歌DNS"
-      },
-      {
-        "rule_set": [
-          "微软域名"
-        ],
-        "action": "route",
-        "server": "谷歌DNS"
-      },
-      {
-        "rule_set": [
-          "国外域名"
-        ],
-        "action": "route",
-        "server": "谷歌DNS"
-      },
-      {
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "action": "route",
-        "server": "FakeIP"
+        "rule_set": "geosite-cn",
+        "server": "Alidns-DNS",
+        "action": "route"
       }
     ],
-    "final": "谷歌DNS",
+    "final": "Global-DNS",
     "strategy": "prefer_ipv4",
+    "disable_cache": false,
+    "disable_expire": false,
     "optimistic": true,
+    "cache_capacity": 4096,
     "timeout": "10s",
     "reverse_mapping": true
   },
@@ -106,23 +88,19 @@
       "type": "tun",
       "tag": "tun-in",
       "address": [
-        "172.18.0.1/30",
+        "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
       "mtu": 9000,
-      "dns_mode": "hijack",
       "auto_route": true,
       "strict_route": true,
-      "stack": "system",
-      "endpoint_independent_nat": true,
-      "udp_timeout": "5m"
-    },
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "127.0.0.1",
-      "listen_port": 7890,
-      "set_system_proxy": false
+      "stack": "mixed",
+      "dns_mode": "hijack",
+      "endpoint_independent_nat": false,
+      "udp_timeout": "5m",
+      "exclude_package": [
+        "com.android.captiveportallogin"
+      ]
     }
   ],
   "outbounds": [
@@ -130,76 +108,83 @@
       "type": "selector",
       "tag": "Proxy",
       "outbounds": [
-        "自动选择"
+        "Auto-Proxy",
+        "Direct"
       ],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
+      "default": "Auto-Proxy",
+      "interrupt_exist_connections": false
     },
     {
       "type": "urltest",
-      "tag": "自动选择",
-      "outbounds": [],
+      "tag": "Auto-Proxy",
+      "outbounds": [
+        "Direct"
+      ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
       "tolerance": 50,
       "idle_timeout": "30m",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
-      "tag": "广告拦截",
-      "outbounds": [
-        "拒绝",
-        "直连"
-      ],
-      "default": "拒绝",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
-      "tag": "国内直连",
-      "outbounds": [
-        "直连"
-      ],
-      "default": "直连",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
-      "tag": "微软服务",
+      "tag": "Google-Service",
       "outbounds": [
         "Proxy",
-        "直连"
+        "Auto-Proxy",
+        "Direct"
       ],
       "default": "Proxy",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
-      "tag": "谷歌服务",
-      "outbounds": [
-        "Proxy"
-      ],
-      "default": "Proxy",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
-      "tag": "兜底策略",
+      "tag": "Microsoft-Service",
       "outbounds": [
         "Proxy",
-        "直连"
+        "Auto-Proxy",
+        "Direct"
       ],
       "default": "Proxy",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "selector",
+      "tag": "Direct-Group",
+      "outbounds": [
+        "Direct"
+      ],
+      "default": "Direct",
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "selector",
+      "tag": "AdBlock",
+      "outbounds": [
+        "Block",
+        "Direct"
+      ],
+      "default": "Block",
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "selector",
+      "tag": "Fallback-policy",
+      "outbounds": [
+        "Proxy",
+        "Auto-Proxy",
+        "Direct"
+      ],
+      "default": "Proxy",
+      "interrupt_exist_connections": false
     },
     {
       "type": "direct",
-      "tag": "直连"
+      "tag": "Direct"
     },
     {
       "type": "block",
-      "tag": "拒绝"
+      "tag": "Block"
     }
   ],
   "route": {
@@ -212,150 +197,138 @@
         "action": "hijack-dns"
       },
       {
-        "clash_mode": "direct",
-        "action": "route",
-        "outbound": "直连"
+        "clash_mode": "Direct",
+        "outbound": "Direct",
+        "action": "route"
       },
       {
-        "clash_mode": "global",
-        "action": "route",
-        "outbound": "Proxy"
+        "clash_mode": "Global",
+        "outbound": "Proxy",
+        "action": "route"
       },
       {
-        "rule_set": "广告拦截",
-        "action": "route",
-        "outbound": "广告拦截"
+        "rule_set": "adrules",
+        "outbound": "AdBlock",
+        "action": "route"
       },
       {
-        "rule_set": "私有网络",
-        "action": "route",
-        "outbound": "直连"
+        "rule_set": "geosite-microsoft-cn",
+        "outbound": "Microsoft-Service",
+        "action": "route"
       },
       {
-        "rule_set": [
-          "中国IP",
-          "中国域名"
-        ],
-        "action": "route",
-        "outbound": "国内直连"
+        "rule_set": "geosite-google",
+        "outbound": "Google-Service",
+        "action": "route"
       },
       {
-        "rule_set": "微软域名",
-        "action": "route",
-        "outbound": "微软服务"
+        "rule_set": "geoip-google",
+        "outbound": "Google-Service",
+        "action": "route"
       },
       {
-        "rule_set": [
-          "谷歌域名",
-          "谷歌IP"
-        ],
-        "action": "route",
-        "outbound": "谷歌服务"
+        "rule_set": "geosite-cn",
+        "outbound": "Direct-Group",
+        "action": "route"
       },
       {
-        "rule_set": "国外域名",
-        "action": "route",
-        "outbound": "Proxy"
+        "rule_set": "geoip-cn",
+        "outbound": "Direct-Group",
+        "action": "route"
+      },
+      {
+        "rule_set": "geoip-private",
+        "outbound": "Direct",
+        "action": "route"
       },
       {
         "ip_is_private": true,
-        "action": "route",
-        "outbound": "直连"
+        "outbound": "Direct",
+        "action": "route"
+      },
+      {
+        "rule_set": "geolocation-!cn",
+        "outbound": "Proxy",
+        "action": "route"
       }
     ],
     "rule_set": [
       {
         "type": "remote",
-        "tag": "中国IP",
+        "tag": "geosite-google",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "中国域名",
+        "tag": "geoip-google",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "谷歌域名",
+        "tag": "geosite-microsoft-cn",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-google.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft%40cn.srs",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "谷歌IP",
+        "tag": "geosite-cn",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/you-oops-dev/ipranges-singbox@main/google/google.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "微软域名",
+        "tag": "geoip-cn",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-microsoft@cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
         "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "国外域名",
+        "tag": "geoip-private",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-geolocation-!cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/private.srs",
         "update_interval": "1d"
       },
       {
-        "type": "inline",
-        "tag": "私有网络",
-        "rules": [
-          {
-            "ip_cidr": [
-              "10.0.0.0/8",
-              "172.16.0.0/12",
-              "192.168.0.0/16",
-              "100.64.0.0/10",
-              "127.0.0.0/8",
-              "169.254.0.0/16",
-              "224.0.0.0/4",
-              "fc00::/7",
-              "fe80::/10",
-              "::1/128"
-            ]
-          }
-        ]
+        "type": "remote",
+        "tag": "geolocation-!cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-%21cn.srs",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "广告拦截",
+        "tag": "adrules",
         "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
         "update_interval": "1d"
       }
     ],
-    "final": "兜底策略",
     "auto_detect_interface": true,
-    "find_process": false,
-    "default_domain_resolver": "阿里DNS"
+    "override_android_vpn": false,
+    "default_domain_resolver": {
+      "server": "Boot-DNS"
+    },
+    "final": "Fallback-policy"
   },
   "experimental": {
     "cache_file": {
       "enabled": true,
-      "path": "cache.db",
-      "cache_id": "sing-box-profile",
-      "store_fakeip": true,
-      "store_dns": true
+      "store_dns": true,
+      "store_fakeip": false
     },
     "clash_api": {
       "external_controller": "127.0.0.1:9090",
       "external_ui": "ui",
       "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
-      "external_ui_download_detour": "直连",
+      "external_ui_download_detour": "Proxy",
       "default_mode": "rule",
-      "access_control_allow_origin": [
-        "*"
-      ],
       "access_control_allow_private_network": true
     }
   }
