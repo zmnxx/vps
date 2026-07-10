@@ -1,89 +1,125 @@
-/**
- * Sub-Store sing-box 模板脚本 (v1.14.0-alpha.41)
+/* =========================================================================
+ *  Sub-Store 模板脚本  ·  sing-box v1.14.0-alpha.41
+ *  -----------------------------------------------------------------------
+ *  用途：作为 Sub-Store 的「自定义脚本」使用。
+ *        - 模板文件 config-template.json 作为 $files[0]
+ *        - 脚本拉取订阅节点（platform: "sing-box", produceType: "internal"）
+ *        - 将过滤后的全部节点注入 Proxy / Auto-Proxy 两个策略组
+ *        - 关键字黑名单 + 白名单（可选）双过滤，剔除机场里的杂七杂八信息
  *
- * 优化自: https://cdn.jsdelivr.net/gh/Sheldontao/Scripts@refs/heads/main/sub-store-template/1.12or13/sing-box.js
+ *  安装：Sub-Store → 编辑订阅/组合订阅 →
+ *        「订阅」设置里挂自定义配置 / 单跳订阅 / 文件托管 config-template.json
+ *        脚本路径指向本文件（sing-box-inject.js）
  *
- * 主要改进:
- * 1. 不分组, 全部节点注入到 Proxy(selector) 和 自动选择(urltest)
- * 2. 关键字过滤: 剔除机场订阅中的信息节点
- * 3. 空策略组兜底: 自动填充 COMPATIBLE 直连出站
- * 4. 兼容 sing-box 1.14.0-alpha.41 配置规范
- *
- * Sub-Store 用法:
- *   - 订阅类型: sing-box
- *   - 模板文件: 上传 sing-box-template.json
- *   - 节点注入脚本: 本文件
- *   - arguments: name=你的订阅名&type=sing-box
- */
+ *  参考：
+ *    - https://cdn.jsdelivr.net/gh/Sheldontao/Scripts@refs/heads/main/sub-store-template/1.12or13/sing-box.js
+ *    - Sub-Store 官方 scripts/demo.js（produceArtifact / $files / $arguments 用法）
+ *  ========================================================================= */
 
 const { type, name } = $arguments;
 
-const compatible_outbound = {
-  tag: "COMPATIBLE",
-  type: "direct",
-};
+// ---------------------------------------------------------------------------
+// 1. 兜底直连节点（空节点列表 / 全被过滤时占位）
+// ---------------------------------------------------------------------------
+const compatible_outbound = { tag: "COMPATIBLE", type: "direct" };
 
-var compatible;
-var config = JSON.parse($files[0]);
-
-var nodes = await produceArtifact({
-  name,
+// ---------------------------------------------------------------------------
+// 2. 读取模板 + 拉取节点
+// ---------------------------------------------------------------------------
+let compatible = false;
+let config = JSON.parse($files[0]);
+let proxies = await produceArtifact({
+  name,                                        // 订阅名
   type: /^1$|col/i.test(type) ? "collection" : "subscription",
-  platform: "sing-box",
-  produceType: "internal",
+  platform: "sing-box",                        // 直接产出 sing-box 的 outbound 数组结构
+  produceType: "internal",                      // 返回数组而非字符串
 });
 
-// ============================================================
-// 节点过滤: 剔除信息节点, 只保留真实代理节点
-// ============================================================
-nodes = nodes.filter(function (p) {
-  var tag = p.tag || "";
-  if (!tag.trim()) return false;
-  if (/^(?:流量|剩余|到期|余量|续费|过期|重置|官网|网址|官址|获取|订阅|说明|套餐|会员|购买|机场|群|域名|解锁|检测|测试|实验|已用|时间|通知|公告|提醒|更新|频道|教程|博客|expire|expir|traffic|remain|reset|account|plan|balance|bandwidth|subscription|notify)/i.test(tag)) return false;
-  if (/\d{4}[-]\d{1,2}[-]\d{1,2}/.test(tag)) return false;
-  if (/\d+\s*(?:GB|TB|MB|KB|gb|tb|mb|kb)/.test(tag)) return false;
-  if (/^\d+$/.test(tag.trim())) return false;
-  return true;
-});
+// ---------------------------------------------------------------------------
+// 3. 关键字黑名单：剔除机场里常见的"垃圾节点"
+//    匹配命中即过滤掉。中文 + 英文兼顾；emoji / 旗帜不过滤。
+//    说明：包含 -> 推荐 / 官网 / 订阅 / 流量 / 套餐 / 到期 / 重置 / 公告 等
+// ---------------------------------------------------------------------------
+const BLOCK_KEYWORDS = [
+  // 通用信息类：机场常塞的说明性"节点"
+  "网址", "网站", "官网", "域名", "获取", "订阅", "流量", "套餐", "到期", "余量", "余流量",
+  "续费", "过期", "重置", "公告", "刷新", "更新", "购买", "官址", "官网地址", "说明",
+  "提示", "讨论", "客服", "群组", "电报", "剩余", "倍率", "官网：", "网址：",
+  // 英文常见
+  "expire", "traffic", "expire-date", "expireDate", "subscription", "traffic-expire",
+  "remaining", "流量：", "到期：",
+];
 
-// ============================================================
-// 节点注入: 全部注入到 Proxy(selector) 和 自动选择(urltest)
-// ============================================================
-var proxyTags = nodes.map(function (p) {
-  return p.tag;
-});
+// ---------------------------------------------------------------------------
+// 4. 可选关键字白名单（留空表示不强制白名单，全部黑名单外的节点都注入）
+//    若填入，则只保留节点名命中任一关键字的节点（OR 语义）。
+// ---------------------------------------------------------------------------
+const ALLOW_KEYWORDS = [
+  // "香港","HK","港","日本","JP","日","新加坡","SG","狮城","美国","US","韩","KR","台湾","TW","英","UK","德","DE"
+];
 
-config.outbounds.push.apply(config.outbounds, nodes);
+// ---------------------------------------------------------------------------
+// 5. 过滤逻辑：剔除垃圾节点
+// ---------------------------------------------------------------------------
+function filterProxies(list) {
+  let r = list.filter((p) => {
+    if (!p || !p.tag) return false;
+    const t = String(p.tag);
+    // 命中黑名单 -> 丢弃
+    for (const k of BLOCK_KEYWORDS) {
+      if (t.indexOf(k) !== -1) return false;
+    }
+    // 开启白名单时强制要求命中
+    if (ALLOW_KEYWORDS && ALLOW_KEYWORDS.length) {
+      let ok = false;
+      for (const k of ALLOW_KEYWORDS) {
+        if (t.indexOf(k) !== -1) { ok = true; break; }
+      }
+      if (!ok) return false;
+    }
+    return true;
+  });
+  return r;
+}
 
-config.outbounds.map(function (i) {
-  if (i.tag === "Proxy") {
-    i.outbounds = ["自动选择"].concat(proxyTags).concat(["直连"]);
+proxies = filterProxies(proxies);
+
+// ---------------------------------------------------------------------------
+// 6. 注入：把所有节点追加到 Proxy 和 Auto-Proxy
+//    参照 Sheldontao 原脚本，但改为两策略组都注入（按需求）。
+//    Proxy / Auto-Proxy 在模板里已存在占位 outbounds，这里 push 追加。
+// ---------------------------------------------------------------------------
+const validTags = proxies.map((p) => p.tag);
+
+config.outbounds.push(...proxies);
+
+config.outbounds.forEach((o) => {
+  if (o.tag === "Proxy") {
+    // Proxy 默认是 Auto-Proxy / Direct，追加所有真实节点
+    o.outbounds.push(...validTags);
+    // 让默认首选第一个真实节点（若存在），否则回退 Auto-Proxy
+    if (validTags.length) o.default = validTags[0];
   }
-  if (i.tag === "自动选择") {
-    i.outbounds.push.apply(i.outbounds, proxyTags);
+  if (o.tag === "Auto-Proxy") {
+    // Auto-Proxy 测速组，注入全部节点
+    o.outbounds.push(...validTags);
   }
 });
 
-// ============================================================
-// 空策略组兜底
-// ============================================================
-config.outbounds.forEach(function (outbound) {
-  if (Array.isArray(outbound.outbounds) && outbound.outbounds.length === 0) {
+// ---------------------------------------------------------------------------
+// 7. 空策略组兜底：若某策略组无任何可用节点，注入 COMPATIBLE 直连
+// ---------------------------------------------------------------------------
+config.outbounds.forEach((o) => {
+  if (Array.isArray(o.outbounds) && o.outbounds.length === 0) {
     if (!compatible) {
       config.outbounds.push(compatible_outbound);
       compatible = true;
     }
-    outbound.outbounds.push(compatible_outbound.tag);
+    o.outbounds.push(compatible_outbound.tag);
   }
 });
 
-// ============================================================
-// Proxy selector 默认指向 自动选择
-// ============================================================
-config.outbounds.forEach(function (outbound) {
-  if (outbound.tag === "Proxy" && outbound.outbounds && outbound.outbounds.indexOf("自动选择") !== -1) {
-    outbound.default = "自动选择";
-  }
-});
-
+// ---------------------------------------------------------------------------
+// 8. 输出最终 JSON
+// ---------------------------------------------------------------------------
 $content = JSON.stringify(config, null, 2);
