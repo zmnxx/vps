@@ -71,6 +71,12 @@
     "optimistic": true,
     "timeout": "10s"
   },
+  "http_clients": [
+    {
+      "tag": "规则集HTTP客户端",
+      "detour": "国内直连"
+    }
+  ],
   "inbounds": [
     {
       "type": "tun",
@@ -265,6 +271,8 @@
       }
     ],
     "final": "兜底策略",
+    "default_domain_resolver": "阿里DNS",
+    "default_http_client": "规则集HTTP客户端",
     "auto_detect_interface": true,
     "find_process": false
   },
