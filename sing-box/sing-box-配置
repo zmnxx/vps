@@ -53,16 +53,16 @@
       },
       {
         "type": "hosts",
-        "tag": "hosts-local",
+        "tag": "hosts",
         "path": [],
         "predefined": {}
       }
     ],
     "rules": [
       {
-        "preferred_by": "hosts",
+        "preferred_by": ["hosts"],
         "action": "route",
-        "server": "hosts-local"
+        "server": "hosts"
       },
       {
         "clash_mode": "direct",
