@@ -7,27 +7,49 @@
     "servers": [
       {
         "type": "udp",
-        "tag": "dns-alidns",
+        "tag": "dns-bootstrap",
         "server": "223.5.5.5",
         "server_port": 53
       },
       {
-        "type": "udp",
-        "tag": "dns-dnspod",
-        "server": "119.29.29.29",
-        "server_port": 53
+        "type": "https",
+        "tag": "dns-ali",
+        "server": "dns.alidns.com",
+        "path": "/dns-query",
+        "domain_resolver": "dns-bootstrap",
+        "tls": {
+          "enabled": true
+        }
+      },
+      {
+        "type": "https",
+        "tag": "dns-tencent",
+        "server": "doh.pub",
+        "path": "/dns-query",
+        "domain_resolver": "dns-bootstrap",
+        "tls": {
+          "enabled": true
+        }
       },
       {
         "type": "https",
         "tag": "dns-google",
         "server": "dns.google",
-        "domain_resolver": "dns-alidns"
+        "path": "/dns-query",
+        "domain_resolver": "dns-bootstrap",
+        "tls": {
+          "enabled": true
+        }
       },
       {
         "type": "https",
         "tag": "dns-cloudflare",
-        "server": "1.1.1.1",
-        "domain_resolver": "dns-alidns"
+        "server": "cloudflare-dns.com",
+        "path": "/dns-query",
+        "domain_resolver": "dns-bootstrap",
+        "tls": {
+          "enabled": true
+        }
       },
       {
         "type": "local",
@@ -36,135 +58,192 @@
     ],
     "rules": [
       {
-        "clash_mode": "direct",
-        "server": "dns-alidns",
-        "action": "route"
+        "rule_set": "geosite-private",
+        "action": "route",
+        "server": "dns-local"
       },
       {
-        "clash_mode": "global",
-        "server": "dns-google",
-        "action": "route"
+        "rule_set": "geosite-cn",
+        "action": "route",
+        "server": "dns-ali"
       },
       {
-        "rule_set": [
-          "geosite-cn",
-          "geosite-private"
-        ],
-        "server": "dns-alidns",
-        "action": "route"
+        "rule_set": "geosite-microsoft-cn",
+        "action": "route",
+        "server": "dns-tencent"
       },
       {
-        "rule_set": [
-          "geosite-google"
-        ],
-        "server": "dns-google",
-        "action": "route"
+        "rule_set": "geosite-google",
+        "action": "route",
+        "server": "dns-google"
       },
       {
-        "rule_set": [
-          "geosite-microsoft"
-        ],
-        "server": "dns-google",
-        "action": "route"
+        "rule_set": "geosite-geolocation-!cn",
+        "action": "route",
+        "server": "dns-cloudflare"
       }
     ],
-    "final": "dns-google",
-    "strategy": "prefer_ipv4",
-    "disable_cache": false,
-    "disable_expire": false,
-    "optimistic": true
+    "final": "dns-ali",
+    "strategy": "prefer_ipv4"
   },
+  "http_clients": [
+    {
+      "tag": "default",
+      "tls": {
+        "enabled": true
+      },
+      "domain_resolver": "dns-bootstrap"
+    }
+  ],
   "inbounds": [
     {
       "type": "tun",
       "tag": "tun-in",
       "address": [
-        "172.18.0.1/30",
+        "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
       "mtu": 9000,
-      "stack": "mixed",
+      "dns_mode": "hijack",
       "auto_route": true,
+      "stack": "mixed",
+      "udp_timeout": "5m",
       "exclude_package": [
         "com.android.captiveportallogin"
-      ],
-      "endpoint_independent_nat": true
+      ]
     }
   ],
   "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "广告拦截"
+    },
     {
       "type": "selector",
       "tag": "Proxy",
       "outbounds": [
         "自动选择"
       ],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
+      "default": "自动选择"
     },
     {
       "type": "urltest",
       "tag": "自动选择",
       "outbounds": [
-        "direct-out"
+        "direct"
       ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
-      "tolerance": 50,
-      "idle_timeout": "30m",
-      "interrupt_exist_connections": true
+      "tolerance": 50
+    },
+    {
+      "type": "selector",
+      "tag": "国内服务",
+      "outbounds": [
+        "direct",
+        "Proxy"
+      ],
+      "default": "direct"
     },
     {
       "type": "selector",
       "tag": "谷歌服务",
       "outbounds": [
         "Proxy",
-        "自动选择"
+        "自动选择",
+        "direct"
       ],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
+      "default": "Proxy"
     },
     {
       "type": "selector",
       "tag": "微软服务",
       "outbounds": [
         "Proxy",
-        "自动选择"
+        "自动选择",
+        "direct"
       ],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
+      "default": "Proxy"
     },
     {
       "type": "selector",
       "tag": "兜底策略",
       "outbounds": [
         "Proxy",
-        "自动选择"
+        "自动选择",
+        "direct"
       ],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "block",
-      "tag": "block-out"
-    },
-    {
-      "type": "direct",
-      "tag": "direct-out"
+      "default": "Proxy"
     }
   ],
   "route": {
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-google",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-google",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-microsoft-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-geolocation-!cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-private",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "adrules",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
+        "update_interval": "1d"
+      }
+    ],
     "rules": [
-      {
-        "action": "sniff"
-      },
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
       {
         "clash_mode": "direct",
         "action": "route",
-        "outbound": "direct-out"
+        "outbound": "direct"
       },
       {
         "clash_mode": "global",
@@ -172,23 +251,22 @@
         "outbound": "Proxy"
       },
       {
-        "ip_is_private": true,
+        "rule_set": "adrules",
         "action": "route",
-        "outbound": "direct-out"
+        "outbound": "广告拦截"
+      },
+      {
+        "rule_set": "geosite-private",
+        "action": "route",
+        "outbound": "direct"
       },
       {
         "rule_set": [
-          "geosite-private"
+          "geosite-cn",
+          "geoip-cn"
         ],
         "action": "route",
-        "outbound": "direct-out"
-      },
-      {
-        "rule_set": [
-          "adrules"
-        ],
-        "action": "route",
-        "outbound": "block-out"
+        "outbound": "国内服务"
       },
       {
         "rule_set": [
@@ -199,114 +277,37 @@
         "outbound": "谷歌服务"
       },
       {
-        "rule_set": [
-          "geosite-microsoft"
-        ],
+        "rule_set": "geosite-microsoft-cn",
         "action": "route",
         "outbound": "微软服务"
       },
       {
-        "rule_set": [
-          "geosite-cn",
-          "geoip-cn"
-        ],
-        "action": "route",
-        "outbound": "direct-out"
-      },
-      {
-        "rule_set": [
-          "geosite-geolocation-not-cn"
-        ],
+        "rule_set": "geosite-geolocation-!cn",
         "action": "route",
         "outbound": "兜底策略"
       }
     ],
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "geosite-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-google",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-google",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-microsoft",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-geolocation-not-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-private",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "adrules",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
-        "http_client": "default-http-client",
-        "update_interval": "1d"
-      }
-    ],
-    "auto_detect_interface": true,
-    "default_domain_resolver": {
-      "server": "dns-alidns"
-    },
-    "default_http_client": "default-http-client",
-    "final": "兜底策略"
+    "final": "兜底策略",
+    "default_http_client": "default",
+    "default_domain_resolver": "dns-ali"
   },
-  "http_clients": [
-    {
-      "tag": "default-http-client"
-    }
-  ],
   "experimental": {
-    "cache_file": {
-      "enabled": true,
-      "store_dns": true
-    },
     "clash_api": {
       "external_controller": "127.0.0.1:9090",
-      "default_mode": "Rule"
+      "external_ui": "ui",
+      "external_ui_download_detour": "direct",
+      "secret": "",
+      "default_mode": "rule",
+      "access_control_allow_origin": [
+        "*"
+      ],
+      "access_control_allow_private_network": true
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_dns": true,
+      "store_fakeip": false
     }
   }
 }
