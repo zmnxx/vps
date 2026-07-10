@@ -1,29 +1,15 @@
-/**
- * Sub-Store 节点注入脚本 — sing-box v1.14.0-alpha.41 专用
- *
- * 功能：
- * 1. 从机场订阅提取所有节点
- * 2. 关键字过滤：排除包含"网站/网址/获取/订阅/流量/到期/余量/续费/过期/重置"等无效节点
- * 3. 清理节点 tag 中的杂七杂八信息（emoji 重复前缀、多余空格、广告信息等）
- * 4. 将所有节点注入到「Proxy」和「自动选择」策略组
- *
- * 使用方式：
- * 在 Sub-Store 中创建 sing-box 类型模板，将此脚本作为"脚本"操作，
- * 然后配置一个订阅集合（collection）或单个订阅（subscription）。
- */
+// ==SubStore==
+// name=sing-box 节点注入 (SFA 1.14 / 策略组)
+// description=将订阅节点注入 sing-box 策略组：Proxy / 自动选择 / 国内服务 / 谷歌服务 / 微软服务 / 兜底策略，支持 Clash API
+// ==/SubStore==
 
 const { type, name } = $arguments;
 
-// 兜底出站：当某策略组为空时填充
-const compatibleOutbound = {
-  tag: "COMPATIBLE",
-  type: "direct",
-};
-
+const compatibleOutbound = { tag: "COMPATIBLE", type: "direct" };
 let compatible = false;
 let config = JSON.parse($files[0]);
 
-// 获取订阅节点
+// 1. 拉取当前订阅/集合内的 sing-box 节点
 let proxies = await produceArtifact({
   name,
   type: /^1$|col/i.test(type) ? "collection" : "subscription",
@@ -31,52 +17,46 @@ let proxies = await produceArtifact({
   produceType: "internal",
 });
 
-// ── 关键字过滤：去除机场订阅中的杂七杂八信息 ──
-const FILTER_REGEX =
-  /^(?!.*(?:网站|网址|获取|订阅|流量|到期|余量|续费|过期|重置|剩余|套餐|官网|购买|注册|免费|测试|test|traffic|expire|expiry|buy|shop|store|剩余流量|使用量)).*/i;
+// 2. 过滤杂七杂八节点（广告、官网、流量提示、过期/套餐信息等非可用节点）
+const JUNK_REGEX =
+  /(?:官网|剩余|流量|套餐|订阅|重置|到期|过期|活动|客服|个人订阅|自定义|节点列表|频道|群组|公告|更新|请关注|导入|自助|后台|充值|活动)/i;
+proxies = proxies.filter((p) => !JUNK_REGEX.test(p.tag || ""));
 
-proxies = proxies.filter((p) => FILTER_REGEX.test(p.tag));
-
-// ── 清理节点 tag：去重前缀、清理信息 ──
+// 3. 清理 tag：去 [xx]/【xx】 前缀、去 emoji 旗帜前缀、去多余空格
 function cleanTag(tag) {
-  let cleaned = tag
-    // 去掉常见机场前缀（如 [xxx], 【xxx】）
-    .replace(/^[\[【]\s*[^\]】]+[\】\]]\s*/g, "")
-    // 去掉重复的 emoji 国家前缀（如 🇭🇰🇭🇰 → 🇭🇰）
-    .replace(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)\s*\1+/u, "$1")
-    // 去掉多余空格
-    .replace(/\s{2,}/g, " ")
-    // 去掉首尾空格
+  return tag
+    .replace(/^[\[【][^\]】]*[\]】]\s*/g, "")
+    .replace(/^(🇺🇸|🇨🇳|🇭🇰|🇯🇵|🇰🇷|🇹🇼|🇸🇬|🇲🇴|🇬🇧|🇩🇪|🇫🇷|🇷🇺|🇦🇺|🇨🇦|🇮🇳|🇧🇷)\s*/gu, "")
+    .replace(/\s+/g, " ")
     .trim();
-
-  // 如果清理后为空，保留原始 tag
-  return cleaned || tag;
 }
-
 proxies.forEach((p) => {
-  p.tag = cleanTag(p.tag);
+  if (p.tag) p.tag = cleanTag(p.tag);
+});
+// 去重（清理后可能重名）
+const seen = new Set();
+proxies = proxies.filter((p) => {
+  if (!p.tag || seen.has(p.tag)) return false;
+  seen.add(p.tag);
+  return true;
 });
 
-// ── 注入到配置文件 ──
+// 4. 注入节点
 config.outbounds.push(...proxies);
-
-// 收集所有节点 tag
 const proxyTags = proxies.map((p) => p.tag);
 
-// ── 填充策略组：清空后全部用节点重建，注入后兜底节点不再需要 ──
+// 5. 重建策略组
 config.outbounds.forEach((outbound) => {
-  if (outbound.tag === "Proxy" && Array.isArray(outbound.outbounds)) {
-    // 清空兜底节点，填入所有真实节点 + 自动选择
+  if (outbound.tag === "Proxy") {
     outbound.outbounds = [...proxyTags, "自动选择"];
     outbound.default = "自动选择";
   }
-  if (outbound.tag === "自动选择" && Array.isArray(outbound.outbounds)) {
-    // 清空兜底节点，填入所有真实节点
+  if (outbound.tag === "自动选择") {
     outbound.outbounds = [...proxyTags];
   }
 });
 
-// ── 为空的策略组填充兜底出站 ──
+// 6. 空策略组兜底 COMPATIBLE direct
 config.outbounds.forEach((outbound) => {
   if (Array.isArray(outbound.outbounds) && outbound.outbounds.length === 0) {
     if (!compatible) {
@@ -87,5 +67,4 @@ config.outbounds.forEach((outbound) => {
   }
 });
 
-// ── 输出最终配置 ──
 $content = JSON.stringify(config, null, 2);
