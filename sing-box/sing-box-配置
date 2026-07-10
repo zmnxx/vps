@@ -107,7 +107,7 @@
       "type": "selector",
       "tag": "Proxy",
       "outbounds": ["自动选择兜底"],
-      "default": "自动选择"
+      "default": "自动选择兜底"
     },
     {
       "type": "urltest",
