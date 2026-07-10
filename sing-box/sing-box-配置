@@ -32,14 +32,12 @@
       {
         "type": "udp",
         "tag": "DNS直连",
-        "server": "223.5.5.5",
-        "detour": "国内直连"
+        "server": "223.5.5.5"
       },
       {
         "type": "udp",
         "tag": "DNS代理",
-        "server": "8.8.8.8",
-        "detour": "Proxy"
+        "server": "8.8.8.8"
       }
     ],
     "rules": [
@@ -150,10 +148,6 @@
     {
       "type": "direct",
       "tag": "国内直连"
-    },
-    {
-      "type": "dns",
-      "tag": "DNS出站"
     }
   ],
   "route": {
@@ -162,49 +156,49 @@
         "type": "remote",
         "tag": "中国IP",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-ip/cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
         "update_interval": "3d"
       },
       {
         "type": "remote",
         "tag": "中国域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-site/cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
         "update_interval": "3d"
       },
       {
         "type": "remote",
         "tag": "谷歌域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-site/google.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
         "update_interval": "3d"
       },
       {
         "type": "remote",
         "tag": "谷歌IP",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-ip/google.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
         "update_interval": "3d"
       },
       {
         "type": "remote",
         "tag": "微软服务",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-site/microsoft@cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
         "update_interval": "3d"
       },
       {
         "type": "remote",
         "tag": "国外域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-site/geolocation-!cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
         "update_interval": "3d"
       },
       {
         "type": "remote",
         "tag": "私有网络",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/meta-rules-dat/meta-rules-dat@release/geo/geo-ip/private.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
         "update_interval": "3d"
       },
       {
