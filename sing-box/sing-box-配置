@@ -6,12 +6,6 @@
   "dns": {
     "servers": [
       {
-        "type": "fakeip",
-        "tag": "fakeip",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
-      },
-      {
         "type": "https",
         "tag": "dns-google",
         "server": "dns.google",
@@ -50,20 +44,9 @@
         "tag": "dns-tencent",
         "server": "119.29.29.29",
         "server_port": 53
-      },
-      {
-        "type": "hosts",
-        "tag": "hosts",
-        "path": [],
-        "predefined": {}
       }
     ],
     "rules": [
-      {
-        "preferred_by": ["hosts"],
-        "action": "route",
-        "server": "hosts"
-      },
       {
         "clash_mode": "direct",
         "server": "dns-aliyun",
@@ -101,14 +84,6 @@
           "geosite-proxy"
         ],
         "server": "dns-google",
-        "action": "route"
-      },
-      {
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "server": "fakeip",
         "action": "route"
       }
     ],
@@ -367,7 +342,6 @@
       "enabled": true,
       "path": "cache.db",
       "cache_id": "",
-      "store_fakeip": true,
       "store_dns": true
     },
     "clash_api": {
