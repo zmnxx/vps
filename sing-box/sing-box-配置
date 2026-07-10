@@ -106,13 +106,13 @@
     {
       "type": "selector",
       "tag": "Proxy",
-      "outbounds": [],
+      "outbounds": ["自动选择兜底"],
       "default": "自动选择"
     },
     {
       "type": "urltest",
       "tag": "自动选择",
-      "outbounds": [],
+      "outbounds": ["自动选择兜底"],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
       "tolerance": 50,
@@ -148,6 +148,10 @@
     {
       "type": "direct",
       "tag": "国内直连"
+    },
+    {
+      "type": "direct",
+      "tag": "自动选择兜底"
     }
   ],
   "route": {
