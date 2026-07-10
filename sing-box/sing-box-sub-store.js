@@ -63,15 +63,16 @@ config.outbounds.push(...proxies);
 // 收集所有节点 tag
 const proxyTags = proxies.map((p) => p.tag);
 
-// ── 填充策略组 ──
+// ── 填充策略组：清空后全部用节点重建，注入后兜底节点不再需要 ──
 config.outbounds.forEach((outbound) => {
-  // Proxy（selector）：包含所有节点 + 自动选择
   if (outbound.tag === "Proxy" && Array.isArray(outbound.outbounds)) {
-    outbound.outbounds.push(...proxyTags);
+    // 清空兜底节点，填入所有真实节点 + 自动选择
+    outbound.outbounds = [...proxyTags, "自动选择"];
+    outbound.default = "自动选择";
   }
-  // 自动选择（urltest）：包含所有节点
   if (outbound.tag === "自动选择" && Array.isArray(outbound.outbounds)) {
-    outbound.outbounds.push(...proxyTags);
+    // 清空兜底节点，填入所有真实节点
+    outbound.outbounds = [...proxyTags];
   }
 });
 
