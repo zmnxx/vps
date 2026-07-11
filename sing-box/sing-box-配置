@@ -140,10 +140,6 @@
         "server": "fakeip"
       },
       {
-        "rule_set": [
-          "cn_domain",
-          "cn_ip"
-        ],
         "action": "evaluate",
         "server": "udp_dns"
       },
