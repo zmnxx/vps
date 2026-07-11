@@ -1,6 +1,6 @@
 {
   "log": {
-    "level": "info",
+    "level": "warn",
     "timestamp": true
   },
   "dns": {
@@ -65,17 +65,17 @@
         "action": "reject"
       },
       {
-        "rule_set": "国内域名",
-        "action": "route",
-        "server": "直连DNS"
-      },
-      {
         "rule_set": "谷歌域名",
         "action": "route",
         "server": "代理DNS"
       },
       {
         "rule_set": "微软域名",
+        "action": "route",
+        "server": "直连DNS"
+      },
+      {
+        "rule_set": "国内域名",
         "action": "route",
         "server": "直连DNS"
       },
@@ -238,14 +238,16 @@
         "outbound": "拦截"
       },
       {
-        "rule_set": "国内域名",
+        "domain_suffix": [
+          "googleapis.cn",
+          "google.cn",
+          "g.cn",
+          "google-analytics.cn",
+          "googletagmanager.cn",
+          "doubleclick.cn"
+        ],
         "action": "route",
-        "outbound": "国内服务"
-      },
-      {
-        "rule_set": "国内IP",
-        "action": "route",
-        "outbound": "国内服务"
+        "outbound": "谷歌服务"
       },
       {
         "rule_set": [
@@ -259,6 +261,16 @@
         "rule_set": "微软域名",
         "action": "route",
         "outbound": "微软服务"
+      },
+      {
+        "rule_set": "国内域名",
+        "action": "route",
+        "outbound": "国内服务"
+      },
+      {
+        "rule_set": "国内IP",
+        "action": "route",
+        "outbound": "国内服务"
       },
       {
         "rule_set": "非中国域名",
