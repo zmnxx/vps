@@ -38,6 +38,11 @@ let proxies = await produceArtifact({
 const infoKeywords = /网址|网站|获取|订阅|流量|到期|余量|续费|过期|重置|套餐|官网|面板|剩余|更新|expire|traffic|reset|plan|manual/gi;
 proxies = proxies.filter((p) => !infoKeywords.test(p.tag));
 
+// ─── 关键修复：将节点对象本身加入 outbounds 末尾 ──────────
+// selector/urltest 引用的 tag 必须在 config.outbounds 中有对应的节点对象，
+// 否则 sing-box 启动时报 "dependency not found for outbound"
+config.outbounds.push(...proxies);
+
 // 获取过滤后所有代理节点的 tag 列表
 const proxyTags = proxies.map((p) => p.tag);
 
@@ -57,17 +62,15 @@ config.outbounds.forEach((outbound) => {
     outbound.outbounds.push(...proxyTags);
   }
 
-  // auto-select（urltest 类型）：注入全部过滤后的代理节点用于自动测速
-  if (
-    outbound.type === "urltest" &&
-    outbound.tag === "auto-select"
-  ) {
+  // 所有 urltest 类型的组：注入全部过滤后的代理节点用于自动测速
+  // 不限定 tag 名，兼容 auto-select / 自动选择 等任意命名
+  if (outbound.type === "urltest") {
     outbound.outbounds.push(...proxyTags);
   }
 });
 
 // ─── 兜底处理 ────────────────────────────────────────────
-// 如果 auto-select 组没有任何节点（例如订阅为空），补充一个兜底 direct 节点
+// 如果 urltest 组没有任何节点（例如订阅为空），补充一个兜底 direct 节点
 config.outbounds.forEach((outbound) => {
   if (
     outbound.type === "urltest" &&
