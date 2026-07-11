@@ -7,116 +7,154 @@
     "servers": [
       {
         "type": "https",
-        "tag": "dns-proxy",
-        "server": "8.8.8.8",
+        "tag": "代理DNS",
+        "server": "1.1.1.1",
         "server_port": 443,
-        "dial": {
-          "detour": "代理"
-        }
+        "detour": "代理",
+        "domain_resolver": "本地DNS"
       },
       {
         "type": "https",
-        "tag": "dns-direct",
+        "tag": "直连DNS",
         "server": "223.5.5.5",
-        "server_port": 443
+        "server_port": 443,
+        "domain_resolver": "本地DNS"
+      },
+      {
+        "type": "local",
+        "tag": "本地DNS",
+        "prefer_go": true
+      },
+      {
+        "type": "fakeip",
+        "tag": "FakeIP",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      },
+      {
+        "type": "hosts",
+        "tag": "Hosts"
       }
     ],
     "rules": [
       {
-        "rule_set": "adrules",
+        "clash_mode": "AllowAds",
+        "action": "route",
+        "server": "直连DNS"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "server": "直连DNS"
+      },
+      {
+        "preferred_by": "hosts",
+        "action": "route",
+        "server": "Hosts"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "FakeIP"
+      },
+      {
+        "rule_set": "广告拦截",
         "action": "reject"
       },
       {
-        "rule_set": "geosite-google",
+        "rule_set": "国内域名",
         "action": "route",
-        "server": "dns-proxy"
+        "server": "直连DNS"
       },
       {
-        "rule_set": "geosite-microsoft",
+        "rule_set": "谷歌域名",
         "action": "route",
-        "server": "dns-direct"
+        "server": "代理DNS"
       },
       {
-        "rule_set": "geosite-geolocation-not-cn",
+        "rule_set": "微软域名",
         "action": "route",
-        "server": "dns-proxy"
+        "server": "直连DNS"
       },
       {
-        "rule_set": "geosite-cn",
+        "rule_set": "非中国域名",
         "action": "route",
-        "server": "dns-direct"
-      },
-      {
-        "rule_set": "geosite-private",
-        "action": "route",
-        "server": "dns-direct"
+        "server": "代理DNS"
       }
     ],
-    "final": "dns-proxy"
+    "final": "代理DNS",
+    "strategy": "prefer_ipv4",
+    "optimistic": {
+      "enabled": true,
+      "timeout": "3d"
+    },
+    "timeout": "10s",
+    "reverse_mapping": true
   },
-  "ntp": {
-    "enabled": true,
-    "server": "time.apple.com",
-    "server_port": 123,
-    "interval": "30m"
-  },
-  "http_clients": [
-    {
-      "tag": "ruleset-http",
-      "dial": {
-        "detour": "代理"
-      }
-    }
-  ],
   "inbounds": [
     {
       "type": "tun",
-      "tag": "tun-in",
+      "tag": "tun入站",
       "address": [
-        "172.19.0.1/30",
+        "172.18.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
       "mtu": 9000,
       "auto_route": true,
-      "strict_route": true
+      "strict_route": false,
+      "endpoint_independent_nat": true
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed入站",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
     }
   ],
   "outbounds": [
     {
       "type": "selector",
       "tag": "代理",
-      "outbounds": [],
-      "default": "自动选择"
+      "outbounds": [
+        "自动选择",
+        "直连"
+      ],
+      "default": "自动选择",
+      "interrupt_exist_connections": true
     },
     {
-      "type": "urltest",
+      "type": "selector",
       "tag": "自动选择",
-      "outbounds": []
+      "outbounds": [],
+      "interrupt_exist_connections": true
     },
     {
       "type": "selector",
       "tag": "广告拦截",
       "outbounds": [
-        "block-out",
-        "direct-out"
+        "拦截",
+        "直连"
       ],
-      "default": "block-out"
+      "default": "拦截"
     },
     {
       "type": "selector",
       "tag": "国内服务",
       "outbounds": [
-        "direct-out",
+        "直连",
         "代理"
       ],
-      "default": "direct-out"
+      "default": "直连"
     },
     {
       "type": "selector",
       "tag": "谷歌服务",
       "outbounds": [
         "代理",
-        "direct-out"
+        "直连"
       ],
       "default": "代理"
     },
@@ -124,145 +162,210 @@
       "type": "selector",
       "tag": "微软服务",
       "outbounds": [
-        "direct-out",
+        "直连",
         "代理"
       ],
-      "default": "direct-out"
+      "default": "直连"
     },
     {
       "type": "selector",
       "tag": "兜底策略",
       "outbounds": [
         "代理",
-        "direct-out",
-        "block-out"
+        "直连"
       ],
       "default": "代理"
     },
     {
       "type": "direct",
-      "tag": "direct-out"
+      "tag": "直连",
+      "domain_resolver": "本地DNS"
     },
     {
       "type": "block",
-      "tag": "block-out"
+      "tag": "拦截"
     }
   ],
   "route": {
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "geoip-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-google",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-google",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-microsoft",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-geolocation-not-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-private",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
-        "http_client": "ruleset-http"
-      },
-      {
-        "type": "remote",
-        "tag": "adrules",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
-        "http_client": "ruleset-http"
-      }
-    ],
     "rules": [
+      {
+        "clash_mode": "AllowAds",
+        "action": "sniff"
+      },
+      {
+        "clash_mode": "AllowAds",
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "sniff"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "clash_mode": "Global",
+        "action": "sniff"
+      },
+      {
+        "clash_mode": "Global",
+        "action": "route",
+        "outbound": "代理"
+      },
       {
         "action": "sniff"
       },
       {
-        "rule_set": "adrules",
-        "action": "route",
-        "outbound": "广告拦截"
+        "protocol": "dns",
+        "action": "hijack-dns"
       },
       {
-        "rule_set": "geoip-cn",
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "rule_set": "局域网",
+        "action": "route",
+        "outbound": "直连"
+      },
+      {
+        "rule_set": "广告拦截",
+        "action": "route",
+        "outbound": "拦截"
+      },
+      {
+        "rule_set": "国内域名",
         "action": "route",
         "outbound": "国内服务"
       },
       {
-        "rule_set": "geosite-cn",
+        "rule_set": "国内IP",
         "action": "route",
         "outbound": "国内服务"
       },
       {
-        "rule_set": "geosite-private",
-        "action": "route",
-        "outbound": "国内服务"
-      },
-      {
-        "rule_set": "geosite-google",
+        "rule_set": [
+          "谷歌域名",
+          "谷歌IP"
+        ],
         "action": "route",
         "outbound": "谷歌服务"
       },
       {
-        "rule_set": "geoip-google",
-        "action": "route",
-        "outbound": "谷歌服务"
-      },
-      {
-        "rule_set": "geosite-microsoft",
+        "rule_set": "微软域名",
         "action": "route",
         "outbound": "微软服务"
       },
       {
-        "rule_set": "geosite-geolocation-not-cn",
+        "rule_set": "非中国域名",
         "action": "route",
-        "outbound": "兜底策略"
+        "outbound": "代理"
       }
     ],
-    "final": "兜底策略",
-    "auto_detect_interface": true
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "国内IP",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "http_client": {
+          "detour": "直连"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "国内域名",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
+        "http_client": {
+          "detour": "直连"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "谷歌域名",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
+        "http_client": {
+          "detour": "代理"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "谷歌IP",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
+        "http_client": {
+          "detour": "代理"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "微软域名",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
+        "http_client": {
+          "detour": "直连"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "非中国域名",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
+        "http_client": {
+          "detour": "代理"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "局域网",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
+        "http_client": {
+          "detour": "直连"
+        },
+        "format": "binary"
+      },
+      {
+        "type": "remote",
+        "tag": "广告拦截",
+        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
+        "http_client": {
+          "detour": "直连"
+        },
+        "format": "binary"
+      }
+    ],
+    "auto_detect_interface": true,
+    "override_android_vpn": false,
+    "default_domain_resolver": {
+      "server": "本地DNS"
+    },
+    "final": "兜底策略"
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com",
+    "server_port": 123,
+    "interval": "30m",
+    "detour": "直连"
   },
   "experimental": {
-    "cache_file": {
-      "enabled": true
-    },
     "clash_api": {
       "external_controller": "127.0.0.1:9090",
-      "secret": "",
-      "default_mode": "rule"
+      "external_ui": "ui",
+      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
+      "external_ui_download_detour": "代理",
+      "default_mode": "Rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "store_fakeip": true,
+      "store_dns": true
     }
   }
 }
