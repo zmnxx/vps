@@ -1,7 +1,6 @@
 {
   "log": {
     "level": "warn",
-    "output": "sing-box.log",
     "timestamp": true
   },
   "dns": {
@@ -22,26 +21,26 @@
       },
       {
         "type": "https",
-        "tag": "代理DNS",
+        "tag": "代理 DNS",
         "server": "dns.google",
         "domain_resolver": "Hosts",
         "detour": "代理"
       },
       {
         "type": "https",
-        "tag": "直连DNS",
+        "tag": "直连 DNS",
         "server": "dns.alidns.com",
         "domain_resolver": "Hosts"
       },
       {
         "type": "udp",
-        "tag": "直连DNS-UDP",
+        "tag": "直连 UDP DNS",
         "server": "dns.alidns.com",
         "domain_resolver": "Hosts"
       },
       {
         "type": "local",
-        "tag": "本地DNS"
+        "tag": "本地 DNS"
       },
       {
         "type": "fakeip",
@@ -59,7 +58,7 @@
       {
         "clash_mode": "Direct",
         "action": "route",
-        "server": "直连DNS"
+        "server": "直连 DNS"
       },
       {
         "clash_mode": "Global",
@@ -69,7 +68,7 @@
       {
         "clash_mode": "Global",
         "action": "route",
-        "server": "代理DNS"
+        "server": "代理 DNS"
       },
       {
         "type": "logical",
@@ -80,15 +79,15 @@
             "invert": true
           },
           {
-            "rule_set": "广告拦截"
+            "rule_set": "广告"
           }
         ],
         "action": "predefined"
       },
       {
-        "rule_set": "局域网域名",
+        "rule_set": "私有网络",
         "action": "route",
-        "server": "本地DNS"
+        "server": "本地 DNS"
       },
       {
         "query_type": [
@@ -103,49 +102,58 @@
           ".lan",
           "miwifi.com"
         ],
-        "rule_set": "国内域名",
         "action": "route",
-        "server": "本地DNS"
+        "server": "本地 DNS"
       },
       {
-        "domain": [
-          "ghfast.top",
-          "cdn.jsdelivr.net"
-        ],
-        "domain_suffix": [
-          "tplogin.cn",
-          "router.asus.com",
-          "tendawifi.com",
-          "tplinkwifi.net",
-          "app-measurement.com",
-          "hm.baidu.com",
-          "tracking.miui.com",
-          "market.xiaomi.com",
-          "lancache.steamcontent.com"
-        ],
-        "rule_set": [
-          "国内域名",
-          "微软域名"
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "domain": [
+              "ghfast.top",
+              "cdn.jsdelivr.net"
+            ]
+          },
+          {
+            "domain_suffix": [
+              "tplogin.cn",
+              "router.asus.com",
+              "tendawifi.com",
+              "tplinkwifi.net",
+              "app-measurement.com",
+              "hm.baidu.com",
+              "tracking.miui.com",
+              "market.xiaomi.com",
+              "lancache.steamcontent.com"
+            ]
+          },
+          {
+            "rule_set": [
+              "国内域名",
+              "微软中国"
+            ]
+          }
         ],
         "action": "route",
-        "server": "直连DNS"
+        "server": "直连 DNS"
       },
       {
         "query_type": [
           "A",
           "AAAA"
         ],
-        "rule_set": "非中国域名",
+        "rule_set": "代理域名",
         "action": "route",
         "server": "FakeIP"
       },
       {
         "action": "evaluate",
-        "server": "直连DNS-UDP"
+        "server": "直连 UDP DNS"
       },
       {
         "action": "evaluate",
-        "server": "直连DNS"
+        "server": "直连 DNS"
       },
       {
         "type": "logical",
@@ -163,7 +171,7 @@
         "action": "respond"
       },
       {
-        "rule_set": "国内IP",
+        "rule_set": "国内 IP",
         "match_response": true,
         "action": "respond"
       },
@@ -173,10 +181,10 @@
       },
       {
         "action": "route",
-        "server": "代理DNS"
+        "server": "代理 DNS"
       }
     ],
-    "final": "直连DNS",
+    "final": "直连 DNS",
     "optimistic": true
   },
   "http_clients": [
@@ -187,14 +195,13 @@
     {
       "tag": "代理下载",
       "version": 2,
-      "headers": {},
       "detour": "代理"
     }
   ],
   "inbounds": [
     {
       "type": "tun",
-      "tag": "tun入站",
+      "tag": "TUN 入站",
       "address": [
         "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
@@ -202,13 +209,20 @@
       "mtu": 9000,
       "stack": "mixed",
       "auto_route": true,
-      "auto_redirect": false
+      "strict_route": true,
+      "auto_redirect": false,
+      "endpoint_independent_nat": true,
+      "udp_timeout": "5m",
+      "exclude_package": [
+        "com.android.captiveportallogin",
+        "com.google.android.captiveportallogin"
+      ]
     },
     {
       "type": "mixed",
-      "tag": "mixed入站",
+      "tag": "mixed 入站",
       "listen": "127.0.0.1",
-      "listen_port": 2080,
+      "listen_port": 7890,
       "set_system_proxy": false
     }
   ],
@@ -217,17 +231,18 @@
       "type": "selector",
       "tag": "代理",
       "outbounds": [
-        "自动选择",
-        "直连"
+        "直连",
+        "自动选择"
       ],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
+      "default": "自动选择"
     },
     {
       "type": "urltest",
       "tag": "自动选择",
       "outbounds": [],
-      "interval": "2m0s",
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "2m",
+      "tolerance": 50,
       "interrupt_exist_connections": true
     },
     {
@@ -281,7 +296,7 @@
     {
       "type": "direct",
       "tag": "直连",
-      "domain_resolver": "直连DNS"
+      "domain_resolver": "直连 DNS"
     },
     {
       "type": "block",
@@ -290,6 +305,20 @@
   ],
   "route": {
     "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic",
+          "dns"
+        ]
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
       {
         "network": "icmp",
         "action": "route",
@@ -311,7 +340,17 @@
         "outbound": "直连"
       },
       {
-        "action": "sniff"
+        "package_name": [
+          "com.xunlei.downloadprovider",
+          "com.xunlei.downloadprovider.oversea",
+          "com.baidu.netdisk",
+          "com.baidu.netdisk.samsung",
+          "com.utorrent.client",
+          "com.bittorrent.client",
+          "org.qbittorrent.client"
+        ],
+        "action": "route",
+        "outbound": "直连"
       },
       {
         "type": "logical",
@@ -322,7 +361,7 @@
             "invert": true
           },
           {
-            "rule_set": "广告拦截"
+            "rule_set": "广告"
           }
         ],
         "action": "reject"
@@ -335,14 +374,14 @@
             "protocol": "stun"
           },
           {
-            "rule_set": "国内IP",
+            "rule_set": "国内 IP",
             "invert": true
           }
         ],
         "action": "reject"
       },
       {
-        "rule_set": "广告拦截",
+        "rule_set": "广告",
         "action": "route",
         "outbound": "广告拦截"
       },
@@ -352,12 +391,12 @@
         "outbound": "谷歌服务"
       },
       {
-        "rule_set": "谷歌IP",
+        "rule_set": "谷歌 IP",
         "action": "route",
         "outbound": "谷歌服务"
       },
       {
-        "rule_set": "微软域名",
+        "rule_set": "微软中国",
         "action": "route",
         "outbound": "微软服务"
       },
@@ -367,13 +406,27 @@
         "outbound": "国内服务"
       },
       {
-        "rule_set": "国内IP",
+        "rule_set": "国内 IP",
         "action": "route",
         "outbound": "国内服务"
       },
       {
-        "domain": "captive.apple.com",
-        "domain_suffix": "wiwide.com",
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "domain": "captive.apple.com"
+          },
+          {
+            "domain_suffix": [
+              "wiwide.com",
+              "miwifi.com"
+            ]
+          },
+          {
+            "rule_set": "私有网络"
+          }
+        ],
         "action": "route",
         "outbound": "直连"
       },
@@ -381,61 +434,79 @@
         "domain": "apps.apple.com",
         "action": "route",
         "outbound": "代理"
-      },
-      {
-        "domain_suffix": "miwifi.com",
-        "rule_set": "局域网域名",
-        "action": "route",
-        "outbound": "直连"
       }
     ],
     "rule_set": [
       {
         "type": "remote",
-        "tag": "国内IP",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+        "tag": "国内 IP",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "http_client": "直连下载",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
         "tag": "国内域名",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs"
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
+        "http_client": "直连下载",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
         "tag": "谷歌域名",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs"
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
+        "http_client": "直连下载",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "谷歌IP",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs"
+        "tag": "谷歌 IP",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
+        "http_client": "直连下载",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "微软域名",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs"
+        "tag": "微软中国",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
+        "http_client": "直连下载",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "非中国域名",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
+        "tag": "代理域名",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
+        "http_client": "直连下载",
+        "update_interval": "1d"
       },
       {
         "type": "remote",
-        "tag": "局域网域名",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs"
+        "tag": "私有网络",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
+        "http_client": "直连下载",
+        "update_interval": "7d"
       },
       {
         "type": "remote",
-        "tag": "广告拦截",
-        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs"
+        "tag": "广告",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
+        "http_client": "代理下载",
+        "update_interval": "1d"
       }
     ],
     "final": "兜底策略",
     "auto_detect_interface": true,
     "override_android_vpn": false,
     "default_domain_resolver": {
-      "server": "直连DNS",
+      "server": "直连 DNS",
       "disable_optimistic_cache": true
     },
     "default_http_client": "代理下载"
@@ -444,21 +515,22 @@
     "enabled": true,
     "server": "ntp.aliyun.com",
     "server_port": 123,
-    "interval": "30m0s",
+    "interval": "30m",
     "domain_resolver": "Hosts"
   },
   "experimental": {
-    "clash_api": {
-      "external_controller": "127.0.0.1:9090",
-      "external_ui": "ui",
-      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
-      "external_ui_download_detour": "代理",
-      "default_mode": "Rule"
-    },
     "cache_file": {
       "enabled": true,
       "store_fakeip": true,
       "store_dns": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "ui",
+      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip",
+      "external_ui_download_detour": "代理",
+      "secret": "",
+      "default_mode": "Rule"
     }
   }
 }
