@@ -1,0 +1,441 @@
+# --- 基础设置 ---
+mixed-port: 7890
+allow-lan: false
+bind-address: "*"
+mode: rule
+log-level: warning
+ipv6: true
+
+# --- 内核特性 ---
+unified-delay: true
+tcp-concurrent: true
+
+external-controller: 127.0.0.1:9090
+secret: ""
+# FlClash 有原生界面，不需要再下 metacubexd；省流量/存储，已去掉 external-ui
+
+# Android 上 PROCESS 规则可用包名，但多数场景用不到；关可省开销
+# 若要用 PROCESS-NAME,com.xxx 分流，改为 strict
+find-process-mode: off
+
+# 文档建议移动端 15s 降耗电；Android 上 disable-keep-alive 会被内核强制 true
+# （见官方 config 注释），这两项在纯 Android 上可能不生效，留着兼容无害
+keep-alive-interval: 15
+keep-alive-idle: 15
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+# --- GEO 数据库 ---
+# geodata-mode: true → GEOIP/GEOSITE 用 .dat
+geodata-mode: true
+# 手机内存有限：官方默认/推荐 memconservative，不要用 standard
+geodata-loader: memconservative
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  # testingcf 对国内较稳；也可用 fastly.jsdelivr.net
+  geoip: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  geosite: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  # 官方示例已倾向 geoip.metadb（兼容 mmdb 用途）
+  mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb"
+  asn: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"
+
+# --- TUN（FlClash VPN 模式）---
+tun:
+  enable: true
+  # mixed: TCP=system + UDP=gvisor，Android 体验通常更好；不稳可改 system
+  stack: mixed
+  auto-route: true
+  # Android 上仅转发本机 IPv4；热点共享需 VPNHotspot 等
+  auto-redirect: true
+  auto-detect-interface: true
+  # 避免 ICMP 环回；开启后 ping 不显示真实延迟
+  disable-icmp-forwarding: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  # Android 上有助于 DNS 劫持与防泄漏
+  strict-route: true
+  # 放行系统强制门户检测（Wi‑Fi 登录页），避免连公共 Wi‑Fi 异常
+  exclude-package:
+    - com.android.captiveportallogin
+    - com.google.android.captiveportallogin
+
+# --- NTP（校对节点 TLS 时间）---
+ntp:
+  enable: true
+  # Android 无 root 不要写系统时间
+  write-to-system: false
+  server: time.apple.com
+  port: 123
+  # 单位：分钟
+  interval: 30
+
+# --- 域名嗅探 ---
+# fake-ip 模式下多数流量已有域名，默认可关；纯 IP/漏域名再开
+sniffer:
+  enable: false
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: false
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    # QUIC 嗅探可能影响部分 HTTP/3，非必要别开
+    # QUIC:
+    #   ports: [443, 8443]
+  skip-domain:
+    - Mijia Cloud
+    - "+.push.apple.com"
+
+# ================================================================
+# 订阅节点
+# ================================================================
+proxy-providers:
+  订阅一:
+    type: http
+    # ↓↓↓ 改成真实订阅链接（不要留前导空格）↓↓↓
+    url: "YOUR_SUBSCRIBE_URL"
+    interval: 86400
+    path: ./providers/proxy/sub1.yaml
+    proxy: DIRECT
+    health-check:
+      enable: true
+      interval: 600
+      lazy: true
+      url: https://www.gstatic.com/generate_204
+      # 与 generate_204 匹配，减少误判
+      expected-status: 204
+      timeout: 5000
+
+  # 订阅二:
+  #   type: http
+  #   url: "YOUR_SUBSCRIBE_URL_2"
+  #   interval: 86400
+  #   path: ./providers/proxy/sub2.yaml
+  #   proxy: DIRECT
+  #   health-check:
+  #     enable: true
+  #     interval: 600
+  #     lazy: true
+  #     url: https://www.gstatic.com/generate_204
+  #     expected-status: 204
+  #     timeout: 5000
+
+# ================================================================
+# 规则集
+# ================================================================
+rule-providers:
+  去广告:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-mihomo.mrs"
+    path: ./ruleset/adrules-mihomo.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  谷歌域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs"
+    path: ./ruleset/google_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  电报域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/telegram.mrs"
+    path: ./ruleset/telegram_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  电报IP:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs"
+    path: ./ruleset/telegram_ip.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  国内域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs"
+    path: ./ruleset/cn_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  国内IP:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs"
+    path: ./ruleset/cn_ip.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  苹果中国:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple@cn.mrs"
+    path: ./ruleset/apple_cn.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  GFW列表:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/gfw.mrs"
+    path: ./ruleset/gfw_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+
+  # 私有域名（可选增强）
+  私有域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs"
+    path: ./ruleset/private_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+
+# ================================================================
+# DNS
+# 原则（对照官方 DNS 文档）:
+# 1) nameserver = 国内可信解析（直连站）
+# 2) fallback   = 境外抗污染
+# 3) nameserver-policy 优先于 nameserver/fallback
+# 4) proxy-server-nameserver 专解析节点域名，避免鸡生蛋
+# 5) fallback-filter.geosite 已废弃 → 用 nameserver-policy
+# 6) respect-rules 需 proxy-server-nameserver；手机上建议 false 更稳
+# ================================================================
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: fdfe:dcba:9876::1/64
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    # 局域网 / 本机
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "*.home.arpa"
+    - localhost.ptlogin2.qq.com
+    # 连通性检测
+    - dns.msftncsi.com
+    - www.msftncsi.com
+    - www.msftconnecttest.com
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    # 时间同步（fake-ip 会导致校时失败）
+    - time.*.com
+    - time.*.gov
+    - time.*.edu.cn
+    - time.*.apple.com
+    - time-ios.apple.com
+    - "*.ntp.org.cn"
+    - "*.pool.ntp.org"
+    - ntp.*.com
+    # STUN
+    - "*.stun.*"
+    - stun.*.*
+    - stun.*.*.*
+    - lens.l.google.com
+    # 国内/私有/苹果中国走真实 IP，兼容性更好
+    - "geosite:cn,private,apple-cn"
+    # 注意: 不要把 category-ads-all 放进 fake-ip-filter
+    # 广告在 nameserver-policy 里用 rcode://success 直接黑洞即可
+
+  # 只能写 IP（或 system），用于解析 DoH/DoT 服务器域名
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+    - 1.1.1.1
+    - 8.8.8.8
+    - "2400:3200::1"
+    - "2402:4e00::"
+    - system
+
+  # 主 DNS：只用国内，和 fallback 分工清晰
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+
+  # 后备：境外
+  fallback:
+    - https://dns.google/dns-query
+    - https://cloudflare-dns.com/dns-query
+    - tls://8.8.4.4
+    - tls://1.0.0.1
+
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+      - 0.0.0.0/32
+      - 127.0.0.1/32
+      - 100.64.0.0/10
+    domain:
+      - "+.google.com"
+      - "+.facebook.com"
+      - "+.youtube.com"
+      - "+.githubusercontent.com"
+      - "+.twitter.com"
+      - "+.x.com"
+    # geosite 字段已废弃，勿再写；改用下方 nameserver-policy
+
+  # 解析代理节点域名（必须有，尤其在 respect-rules 或复杂 DNS 时）
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+
+  # DIRECT 出站域名解析（可选但推荐）
+  direct-nameserver:
+    - system
+    - 223.5.5.5
+  direct-nameserver-follow-policy: false
+
+  nameserver-policy:
+    "geosite:cn,private,apple-cn":
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+    "geosite:category-ads-all": rcode://success
+    "geosite:geolocation-!cn,gfw":
+      - https://dns.google/dns-query
+      - https://cloudflare-dns.com/dns-query
+
+  # 手机端建议 false：DNS 始终按上面服务器策略走，少一次规则依赖，更稳更省事
+  # 若改为 true，必须保证 proxy-server-nameserver 有效（已配置）
+  respect-rules: false
+  use-hosts: true
+  use-system-hosts: true
+  cache-algorithm: arc
+  # 文档：强烈不建议与 respect-rules 同开；手机 DoH/H3 兼容性一般，保持 false
+  prefer-h3: false
+
+# ================================================================
+# 策略组
+# ================================================================
+proxy-groups:
+  - name: 手动选择
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Static.png
+    use:
+      - 订阅一
+      # - 订阅二
+    proxies:
+      - 自动选择
+      - DIRECT
+
+  - name: 自动选择
+    type: url-test
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Auto.png
+    use:
+      - 订阅一
+      # - 订阅二
+    url: https://www.gstatic.com/generate_204
+    # 原 1600s 偏长，测速滞后；600s 在耗电和时效之间更均衡
+    interval: 600
+    tolerance: 50
+    lazy: true
+    expected-status: 204
+    timeout: 5000
+
+  - name: 去广告
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Advertising.png
+    proxies:
+      - REJECT
+      - DIRECT
+
+  - name: 国内
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/China_Map.png
+    proxies:
+      - DIRECT
+      - 手动选择
+      - 自动选择
+
+  - name: 谷歌
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Google_Search.png
+    proxies:
+      - 手动选择
+      - 自动选择
+      - DIRECT
+
+  - name: 电报
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png
+    proxies:
+      - 手动选择
+      - 自动选择
+      - DIRECT
+
+  - name: 兜底
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Final.png
+    proxies:
+      - 手动选择
+      - 自动选择
+      - DIRECT
+
+# ================================================================
+# 分流规则（自上而下，先匹配先生效）
+# ================================================================
+rules:
+  # ---------- 自定义（取消注释即用）----------
+  # - DOMAIN-SUFFIX,example.com,国内
+  # - DOMAIN-SUFFIX,openai.com,手动选择
+  # - DOMAIN-SUFFIX,googleapis.cn,国内
+
+  # ---------- 广告 ----------
+  - RULE-SET,去广告,去广告
+
+  # ---------- 局域网 / 私有（原稿缺失，Android 很重要）----------
+  - RULE-SET,私有域名,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+
+  # ---------- 域名类（先于 IP 类）----------
+  - RULE-SET,私有域名,国内
+  - RULE-SET,苹果中国,国内
+  - RULE-SET,谷歌域名,谷歌
+  - RULE-SET,电报域名,电报
+  - RULE-SET,国内域名,国内
+  - RULE-SET,GFW列表,兜底
+
+  # ---------- IP 类 ----------
+  - RULE-SET,电报IP,电报,no-resolve
+  - RULE-SET,国内IP,国内,no-resolve
+  # 规则集下载失败时的兜底（geodata-mode 下可用）
+  - GEOIP,CN,国内,no-resolve
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+
+  # ---------- 最终兜底 ----------
+  - MATCH,兜底
