@@ -77,21 +77,18 @@
         "server": "直连DNS"
       },
       {
-        "rule_set": "微软中国域名",
+        "rule_set": [
+          "微软中国域名",
+          "微软域名"
+        ],
         "action": "route",
         "server": "直连DNS"
       },
       {
-        "rule_set": "谷歌域名",
-        "query_type": [
-          "A",
-          "AAAA"
+        "rule_set": [
+          "谷歌域名",
+          "非中国域名"
         ],
-        "action": "route",
-        "server": "FakeIP"
-      },
-      {
-        "rule_set": "非中国域名",
         "query_type": [
           "A",
           "AAAA"
@@ -131,6 +128,7 @@
       "auto_route": true,
       "strict_route": true,
       "stack": "mixed",
+      "udp_timeout": "30m",
       "platform": {
         "http_proxy": {
           "enabled": true,
@@ -156,17 +154,17 @@
         "拦截"
       ],
       "default": "自动选择",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "urltest",
       "tag": "自动选择",
       "outbounds": [],
       "url": "https://www.gstatic.com/generate_204",
-      "interval": "3m",
+      "interval": "10m",
       "tolerance": 50,
       "idle_timeout": "30m",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
@@ -178,7 +176,7 @@
         "自动选择"
       ],
       "default": "拦截",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
@@ -190,7 +188,7 @@
         "拦截"
       ],
       "default": "直连",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
@@ -202,19 +200,19 @@
         "拦截"
       ],
       "default": "代理",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
       "tag": "微软服务",
       "outbounds": [
-        "直连",
         "代理",
+        "直连",
         "自动选择",
         "拦截"
       ],
-      "default": "直连",
-      "interrupt_exist_connections": true
+      "default": "代理",
+      "interrupt_exist_connections": false
     },
     {
       "type": "selector",
@@ -226,7 +224,7 @@
         "拦截"
       ],
       "default": "代理",
-      "interrupt_exist_connections": true
+      "interrupt_exist_connections": false
     },
     {
       "type": "direct",
@@ -281,7 +279,10 @@
         "outbound": "谷歌服务"
       },
       {
-        "rule_set": "微软中国域名",
+        "rule_set": [
+          "微软域名",
+          "微软中国域名"
+        ],
         "action": "route",
         "outbound": "微软服务"
       },
@@ -312,7 +313,7 @@
         "type": "remote",
         "tag": "国内域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/cn.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
         "http_client": "直连下载",
         "update_interval": "1d"
       },
@@ -320,7 +321,7 @@
         "type": "remote",
         "tag": "谷歌域名",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geosite/google.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
         "http_client": "代理下载",
         "update_interval": "1d"
       },
@@ -328,7 +329,15 @@
         "type": "remote",
         "tag": "谷歌IP",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo-lite/geoip/google.srs",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs",
+        "http_client": "代理下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "微软域名",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft.srs",
         "http_client": "代理下载",
         "update_interval": "1d"
       },
