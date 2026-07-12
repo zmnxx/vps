@@ -1,6 +1,6 @@
 {
   "log": {
-    "level": "warn",
+    "level": "info",
     "timestamp": true
   },
   "dns": {
@@ -59,11 +59,6 @@
         "clash_mode": "Direct",
         "action": "route",
         "server": "直连 DNS"
-      },
-      {
-        "clash_mode": "Global",
-        "query_type": "AAAA",
-        "action": "predefined"
       },
       {
         "clash_mode": "Global",
@@ -176,15 +171,14 @@
         "action": "respond"
       },
       {
-        "query_type": "AAAA",
-        "action": "predefined"
-      },
-      {
         "action": "route",
         "server": "代理 DNS"
       }
     ],
     "final": "直连 DNS",
+    "strategy": "prefer_ipv4",
+    "independent_cache": true,
+    "reverse_mapping": true,
     "optimistic": true
   },
   "http_clients": [
@@ -206,8 +200,8 @@
         "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
-      "mtu": 9000,
-      "stack": "mixed",
+      "mtu": 1500,
+      "stack": "gvisor",
       "auto_route": true,
       "strict_route": true,
       "auto_redirect": false,
@@ -234,7 +228,8 @@
         "直连",
         "自动选择"
       ],
-      "default": "自动选择"
+      "default": "自动选择",
+      "interrupt_exist_connections": true
     },
     {
       "type": "urltest",
@@ -296,7 +291,10 @@
     {
       "type": "direct",
       "tag": "直连",
-      "domain_resolver": "直连 DNS"
+      "domain_resolver": {
+        "server": "直连 DNS",
+        "strategy": "prefer_ipv4"
+      }
     },
     {
       "type": "block",
@@ -307,12 +305,13 @@
     "rules": [
       {
         "action": "sniff",
-        "timeout": "300ms",
+        "timeout": "500ms",
         "sniffer": [
           "http",
           "tls",
           "quic",
-          "dns"
+          "dns",
+          "stun"
         ]
       },
       {
@@ -507,6 +506,7 @@
     "override_android_vpn": false,
     "default_domain_resolver": {
       "server": "直连 DNS",
+      "strategy": "prefer_ipv4",
       "disable_optimistic_cache": true
     },
     "default_http_client": "代理下载"
