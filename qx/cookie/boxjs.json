@@ -3,7 +3,7 @@
   "name": "联通/移动 Cookie 抓取",
   "author": "zmnxx",
   "icon": "https://raw.githubusercontent.com/Orz-3/mini/master/Color/10010.png",
-  "repo": "https://github.com/zmnxx/vps/tree/main/圈X/cookie",
+  "repo": "https://github.com/zmnxx/vps/tree/main/qx/cookie",
   "apps": [
     {
       "id": "ChinaUnicomCookie",
@@ -28,7 +28,7 @@
         }
       ],
       "author": "zmnxx",
-      "repo": "https://github.com/zmnxx/vps/tree/main/圈X/cookie",
+      "repo": "https://github.com/zmnxx/vps/tree/main/qx/cookie",
       "icons": [
         "https://raw.githubusercontent.com/Orz-3/mini/master/Color/10010.png",
         "https://raw.githubusercontent.com/Orz-3/mini/master/Color/10010.png"
@@ -85,7 +85,7 @@
         }
       ],
       "author": "zmnxx",
-      "repo": "https://github.com/zmnxx/vps/tree/main/圈X/cookie",
+      "repo": "https://github.com/zmnxx/vps/tree/main/qx/cookie",
       "icons": [
         "https://raw.githubusercontent.com/Orz-3/mini/master/Color/10086.png",
         "https://raw.githubusercontent.com/Orz-3/mini/master/Color/10086.png"

@@ -1,8 +1,10 @@
 # 联通 / 移动 Cookie 获取（Quantumult X）
 
-仓库路径：[`圈X/cookie`](https://github.com/zmnxx/vps/tree/main/圈X/cookie)
+仓库路径：[`qx/cookie`](https://github.com/zmnxx/vps/tree/main/qx/cookie)
 
 仅抓取 Cookie（移动额外保存登录 Body），给圈 X 重写使用。
+
+> 路径使用纯英文 `qx/cookie`，避免中文目录在 GitHub / 圈 X 中乱码。
 
 ## 文件
 
@@ -18,13 +20,13 @@
 ## 一键订阅（圈 X）
 
 ```text
-https://raw.githubusercontent.com/zmnxx/vps/main/%E5%9C%88X/cookie/all.qx.conf
+https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/all.qx.conf
 ```
 
 备用（jsDelivr）：
 
 ```text
-https://cdn.jsdelivr.net/gh/zmnxx/vps@main/圈X/cookie/all.qx.conf
+https://cdn.jsdelivr.net/gh/zmnxx/vps@main/qx/cookie/all.qx.conf
 ```
 
 ## 使用步骤
@@ -54,8 +56,8 @@ https://cdn.jsdelivr.net/gh/zmnxx/vps@main/圈X/cookie/all.qx.conf
 ## 脚本直链
 
 ```text
-https://raw.githubusercontent.com/zmnxx/vps/main/%E5%9C%88X/cookie/china_unicom_cookie.js
-https://raw.githubusercontent.com/zmnxx/vps/main/%E5%9C%88X/cookie/china_mobile_cookie.js
+https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/china_unicom_cookie.js
+https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/china_mobile_cookie.js
 ```
 
 ## 注意

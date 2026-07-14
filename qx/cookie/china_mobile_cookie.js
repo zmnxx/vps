@@ -19,7 +19,7 @@
  * 移动新版接口除 Cookie 外，常依赖登录 body 里的加密字段。
  * 本脚本会同时保存 Cookie 和 request body。
  *
- * 仓库：https://github.com/zmnxx/vps/tree/main/圈X/cookie
+ * 仓库：https://github.com/zmnxx/vps/tree/main/qx/cookie
  */
 
 const NAME = "ChinaMobile_Cookie";

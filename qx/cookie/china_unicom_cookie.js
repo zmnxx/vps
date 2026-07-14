@@ -12,7 +12,7 @@
  * - ChinaUnicom_Cookie
  * - YaYa_10010.cookie（兼容旧脚本）
  *
- * 仓库：https://github.com/zmnxx/vps/tree/main/圈X/cookie
+ * 仓库：https://github.com/zmnxx/vps/tree/main/qx/cookie
  */
 
 const NAME = "ChinaUnicom_Cookie";
