@@ -1,133 +1,48 @@
-# 联通 / 移动 Cookie 获取（Quantumult X）
+# 中国联通 Cookie 获取（单文件）
 
-仓库路径：[`qx/cookie`](https://github.com/zmnxx/vps/tree/main/qx/cookie)
-
-仅抓取 Cookie（移动额外保存登录 Body）。
-
-## 一键订阅（重写引用）
+只保留联通，只有一个脚本文件：
 
 ```text
-https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/all.qx.conf
+qx/cookie/china_unicom_cookie.js
 ```
 
-备用：
+## 脚本地址
 
 ```text
-https://cdn.jsdelivr.net/gh/zmnxx/vps@main/qx/cookie/all.qx.conf
+https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/china_unicom_cookie.js
 ```
 
-## 圈 X 导入步骤（很重要）
+## 圈 X 配置（手动，最稳）
 
-1. 打开 **Quantumult X**
-2. 右下角 **风车** → **重写**
-3. 点右上角 **引用**
-4. 粘贴上面的链接，标签随便写：`cookie`
-5. 保存后 **开启** 该重写资源
-6. 回到风车 → **MitM**  
-   - 开启 MitM  
-   - 生成并安装证书，系统里「信任」证书  
-   - 主机名里应自动有：  
-     `m.client.10010.com, client.app.coc.10086.cn`  
-     （没有就手动加）
-7. 再开一次 **重写** 总开关
+### 1. 重写规则
 
-> 注意：这是「重写资源」链接，不是「配置文件 / 节点订阅」。  
-> 不要丢到「商店 / 画廊 / 配置文件」里硬导。
-
-## 抓取方法
-
-| 运营商 | 操作 | 成功提示 |
-|--------|------|----------|
-| 联通 | 打开联通 App → 首页点 **流量 / 语音** | Cookie 获取成功 |
-| 移动 | 打开移动 App → **验证码登录** | 参数获取成功 |
-
-## 文件说明
-
-| 文件 | 用途 |
-|------|------|
-| `all.qx.conf` | 联通+移动 合并重写资源（推荐） |
-| `china_unicom_cookie.qx.conf` | 仅联通 |
-| `china_mobile_cookie.qx.conf` | 仅移动 |
-| `china_unicom_cookie.js` | 联通脚本 |
-| `china_mobile_cookie.js` | 移动脚本 |
-| `boxjs.json` | 可选，查看已抓到的值 |
-
-## 查看已抓到的 Cookie（重要）
-
-通知里只显示「成功 / 预览」，**完整 Cookie 不会弹在通知上**（太长且不安全）。
-
-### 方法 1：导入查看任务（推荐）
-
-```text
-https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/task.qx.conf
-```
-
-1. 圈 X → 风车 → **定时任务** → **引用** 上面链接  
-2. 找到任务 **查看Cookie** → 点右侧运行  
-3. 打开 **运行结果 / 日志**，里面是完整 Cookie / Body
-
-也可直接添加任务：
-
-```text
-0 0 1 1 * https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/view_cookie.js, tag=查看Cookie, img-url=https://raw.githubusercontent.com/Orz-3/mini/master/Color/10010.png, enabled=true
-```
-
-### 方法 2：看脚本日志
-
-抓取成功后：  
-风车 → 最近日志 / JS 日志，搜索：
-
-- `china_mobile_cookie`
-- `ChinaUnicom_Cookie`
-- `Cookie 全文`
-
-### 方法 3：BoxJS
-
-订阅：
-
-```text
-https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/boxjs.json
-```
-
-在 BoxJS 里查看对应 key。
-
-## 存储 Key
-
-### 联通
-- `ChinaUnicom_Cookie`
-- `YaYa_10010.cookie`
-
-### 移动
-- `china_mobile_cookie`
-- `china_mobile_body`
-- `china_mobile_url`
-- `china_mobile_headers`
-- `china_mobile_phonenumber`
-
-## 如果还是导入失败
-
-### 方案 A：手动添加（最稳）
-
-风车 → 重写 → 规则 → 添加两条：
+风车 → 重写 → 规则 → 添加：
 
 ```text
 ^https?:\/\/m\.client\.10010\.com\/.+\/smartwisdomCommon url script-request-header https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/china_unicom_cookie.js
-
-^https?:\/\/client\.app\.coc\.10086\.cn\/biz-orange\/[LD]N\/(uam(onekey|randcode)login|realPersonAuthentication)\/autoLogin url script-request-body https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/china_mobile_cookie.js
 ```
 
-然后 MitM 主机名加入：
+### 2. MitM 主机名
 
 ```text
-m.client.10010.com, client.app.coc.10086.cn
+m.client.10010.com
 ```
 
-### 方案 B：Safari 打开链接检查
+开启 MitM，安装并信任证书，打开重写总开关。
 
-用 Safari 打开订阅链接，应直接显示文本内容，而不是 GitHub 网页。
+## 抓取
 
-## 注意
+1. 打开 **中国联通** App  
+2. 首页点 **流量 / 语音**  
+3. 通知：**Cookie 获取成功**  
+4. **通知正文就是完整 Cookie**，可直接复制  
 
-- Cookie 属于账号凭证，勿公开分享  
-- 移动部分接口不只靠 Cookie，脚本会连登录 Body 一起保存  
-- 仅供个人学习/查询使用
+## 再次查看
+
+把该脚本加到「定时任务」后手动运行，或在重写里点脚本运行：  
+会读取本地已保存的 Cookie 并再次通知显示。
+
+## 存储 Key
+
+- `ChinaUnicom_Cookie`
+- `YaYa_10010.cookie`（兼容旧脚本）
