@@ -82,11 +82,22 @@ function capture() {
       .filter(Boolean)
       .join(" | ");
 
-    $.msg("中国移动", "✅ 参数获取成功", tip);
+    // 通知只显示摘要；完整内容写日志，避免通知被截断/泄露
+    $.msg(
+      "中国移动",
+      "✅ 参数获取成功",
+      tip + (cookie ? `\nCookie预览: ${short(cookie, 50)}` : "") + "\n完整内容请运行「查看Cookie」任务或看日志"
+    );
+    $.log("======== 中国移动 抓取结果 ========");
     $.log(`URL: ${url}`);
     $.log(`Method: ${method}`);
-    $.log(`Cookie: ${short(cookie)}`);
-    $.log(`Body: ${short(body, 120)}`);
+    $.log(`Phone: ${phone || "(未识别)"}`);
+    $.log(`Cookie Key: ${KEY_COOKIE}`);
+    $.log(`Cookie 全文:\n${cookie || "(空)"}`);
+    $.log(`Body Key: ${KEY_BODY}`);
+    $.log(`Body 全文:\n${body || "(空)"}`);
+    $.log("================================");
+
   } catch (e) {
     $.msg("中国移动", "❌ 获取失败", String(e));
     $.log(e);

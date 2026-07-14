@@ -52,6 +52,45 @@ https://cdn.jsdelivr.net/gh/zmnxx/vps@main/qx/cookie/all.qx.conf
 | `china_mobile_cookie.js` | 移动脚本 |
 | `boxjs.json` | 可选，查看已抓到的值 |
 
+## 查看已抓到的 Cookie（重要）
+
+通知里只显示「成功 / 预览」，**完整 Cookie 不会弹在通知上**（太长且不安全）。
+
+### 方法 1：导入查看任务（推荐）
+
+```text
+https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/task.qx.conf
+```
+
+1. 圈 X → 风车 → **定时任务** → **引用** 上面链接  
+2. 找到任务 **查看Cookie** → 点右侧运行  
+3. 打开 **运行结果 / 日志**，里面是完整 Cookie / Body
+
+也可直接添加任务：
+
+```text
+0 0 1 1 * https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/view_cookie.js, tag=查看Cookie, img-url=https://raw.githubusercontent.com/Orz-3/mini/master/Color/10010.png, enabled=true
+```
+
+### 方法 2：看脚本日志
+
+抓取成功后：  
+风车 → 最近日志 / JS 日志，搜索：
+
+- `china_mobile_cookie`
+- `ChinaUnicom_Cookie`
+- `Cookie 全文`
+
+### 方法 3：BoxJS
+
+订阅：
+
+```text
+https://raw.githubusercontent.com/zmnxx/vps/main/qx/cookie/boxjs.json
+```
+
+在 BoxJS 里查看对应 key。
+
 ## 存储 Key
 
 ### 联通

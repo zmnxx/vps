@@ -54,8 +54,16 @@ function getCookie() {
     $.setdata(cookie, NAME);
     $.setdata(cookie, LEGACY_KEY);
 
-    $.msg("中国联通", "✅ Cookie 获取成功", short(cookie));
+    $.msg(
+      "中国联通",
+      "✅ Cookie 获取成功",
+      `预览: ${short(cookie, 50)}\n完整内容请运行「查看Cookie」任务或看日志`
+    );
+    $.log("======== 中国联通 抓取结果 ========");
     $.log("Cookie 已写入: " + NAME + " / " + LEGACY_KEY);
+    $.log("Cookie 全文:\n" + cookie);
+    $.log("================================");
+
   } catch (e) {
     $.msg("中国联通", "❌ Cookie 获取失败", String(e));
     $.log(e);
