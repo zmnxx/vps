@@ -50,13 +50,6 @@
         "detour": "手动选择"
       },
       {
-        "type": "https",
-        "tag": "dns-谷歌",
-        "server": "8.8.8.8",
-        "domain_resolver": "dns-本地",
-        "detour": "手动选择"
-      },
-      {
         "type": "fakeip",
         "tag": "dns-fakeip",
         "inet4_range": "198.18.0.0/15",
@@ -88,6 +81,34 @@
         ],
         "action": "route",
         "server": "dns-境外"
+      },
+      {
+        "domain_suffix": [
+          "cloudflare.com",
+          "cloudflare-dns.com",
+          "cloudflareinsights.com",
+          "cloudflarestream.com",
+          "cloudflareclient.com",
+          "cf-ns.com",
+          "cf-ns.net"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "domain_suffix": [
+          "pcloud.com"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "domain_suffix": [
+          "msftconnecttest.com",
+          "msftncsi.com"
+        ],
+        "action": "route",
+        "server": "dns-国内"
       },
       {
         "rule_set": [
@@ -123,7 +144,7 @@
   },
   "ntp": {
     "enabled": true,
-    "server": "time.windows.com",
+    "server": "time.apple.com",
     "server_port": 123,
     "interval": "30m",
     "domain_resolver": "dns-本地"
@@ -136,7 +157,7 @@
         "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
-      "mtu": 1500,
+      "mtu": 1400,
       "auto_route": true,
       "strict_route": true,
       "stack": "system"
@@ -166,7 +187,7 @@
       "url": "https://www.gstatic.com/generate_204",
       "interval": "5m",
       "tolerance": 50,
-      "idle_timeout": "30m",
+      "idle_timeout": "15m",
       "interrupt_exist_connections": true
     },
     {
@@ -216,7 +237,7 @@
   ],
   "route": {
     "auto_detect_interface": true,
-    "default_domain_resolver": "dns-国内",
+    "default_domain_resolver": "dns-本地",
     "default_http_client": "http-直连下载",
     "find_process": false,
     "final": "兜底",
@@ -336,6 +357,42 @@
         "outbound": "谷歌"
       },
       {
+        "domain_suffix": [
+          "cloudflare.com",
+          "cloudflare-dns.com",
+          "cloudflareinsights.com",
+          "cloudflarestream.com",
+          "cloudflareclient.com",
+          "cf-ns.com",
+          "cf-ns.net"
+        ],
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "domain_suffix": [
+          "pcloud.com"
+        ],
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "ip_cidr": [
+          "192.168.100.111/32"
+        ],
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
+      },
+      {
+        "domain_suffix": [
+          "msftconnecttest.com",
+          "msftncsi.com"
+        ],
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
         "rule_set": "规则-广告",
         "action": "reject",
         "method": "default",
@@ -378,7 +435,7 @@
       },
       {
         "action": "resolve",
-        "server": "dns-国内",
+        "server": "dns-境外",
         "strategy": "ipv4_only"
       },
       {
