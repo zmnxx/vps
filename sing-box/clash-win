@@ -1,15 +1,11 @@
 # ================================================================
-# Windows · mihomo/Meta 优化配置
-# 文档: https://wiki.metacubex.one/
-# 适用: FlClash / Clash Verge Rev / mihomo 等 Windows 客户端
-# ================================================================
-# 使用前请把 proxy-providers 里的订阅 URL 换成真实地址
-# 开 TUN 需管理员权限；若用系统代理模式可把 tun.enable 改为 false
+# Windows · mihomo/Meta · Sub-Store 方案 A
+# 节点由 Sub-Store「来源=订阅名」注入到 proxies:
+# 策略组用 include-all-proxies 引用，不再使用 proxy-providers
 # ================================================================
 
 # --- 基础设置 ---
 mixed-port: 7890
-# 本机自用 false；要给局域网设备用代理再改 true
 allow-lan: false
 bind-address: "*"
 mode: rule
@@ -20,20 +16,14 @@ ipv6: true
 unified-delay: true
 tcp-concurrent: true
 
-# RESTful API（本机控制；仅本机访问时 127.0.0.1 更安全）
 external-controller: 127.0.0.1:9090
 secret: ""
-# Windows 桌面可用 Web UI；不需要可整段删掉
 external-ui: ui
 external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
 
-# Windows 支持进程匹配；strict 由内核判断，需要 PROCESS 规则时可用 always
 find-process-mode: strict
-
-# 桌面端可略放宽；若笔记本插电/追求连接稳定可保持
 keep-alive-interval: 30
 keep-alive-idle: 30
-# Windows 不要设 disable-keep-alive: true（除非你明确要省电实验）
 
 profile:
   store-selected: true
@@ -41,7 +31,6 @@ profile:
 
 # --- GEO 数据库 ---
 geodata-mode: true
-# 内存充足可用 standard；笔记本/小内存继续 memconservative
 geodata-loader: memconservative
 geo-auto-update: true
 geo-update-interval: 24
@@ -51,38 +40,27 @@ geox-url:
   mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb"
   asn: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"
 
-# --- TUN 虚拟网卡（全局接管；需管理员）---
-# 若只用系统代理 / 混合端口，把 enable 改为 false 即可
+# --- TUN（系统代理模式可改 enable: false）---
 tun:
   enable: true
-  # Windows 上 system 一般最稳；异常可改 mixed / gvisor
   stack: system
   auto-route: true
-  # auto-redirect 仅 Linux 有效，Windows 写了会被忽略；不写更干净
   auto-detect-interface: true
   disable-icmp-forwarding: true
   dns-hijack:
     - any:53
     - tcp://any:53
-  # Windows: 用防火墙规则防多宿主 DNS 泄漏；可能影响 VirtualBox 等虚拟机联网
-  # 若虚拟机/特殊软件异常，可改 false
   strict-route: true
-  # 可选：排除本机网段不进 TUN（按自家局域网改）
-  # route-exclude-address:
-  #   - 192.168.0.0/16
-  #   - 10.0.0.0/8
-  #   - fc00::/7
 
 # --- NTP ---
 ntp:
   enable: true
-  # true 需要管理员；一般 false，交给 Windows 自己校时即可
   write-to-system: false
   server: time.windows.com
   port: 123
   interval: 30
 
-# --- 域名嗅探（fake-ip 下默认可关）---
+# --- 域名嗅探 ---
 sniffer:
   enable: false
   force-dns-mapping: true
@@ -94,44 +72,14 @@ sniffer:
     HTTP:
       ports: [80, 8080-8880]
       override-destination: true
-    # QUIC:
-    #   ports: [443, 8443]
   skip-domain:
     - Mijia Cloud
     - "+.push.apple.com"
 
 # ================================================================
-# 订阅节点
+# 重要：方案 A 不要写 proxy-providers
+# Sub-Store 会把订阅节点合并进顶层 proxies:
 # ================================================================
-proxy-providers:
-  订阅一:
-    type: http
-    # ↓↓↓ 改成真实订阅链接 ↓↓↓
-    url: "YOUR_SUBSCRIBE_URL"
-    interval: 86400
-    path: ./providers/proxy/sub1.yaml
-    proxy: DIRECT
-    health-check:
-      enable: true
-      interval: 600
-      lazy: true
-      url: https://www.gstatic.com/generate_204
-      expected-status: 204
-      timeout: 5000
-
-  # 订阅二:
-  #   type: http
-  #   url: "YOUR_SUBSCRIBE_URL_2"
-  #   interval: 86400
-  #   path: ./providers/proxy/sub2.yaml
-  #   proxy: DIRECT
-  #   health-check:
-  #     enable: true
-  #     interval: 600
-  #     lazy: true
-  #     url: https://www.gstatic.com/generate_204
-  #     expected-status: 204
-  #     timeout: 5000
 
 # ================================================================
 # 规则集
@@ -240,11 +188,7 @@ dns:
     - www.msftconnecttest.com
     - "+.msftconnecttest.com"
     - "+.msftncsi.com"
-    # Windows 网络检测 / NCSI
-    - www.msftconnecttest.com
     - ipv6.msftconnecttest.com
-    - dns.msftncsi.com
-    - www.msftncsi.com
     - time.*.com
     - time.*.gov
     - time.*.edu.cn
@@ -268,12 +212,10 @@ dns:
     - "2402:4e00::"
     - system
 
-  # 主 DNS：国内
   nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
 
-  # 后备：境外
   fallback:
     - https://dns.google/dns-query
     - https://cloudflare-dns.com/dns-query
@@ -314,7 +256,6 @@ dns:
       - https://dns.google/dns-query
       - https://cloudflare-dns.com/dns-query
 
-  # 桌面可 true（需 proxy-server-nameserver）；不稳再改 false
   respect-rules: false
   use-hosts: true
   use-system-hosts: true
@@ -322,15 +263,18 @@ dns:
   prefer-h3: false
 
 # ================================================================
-# 策略组
+# 策略组：include-all-proxies 吃 Sub-Store 注入的节点
+# 官方字段: https://wiki.metacubex.one/config/proxy-groups/
 # ================================================================
 proxy-groups:
   - name: 手动选择
     type: select
     icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Static.png
-    use:
-      - 订阅一
-      # - 订阅二
+    include-all-proxies: true
+    # 可选：只要某些地区，取消下一行注释并改正则
+    # filter: "(?i)港|hk|台|tw|日|jp|新|sg|美|us"
+    # 可选：排除残留/过期
+    # exclude-filter: "(?i)过期|剩余|官网|流量|到期|套餐"
     proxies:
       - 自动选择
       - DIRECT
@@ -338,9 +282,9 @@ proxy-groups:
   - name: 自动选择
     type: url-test
     icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Auto.png
-    use:
-      - 订阅一
-      # - 订阅二
+    include-all-proxies: true
+    # filter: "(?i)港|hk|台|tw|日|jp|新|sg|美|us"
+    # exclude-filter: "(?i)过期|剩余|官网|流量|到期|套餐"
     url: https://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
@@ -391,18 +335,8 @@ proxy-groups:
 # 分流规则
 # ================================================================
 rules:
-  # ---------- 自定义（按需取消注释）----------
-  # - DOMAIN-SUFFIX,example.com,国内
-  # - DOMAIN-SUFFIX,openai.com,手动选择
-  # Windows 进程规则示例（需 find-process-mode 非 off）:
-  # - PROCESS-NAME,Telegram.exe,电报
-  # - PROCESS-NAME,chrome.exe,谷歌
-  # - PROCESS-PATH-REGEX,(?i).*\\steam\\.exe,手动选择
-
-  # ---------- 广告 ----------
   - RULE-SET,去广告,去广告
 
-  # ---------- 局域网 / 私有 ----------
   - RULE-SET,私有域名,DIRECT
   - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
   - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
@@ -414,7 +348,6 @@ rules:
   - IP-CIDR6,fc00::/7,DIRECT,no-resolve
   - IP-CIDR6,fe80::/10,DIRECT,no-resolve
 
-  # ---------- 域名类 ----------
   - RULE-SET,私有域名,国内
   - RULE-SET,苹果中国,国内
   - RULE-SET,谷歌域名,谷歌
@@ -422,11 +355,9 @@ rules:
   - RULE-SET,国内域名,国内
   - RULE-SET,GFW列表,兜底
 
-  # ---------- IP 类 ----------
   - RULE-SET,电报IP,电报,no-resolve
   - RULE-SET,国内IP,国内,no-resolve
   - GEOIP,CN,国内,no-resolve
   - GEOIP,PRIVATE,DIRECT,no-resolve
 
-  # ---------- 最终兜底 ----------
   - MATCH,兜底
