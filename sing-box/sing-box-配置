@@ -44,12 +44,6 @@
       },
       {
         "type": "https",
-        "tag": "dns-腾讯",
-        "server": "1.12.12.12",
-        "domain_resolver": "dns-本地"
-      },
-      {
-        "type": "https",
         "tag": "dns-境外",
         "server": "1.1.1.1",
         "domain_resolver": "dns-本地",
@@ -72,8 +66,28 @@
     "rules": [
       {
         "rule_set": "规则-广告",
-        "action": "predefined",
-        "rcode": "NOERROR"
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
+      },
+      {
+        "domain_suffix": [
+          "douyin.com",
+          "bytedance.com",
+          "zijieapi.com",
+          "byteoversea.com"
+        ],
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "domain_suffix": [
+          "google.com",
+          "youtube.com",
+          "github.com"
+        ],
+        "action": "route",
+        "server": "dns-境外"
       },
       {
         "rule_set": [
@@ -122,7 +136,7 @@
         "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
-      "mtu": 9000,
+      "mtu": 1500,
       "auto_route": true,
       "strict_route": true,
       "stack": "system"
@@ -154,15 +168,6 @@
       "tolerance": 50,
       "idle_timeout": "30m",
       "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
-      "tag": "去广告",
-      "outbounds": [
-        "REJECT",
-        "DIRECT"
-      ],
-      "default": "REJECT"
     },
     {
       "type": "selector",
@@ -207,17 +212,13 @@
     {
       "type": "direct",
       "tag": "DIRECT"
-    },
-    {
-      "type": "block",
-      "tag": "REJECT"
     }
   ],
   "route": {
     "auto_detect_interface": true,
     "default_domain_resolver": "dns-国内",
     "default_http_client": "http-直连下载",
-    "find_process": true,
+    "find_process": false,
     "final": "兜底",
     "rule_set": [
       {
@@ -302,9 +303,43 @@
         "action": "hijack-dns"
       },
       {
-        "rule_set": "规则-广告",
+        "domain_suffix": [
+          "douyin.com",
+          "bytedance.com",
+          "zijieapi.com",
+          "byteoversea.com"
+        ],
         "action": "route",
-        "outbound": "去广告"
+        "outbound": "国内"
+      },
+      {
+        "ip_cidr": [
+          "101.36.166.16/32"
+        ],
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "domain_suffix": [
+          "google.com",
+          "youtube.com",
+          "github.com"
+        ],
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "ip_cidr": [
+          "142.250.0.0/15"
+        ],
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "rule_set": "规则-广告",
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
       },
       {
         "rule_set": "规则-私有域名",
