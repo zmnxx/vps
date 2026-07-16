@@ -1,20 +1,17 @@
 /**
- * Sub-Store sing-box 脚本：节点注入 + 过滤
+ * Sub-Store sing-box 注入脚本
+ * 适配中文策略组：只把节点注入到「手动选择」「自动选择」
+ * 过滤机场信息节点；urltest 为空时补 COMPATIBLE
  *
- * 参考自 https://github.com/Sheldontao/Scripts/tree/main/sub-store-template/1.12or13
- * 适配用户自定义配置，做如下改动：
- *   1. 不创建地区分组（hk-auto / tw-auto 等），直接全部注入到策略组
- *   2. 过滤掉机场订阅信息节点（网址 / 网站 / 订阅 / 流量 / 到期 等关键词）
- *   3. 节点注入到策略组（selector）中的优先级排在原有手动选项之后，不修改任何策略组名字或已有结构
- *
- * 用法：在 Sub-Store 的 sing-box 订阅中，选择"脚本操作" → 添加此文件
- *   $arguments.type 传入 "subscription" 或 "collection"
- *   $arguments.name 传入订阅名称
+ * 参数：
+ *   $arguments.type = subscription 或 collection
+ *   $arguments.name = 订阅/集合名称
+ * 文件：
+ *   $files[0] = 上面的 config.json 底模
  */
 
 const { type, name } = $arguments;
 
-// 兜底节点：当 urltest 组没有任何可用节点时使用，避免配置报错
 const compatibleOutbound = {
   tag: "COMPATIBLE",
   type: "direct",
@@ -22,10 +19,25 @@ const compatibleOutbound = {
 
 let compatible = false;
 
-// 解析底模配置（$files[0] 由 Sub-Store 绑定的模板内容）
-const config = JSON.parse($files[0]);
+if (!$files || !$files[0]) {
+  throw new Error("未绑定底模文件：$files[0] 为空，请在脚本操作里绑定 config.json");
+}
 
-// 通过 Sub-Store API 生成代理节点列表（plateform: sing-box）
+let config;
+try {
+  config = JSON.parse($files[0]);
+} catch (e) {
+  throw new Error("底模 JSON 解析失败（请确认是纯 JSON、无注释）：" + e.message);
+}
+
+if (!Array.isArray(config.outbounds)) {
+  throw new Error("底模缺少 outbounds 数组");
+}
+
+if (!name) {
+  throw new Error("缺少 $arguments.name（订阅/集合名称）");
+}
+
 let proxies = await produceArtifact({
   name,
   type: /^1$|col/i.test(type) ? "collection" : "subscription",
@@ -33,44 +45,56 @@ let proxies = await produceArtifact({
   produceType: "internal",
 });
 
-// ─── 过滤机场信息节点 ───────────────────────────────────
-// 匹配常见的关键词，这些节点不是真正可用的代理，而是机场提供的"信息/订阅状态"节点
-const infoKeywords = /网址|网站|获取|订阅|流量|到期|余量|续费|过期|重置|套餐|官网|面板|剩余|更新|expire|traffic|reset|plan|manual/gi;
-proxies = proxies.filter((p) => !infoKeywords.test(p.tag));
+if (!Array.isArray(proxies)) {
+  throw new Error("produceArtifact 未返回数组，请检查订阅是否可用");
+}
 
-// ─── 关键修复：将节点对象本身加入 outbounds 末尾 ──────────
-// selector/urltest 引用的 tag 必须在 config.outbounds 中有对应的节点对象，
-// 否则 sing-box 启动时报 "dependency not found for outbound"
+// 过滤机场信息节点
+const infoKeywords =
+  /网址|网站|获取|订阅|流量|到期|余量|续费|过期|重置|套餐|官网|面板|剩余|更新|expire|traffic|reset|plan|manual|通知|公告|说明|教程/i;
+
+proxies = proxies.filter((p) => p && p.tag && !infoKeywords.test(p.tag));
+
+// 去重 tag（防止依赖冲突）
+const seen = new Set();
+proxies = proxies.filter((p) => {
+  if (seen.has(p.tag)) return false;
+  seen.add(p.tag);
+  return true;
+});
+
+// 避免与策略组/内置出口重名
+const reserved = new Set(
+  config.outbounds.map((o) => o.tag).filter(Boolean)
+);
+proxies = proxies.filter((p) => !reserved.has(p.tag));
+
+// 节点本体写入 outbounds
 config.outbounds.push(...proxies);
-
-// 获取过滤后所有代理节点的 tag 列表
 const proxyTags = proxies.map((p) => p.tag);
 
-// ─── 不应注入代理节点的功能性策略组 ────────────────────
-// 例如 adblock（用于控制广告走 reject 还是 direct），这些组不需要单独的代理节点选项
-const skipTags = new Set(["adblock"]);
+// 只注入这两个组（对齐 Clash use: 订阅）
+const injectSelectorTags = new Set(["手动选择"]);
+const injectUrltestTags = new Set(["自动选择"]);
 
-// 遍历所有 outbound，进行注入
 config.outbounds.forEach((outbound) => {
-  // selector 类型的策略组：在原有手动选项后面追加所有代理节点
-  if (
-    outbound.type === "selector" &&
-    Array.isArray(outbound.outbounds) &&
-    !skipTags.has(outbound.tag)
-  ) {
-    // 只在原 outbounds 后面 push，不修改原有选项和顺序
-    outbound.outbounds.push(...proxyTags);
+  if (!outbound || !Array.isArray(outbound.outbounds)) return;
+
+  if (outbound.type === "selector" && injectSelectorTags.has(outbound.tag)) {
+    // 保留原有「自动选择 / DIRECT」，节点追加在后面
+    const exist = new Set(outbound.outbounds);
+    for (const t of proxyTags) {
+      if (!exist.has(t)) outbound.outbounds.push(t);
+    }
   }
 
-  // 所有 urltest 类型的组：注入全部过滤后的代理节点用于自动测速
-  // 不限定 tag 名，兼容 auto-select / 自动选择 等任意命名
-  if (outbound.type === "urltest") {
-    outbound.outbounds.push(...proxyTags);
+  if (outbound.type === "urltest" && injectUrltestTags.has(outbound.tag)) {
+    // 自动选择：用节点覆盖（不要把 DIRECT 放进测速）
+    outbound.outbounds = [...proxyTags];
   }
 });
 
-// ─── 兜底处理 ────────────────────────────────────────────
-// 如果 urltest 组没有任何节点（例如订阅为空），补充一个兜底 direct 节点
+// urltest 空组兜底
 config.outbounds.forEach((outbound) => {
   if (
     outbound.type === "urltest" &&
