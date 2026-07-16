@@ -272,9 +272,9 @@ proxy-groups:
     icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Static.png
     include-all-proxies: true
     # 可选：只要某些地区，取消下一行注释并改正则
-    # filter: "(?i)港|hk|台|tw|日|jp|新|sg|美|us"
+    #filter: "(?i)港|hk|台|tw|日|jp|新|sg|美|us"
     # 可选：排除残留/过期
-    # exclude-filter: "(?i)过期|剩余|官网|流量|到期|套餐"
+    exclude-filter: "(?i)过期|剩余|官网|流量|到期|套餐"
     proxies:
       - 自动选择
       - DIRECT
@@ -284,7 +284,7 @@ proxy-groups:
     icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Auto.png
     include-all-proxies: true
     # filter: "(?i)港|hk|台|tw|日|jp|新|sg|美|us"
-    # exclude-filter: "(?i)过期|剩余|官网|流量|到期|套餐"
+    exclude-filter: "(?i)过期|剩余|官网|流量|到期|套餐"
     url: https://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
