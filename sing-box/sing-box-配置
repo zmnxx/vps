@@ -1,384 +1,7 @@
 {
   "log": {
-    "level": "info",
+    "level": "warn",
     "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "type": "hosts",
-        "tag": "Hosts",
-        "predefined": {
-          "dns.google": [
-            "8.8.8.8",
-            "8.8.4.4"
-          ]
-        }
-      },
-      {
-        "type": "local",
-        "tag": "本地DNS"
-      },
-      {
-        "type": "udp",
-        "tag": "直连DNS",
-        "server": "223.5.5.5",
-        "server_port": 53
-      },
-      {
-        "type": "https",
-        "tag": "代理DNS",
-        "server": "8.8.8.8",
-        "server_port": 443,
-        "path": "/dns-query",
-        "detour": "代理"
-      },
-      {
-        "type": "fakeip",
-        "tag": "FakeIP",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
-      }
-    ],
-    "rules": [
-      {
-        "preferred_by": "Hosts",
-        "action": "route",
-        "server": "Hosts"
-      },
-      {
-        "clash_mode": "Direct",
-        "action": "route",
-        "server": "直连DNS"
-      },
-      {
-        "clash_mode": "Global",
-        "action": "route",
-        "server": "代理DNS"
-      },
-      {
-        "rule_set": "私有域名",
-        "action": "route",
-        "server": "本地DNS"
-      },
-      {
-        "rule_set": "广告规则",
-        "clash_mode": "AllowAds",
-        "action": "route",
-        "server": "直连DNS"
-      },
-      {
-        "rule_set": "广告规则",
-        "action": "reject"
-      },
-      {
-        "rule_set": "国内域名",
-        "action": "route",
-        "server": "直连DNS"
-      },
-      {
-        "rule_set": [
-          "微软中国域名",
-          "微软域名"
-        ],
-        "action": "route",
-        "server": "直连DNS"
-      },
-      {
-        "rule_set": [
-          "谷歌域名",
-          "非中国域名"
-        ],
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "action": "route",
-        "server": "FakeIP"
-      }
-    ],
-    "final": "代理DNS",
-    "strategy": "prefer_ipv4",
-    "reverse_mapping": true
-  },
-  "ntp": {
-    "enabled": true,
-    "server": "217.114.59.3",
-    "server_port": 123,
-    "interval": "30m"
-  },
-  "http_clients": [
-    {
-      "tag": "直连下载"
-    },
-    {
-      "tag": "代理下载",
-      "detour": "代理"
-    }
-  ],
-  "inbounds": [
-    {
-      "type": "tun",
-      "tag": "tun入站",
-      "address": [
-        "172.19.0.1/30",
-        "fdfe:dcba:9876::1/126"
-      ],
-      "mtu": 9000,
-      "auto_route": true,
-      "strict_route": true,
-      "stack": "mixed",
-      "udp_timeout": "30m",
-      "platform": {
-        "http_proxy": {
-          "enabled": true,
-          "server": "127.0.0.1",
-          "server_port": 2080
-        }
-      }
-    },
-    {
-      "type": "mixed",
-      "tag": "mixed入站",
-      "listen": "127.0.0.1",
-      "listen_port": 2080
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "selector",
-      "tag": "代理",
-      "outbounds": [
-        "自动选择",
-        "直连",
-        "拦截"
-      ],
-      "default": "自动选择",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "urltest",
-      "tag": "自动选择",
-      "outbounds": [],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "10m",
-      "tolerance": 50,
-      "idle_timeout": "30m",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "selector",
-      "tag": "广告拦截",
-      "outbounds": [
-        "拦截",
-        "直连",
-        "代理",
-        "自动选择"
-      ],
-      "default": "拦截",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "selector",
-      "tag": "国内服务",
-      "outbounds": [
-        "直连",
-        "代理",
-        "自动选择",
-        "拦截"
-      ],
-      "default": "直连",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "selector",
-      "tag": "谷歌服务",
-      "outbounds": [
-        "代理",
-        "直连",
-        "自动选择",
-        "拦截"
-      ],
-      "default": "代理",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "selector",
-      "tag": "微软服务",
-      "outbounds": [
-        "代理",
-        "直连",
-        "自动选择",
-        "拦截"
-      ],
-      "default": "代理",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "selector",
-      "tag": "兜底策略",
-      "outbounds": [
-        "代理",
-        "直连",
-        "自动选择",
-        "拦截"
-      ],
-      "default": "代理",
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "direct",
-      "tag": "直连"
-    },
-    {
-      "type": "block",
-      "tag": "拦截"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "action": "sniff",
-        "timeout": "300ms"
-      },
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
-      {
-        "clash_mode": "Direct",
-        "action": "route",
-        "outbound": "直连"
-      },
-      {
-        "clash_mode": "Global",
-        "action": "route",
-        "outbound": "代理"
-      },
-      {
-        "rule_set": "私有域名",
-        "action": "route",
-        "outbound": "直连"
-      },
-      {
-        "ip_is_private": true,
-        "action": "route",
-        "outbound": "直连"
-      },
-      {
-        "rule_set": "广告规则",
-        "action": "route",
-        "outbound": "广告拦截"
-      },
-      {
-        "rule_set": [
-          "谷歌域名",
-          "谷歌IP"
-        ],
-        "action": "route",
-        "outbound": "谷歌服务"
-      },
-      {
-        "rule_set": [
-          "微软域名",
-          "微软中国域名"
-        ],
-        "action": "route",
-        "outbound": "微软服务"
-      },
-      {
-        "rule_set": [
-          "国内域名",
-          "国内IP"
-        ],
-        "action": "route",
-        "outbound": "国内服务"
-      },
-      {
-        "rule_set": "非中国域名",
-        "action": "route",
-        "outbound": "兜底策略"
-      }
-    ],
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "国内IP",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "http_client": "直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "国内域名",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
-        "http_client": "直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "谷歌域名",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
-        "http_client": "代理下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "谷歌IP",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs",
-        "http_client": "代理下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "微软域名",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft.srs",
-        "http_client": "代理下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "微软中国域名",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft@cn.srs",
-        "http_client": "直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "非中国域名",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-        "http_client": "代理下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "私有域名",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
-        "http_client": "直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "广告规则",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-singbox.srs",
-        "http_client": "代理下载",
-        "update_interval": "1d"
-      }
-    ],
-    "final": "兜底策略",
-    "auto_detect_interface": true,
-    "override_android_vpn": true,
-    "default_domain_resolver": "本地DNS",
-    "default_http_client": "直连下载"
   },
   "experimental": {
     "cache_file": {
@@ -389,14 +12,350 @@
     },
     "clash_api": {
       "external_controller": "127.0.0.1:9090",
+      "secret": "",
+      "default_mode": "rule",
       "external_ui": "ui",
-      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/download/v3.14.0/dist.zip",
-      "external_ui_download_detour": "代理",
-      "default_mode": "Rule",
-      "access_control_allow_origin": [
-        "*"
-      ],
-      "access_control_allow_private_network": true
+      "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
     }
+  },
+  "http_clients": [
+    {
+      "tag": "http-直连下载",
+      "domain_resolver": "dns-本地"
+    },
+    {
+      "tag": "http-代理下载",
+      "detour": "手动选择",
+      "domain_resolver": "dns-本地"
+    }
+  ],
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "dns-本地",
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "https",
+        "tag": "dns-国内",
+        "server": "223.5.5.5",
+        "domain_resolver": "dns-本地"
+      },
+      {
+        "type": "https",
+        "tag": "dns-腾讯",
+        "server": "1.12.12.12",
+        "domain_resolver": "dns-本地"
+      },
+      {
+        "type": "https",
+        "tag": "dns-境外",
+        "server": "1.1.1.1",
+        "domain_resolver": "dns-本地",
+        "detour": "手动选择"
+      },
+      {
+        "type": "https",
+        "tag": "dns-谷歌",
+        "server": "8.8.8.8",
+        "domain_resolver": "dns-本地",
+        "detour": "手动选择"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "规则-广告",
+        "action": "predefined",
+        "rcode": "NOERROR"
+      },
+      {
+        "rule_set": [
+          "规则-私有域名",
+          "规则-国内域名",
+          "规则-苹果中国"
+        ],
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "rule_set": [
+          "规则-GFW",
+          "规则-谷歌域名",
+          "规则-电报域名"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-境外",
+    "strategy": "ipv4_only",
+    "optimistic": true,
+    "reverse_mapping": true
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "time.windows.com",
+    "server_port": 123,
+    "interval": "30m",
+    "domain_resolver": "dns-本地"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "手动选择",
+      "outbounds": [
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "自动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "urltest",
+      "tag": "自动选择",
+      "outbounds": [],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50,
+      "idle_timeout": "30m",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "去广告",
+      "outbounds": [
+        "REJECT",
+        "DIRECT"
+      ],
+      "default": "REJECT"
+    },
+    {
+      "type": "selector",
+      "tag": "国内",
+      "outbounds": [
+        "DIRECT",
+        "手动选择",
+        "自动选择"
+      ],
+      "default": "DIRECT"
+    },
+    {
+      "type": "selector",
+      "tag": "谷歌",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "手动选择"
+    },
+    {
+      "type": "selector",
+      "tag": "电报",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "手动选择"
+    },
+    {
+      "type": "selector",
+      "tag": "兜底",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "手动选择"
+    },
+    {
+      "type": "direct",
+      "tag": "DIRECT"
+    },
+    {
+      "type": "block",
+      "tag": "REJECT"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-国内",
+    "default_http_client": "http-直连下载",
+    "find_process": true,
+    "final": "兜底",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "规则-广告",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-私有域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-国内域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-国内IP",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "3d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-苹果中国",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/apple@cn.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-谷歌域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-电报域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/telegram.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-电报IP",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "3d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-GFW",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/gfw.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      }
+    ],
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "rule_set": "规则-广告",
+        "action": "route",
+        "outbound": "去广告"
+      },
+      {
+        "rule_set": "规则-私有域名",
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": "规则-苹果中国",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "规则-谷歌域名",
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "rule_set": "规则-电报域名",
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "rule_set": "规则-国内域名",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "规则-GFW",
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "action": "resolve",
+        "server": "dns-国内",
+        "strategy": "ipv4_only"
+      },
+      {
+        "rule_set": "规则-电报IP",
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "rule_set": "规则-国内IP",
+        "action": "route",
+        "outbound": "国内"
+      }
+    ]
   }
 }
