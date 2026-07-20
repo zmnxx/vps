@@ -1,0 +1,454 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true,
+      "store_dns": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "",
+      "default_mode": "rule",
+      "external_ui": "ui",
+      "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+    }
+  },
+  "http_clients": [
+    {
+      "tag": "http-直连下载",
+      "domain_resolver": "dns-本地"
+    },
+    {
+      "tag": "http-代理下载",
+      "detour": "手动选择",
+      "domain_resolver": "dns-本地"
+    }
+  ],
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "dns-本地",
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "https",
+        "tag": "dns-国内",
+        "server": "223.5.5.5",
+        "domain_resolver": "dns-本地"
+      },
+      {
+        "type": "https",
+        "tag": "dns-境外",
+        "server": "1.1.1.1",
+        "domain_resolver": "dns-本地",
+        "detour": "手动选择"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "规则-广告",
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
+      },
+      {
+        "domain_suffix": [
+          "douyin.com",
+          "bytedance.com",
+          "zijieapi.com",
+          "byteoversea.com"
+        ],
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "domain_suffix": [
+          "google.com",
+          "youtube.com",
+          "github.com"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "domain_suffix": [
+          "cloudflare.com",
+          "cloudflare-dns.com",
+          "cloudflareinsights.com",
+          "cloudflarestream.com",
+          "cloudflareclient.com",
+          "cf-ns.com",
+          "cf-ns.net"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "domain_suffix": [
+          "pcloud.com"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "domain_suffix": [
+          "msftconnecttest.com",
+          "msftncsi.com"
+        ],
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "rule_set": [
+          "规则-私有域名",
+          "规则-国内域名",
+          "规则-苹果中国"
+        ],
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "rule_set": [
+          "规则-GFW",
+          "规则-谷歌域名",
+          "规则-电报域名"
+        ],
+        "action": "route",
+        "server": "dns-境外"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-国内",
+    "strategy": "prefer_ipv4",
+    "optimistic": true,
+    "timeout": "10s",
+    "reverse_mapping": true
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "ntp.aliyun.com",
+    "server_port": 123,
+    "interval": "30m",
+    "domain_resolver": "dns-本地"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "auto_route": true,
+      "strict_route": false,
+      "stack": "gvisor"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "手动选择",
+      "outbounds": [
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "自动选择",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "urltest",
+      "tag": "自动选择",
+      "outbounds": [],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50,
+      "idle_timeout": "15m",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "国内",
+      "outbounds": [
+        "DIRECT",
+        "手动选择",
+        "自动选择"
+      ],
+      "default": "DIRECT"
+    },
+    {
+      "type": "selector",
+      "tag": "谷歌",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "手动选择"
+    },
+    {
+      "type": "selector",
+      "tag": "电报",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "手动选择"
+    },
+    {
+      "type": "selector",
+      "tag": "兜底",
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "手动选择"
+    },
+    {
+      "type": "direct",
+      "tag": "DIRECT"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "dns-本地",
+      "strategy": "prefer_ipv4"
+    },
+    "default_http_client": "http-直连下载",
+    "find_process": false,
+    "final": "兜底",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "规则-广告",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-私有域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-国内域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-国内IP",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "3d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-苹果中国",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/apple@cn.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-谷歌域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-电报域名",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/telegram.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-电报IP",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "3d"
+      },
+      {
+        "type": "remote",
+        "tag": "规则-GFW",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/gfw.srs",
+        "http_client": "http-直连下载",
+        "update_interval": "1d"
+      }
+    ],
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "port": 123,
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "domain_suffix": [
+          "douyin.com",
+          "bytedance.com",
+          "zijieapi.com",
+          "byteoversea.com"
+        ],
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "ip_cidr": [
+          "101.36.166.16/32"
+        ],
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "domain_suffix": [
+          "google.com",
+          "youtube.com",
+          "github.com"
+        ],
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "ip_cidr": [
+          "142.250.0.0/15"
+        ],
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "domain_suffix": [
+          "cloudflare.com",
+          "cloudflare-dns.com",
+          "cloudflareinsights.com",
+          "cloudflarestream.com",
+          "cloudflareclient.com",
+          "cf-ns.com",
+          "cf-ns.net"
+        ],
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "domain_suffix": [
+          "pcloud.com"
+        ],
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "ip_cidr": [
+          "192.168.100.111/32"
+        ],
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
+      },
+      {
+        "domain_suffix": [
+          "msftconnecttest.com",
+          "msftncsi.com"
+        ],
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": "规则-广告",
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
+      },
+      {
+        "rule_set": "规则-私有域名",
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": "规则-苹果中国",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "规则-谷歌域名",
+        "action": "route",
+        "outbound": "谷歌"
+      },
+      {
+        "rule_set": "规则-电报域名",
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "rule_set": "规则-国内域名",
+        "action": "route",
+        "outbound": "国内"
+      },
+      {
+        "rule_set": "规则-GFW",
+        "action": "route",
+        "outbound": "兜底"
+      },
+      {
+        "action": "resolve",
+        "server": "dns-国内"
+      },
+      {
+        "rule_set": "规则-电报IP",
+        "action": "route",
+        "outbound": "电报"
+      },
+      {
+        "rule_set": "规则-国内IP",
+        "action": "route",
+        "outbound": "国内"
+      }
+    ]
+  }
+}
