@@ -137,14 +137,15 @@
         "server": "dns-fakeip"
       }
     ],
-    "final": "dns-境外",
-    "strategy": "ipv4_only",
+    "final": "dns-国内",
+    "strategy": "prefer_ipv4",
     "optimistic": true,
+    "timeout": "10s",
     "reverse_mapping": true
   },
   "ntp": {
     "enabled": true,
-    "server": "time.apple.com",
+    "server": "ntp.aliyun.com",
     "server_port": 123,
     "interval": "30m",
     "domain_resolver": "dns-本地"
@@ -157,7 +158,7 @@
         "172.19.0.1/30",
         "fdfe:dcba:9876::1/126"
       ],
-      "mtu": 1400,
+      "mtu": 9000,
       "auto_route": true,
       "strict_route": true,
       "stack": "system"
@@ -237,7 +238,10 @@
   ],
   "route": {
     "auto_detect_interface": true,
-    "default_domain_resolver": "dns-本地",
+    "default_domain_resolver": {
+      "server": "dns-本地",
+      "strategy": "prefer_ipv4"
+    },
     "default_http_client": "http-直连下载",
     "find_process": false,
     "final": "兜底",
@@ -322,6 +326,11 @@
       {
         "protocol": "dns",
         "action": "hijack-dns"
+      },
+      {
+        "port": 123,
+        "action": "route",
+        "outbound": "DIRECT"
       },
       {
         "domain_suffix": [
@@ -435,8 +444,7 @@
       },
       {
         "action": "resolve",
-        "server": "dns-境外",
-        "strategy": "ipv4_only"
+        "server": "dns-国内"
       },
       {
         "rule_set": "规则-电报IP",
