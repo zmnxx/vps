@@ -767,19 +767,25 @@ create_nginx_proxy(){
 
     # 证书申请成功后，转为 HTTPS 配置
     if [ -n "$CERTBOT_DOMAIN" ]; then
-      # 判断 HTTPS 监听端口
+      # 判断 HTTPS 监听端口 — 自动处理，不问用户
       local https_port
-      if ! is_port_in_use 443; then
+      if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then
+        # 已有 SNI 分流：从 stream 块读取 web upstream 端口
+        https_port=$(grep -A2 'upstream web' /etc/nginx/nginx.conf 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+        if [ -z "$https_port" ] || ! valid_port "$https_port"; then
+          # 读不到就用默认
+          https_port="8443"
+        fi
+        info "SNI 分流已配置，HTTPS 监听 ${https_port}（stream 自动转发）"
+      elif ! is_port_in_use 443; then
+        # 无 SNI 分流且 443 空闲：标准方案
         https_port="443"
         info "443 空闲，HTTPS 监听 443（标准方案）"
       else
-        local holder
-        holder=$(get_port_holder 443)
-        echo
-        warn "443 被 ${holder:-未知进程} 占用"
-        read -rp "  HTTPS 监听端口（任意未占用端口，如 8443/9090）: " https_port
+        # 443 被占但没配 SNI 分流
+        warn "443 被占用且未配置 SNI 分流"
+        read -rp "  HTTPS 监听端口（如 8443/9090）: " https_port
         valid_port "$https_port" || https_port="8443"
-        info "HTTPS 将监听 ${https_port}（内部端口，SNI 分流会转发到此）"
       fi
 
       write_nginx_https_template "$conf" "$domain" "$port" "$https_port"
@@ -1214,8 +1220,11 @@ ensure_stream_module(){
 setup_sni_split(){
   ui_header "配置 Nginx SNI 分流"
   info "Nginx 接管 443，按 SNI 分流:"
-  echo "    Web 域名 → Nginx HTTPS 反代"
-  echo "    其他 SNI → sing-box Reality（${SINGBOX_PORT}）"
+  echo "    匹配的域名 → Nginx Web 反代（内部端口）"
+  echo "    其他流量   → sing-box Reality（${SINGBOX_PORT}）"
+  echo
+  info "「Web 域名」= 哪些域名走网站（不写就都走 sing-box）"
+  info "这些域名必须和反代站点里的 server_name 一致"
   echo
 
   if ! ensure_stream_module; then
@@ -1225,14 +1234,28 @@ setup_sni_split(){
   fi
 
   local ng_conf="/etc/nginx/nginx.conf"
-  cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
 
+  # 如果已有 stream 块，显示当前配置，问是否重建
   if grep -q '^stream' "$ng_conf" 2>/dev/null; then
-    ok "已有 stream 块"; ask_yn "重新配置？" "n" || return 0
-    sed -i '/^stream {/,/^}/d' "$ng_conf"
+    ok "已有 SNI 分流配置"
+    echo
+    echo "  当前 Web 域名:"
+    grep -oP '(?<=\s)[a-z0-9.]+\.[a-z]{2,}(?=\s+web;)' "$ng_conf" 2>/dev/null | sed 's/^/    /' || echo "    （无）"
+    local cur_web_port cur_sb_port
+    cur_web_port=$(grep -A2 'upstream web' "$ng_conf" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+    cur_sb_port=$(grep -A2 'upstream singbox' "$ng_conf" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+    echo "  Web 内部端口: ${cur_web_port:-?}"
+    echo "  sing-box 端口: ${cur_sb_port:-?}"
+    echo
+    if ! ask_yn "重新配置？" "n"; then return 0; fi
   fi
 
-  # 读取已有 Web 域名
+  cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
+
+  # 删除旧 stream 块
+  sed -i '/^stream {/,/^}/d' "$ng_conf"
+
+  # 自动读取已有反代站点的域名
   local web_domains="" f domain
   for f in /etc/nginx/sites-enabled/*; do
     [ -L "$f" ] || [ -f "$f" ] || continue
@@ -1240,33 +1263,38 @@ setup_sni_split(){
     [ -n "$domain" ] && [ "$domain" != "_" ] && web_domains="$web_domains $domain"
   done
 
-  # 问用户 Web HTTPS 内部监听端口
-  local https_port
-  if ! is_port_in_use 443; then
-    https_port="443"
+  # 让用户补充域名（已有的 + 新输入的）
+  echo
+  if [ -n "$(echo $web_domains | tr -d ' ')" ]; then
+    info "已检测到反代域名: ${web_domains}"
+    read -rp "  补充其他域名（空格分隔，回车跳过）: " extra_domains
+    web_domains="${web_domains} ${extra_domains}"
   else
-    echo
-    warn "443 已被占用（stream 分流会用 443）"
-    info "Web 需要一个内部端口（仅本机监听，不暴露公网）"
-    read -rp "  Web HTTPS 内部端口（如 8443/9090）: " https_port
-    valid_port "$https_port" || https_port="8443"
+    read -rp "  输入 Web 域名（空格分隔，如 a.xxx.com b.xxx.com）: " extra_domains
+    web_domains="$extra_domains"
   fi
-  info "Web HTTPS 监听: ${https_port}"
-  info "sing-box 监听: ${SINGBOX_PORT}"
 
+  # Web 内部端口（首次默认 8443，已有就用已有的）
+  local https_port
+  https_port=$(grep -A2 'upstream web' "${ng_conf}.bak.$(date +%s)" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+  [ -z "$https_port" ] || ! valid_port "$https_port" && https_port="8443"
+  echo
+  info "Web HTTPS 内部端口: ${https_port}（仅本机，不暴露公网）"
+  info "sing-box 端口: ${SINGBOX_PORT}"
+  ask_yn "修改 Web 内部端口？" "n" && {
+    read -rp "  端口: " https_port; valid_port "$https_port" || https_port="8443"
+  }
+
+  # 写入 stream 块
   cat >> "$ng_conf" <<SNIEOF
 
 stream {
     map \$ssl_preread_server_name \$upstream {
 SNIEOF
-
-  if [ -z "$(echo $web_domains | tr -d ' ')" ]; then
-    read -rp "  输入 Web 域名（多个空格分隔）: " input_domains
-    for domain in $input_domains; do echo "        $domain    web;" >> "$ng_conf"; done
-  else
-    for domain in $web_domains; do [ -z "$domain" ] && continue; echo "        $domain    web;" >> "$ng_conf"; done
-  fi
-
+  for domain in $web_domains; do
+    [ -z "$domain" ] && continue
+    echo "        $domain    web;" >> "$ng_conf"
+  done
   cat >> "$ng_conf" <<SNIEOF
         default         singbox;
     }
@@ -1287,7 +1315,10 @@ SNIEOF
 
   if nginx -t 2>/dev/null; then
     ok "SNI 分流配置已写入"
-    info "端口: 443(stream) → ${https_port}(web) / ${SINGBOX_PORT}(sing-box)"
+    info "对外 443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
+    echo
+    info "Web 域名: $(echo $web_domains | tr '\n' ' ')"
+    info "创建反代时 HTTPS 会自动监听 ${https_port}"
     if systemctl is-active --quiet sing-box 2>/dev/null; then
       warn "重启顺序: Nginx 先 → sing-box 后"
       ask_yn "执行重启？" "y" || return 0
