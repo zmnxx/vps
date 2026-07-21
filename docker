@@ -336,11 +336,24 @@ install_docker(){
 }
 
 install_nginx(){
-  cmd_exists nginx && { ok "Nginx 已安装"; return 0; }
-  info "安装 Nginx..."
-  apt-get install -y -qq nginx
+  if cmd_exists nginx; then
+    # 已安装，检查 stream 模块是否可用
+    if ! ensure_stream_module 2>/dev/null; then
+      warn "Nginx 已安装但缺 stream 模块，升级到 nginx-full..."
+      apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
+    fi
+    ok "Nginx 已安装"
+    return 0
+  fi
+  info "安装 Nginx（nginx-full，自带 stream 模块）..."
+  apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx
   systemctl enable --now nginx 2>/dev/null
-  ok "Nginx 安装完成"
+  # 确认 stream 模块可用
+  if ensure_stream_module 2>/dev/null; then
+    ok "Nginx 安装完成（stream 模块就绪）"
+  else
+    ok "Nginx 安装完成（stream 模块可能需要手动安装 nginx-extras）"
+  fi
 }
 
 install_certbot(){
@@ -748,9 +761,9 @@ create_nginx_proxy(){
         holder=$(get_port_holder 443)
         echo
         warn "443 被 ${holder:-未知进程} 占用"
-        read -rp "  HTTPS 监听端口（如 8443/2053/2083）: " https_port
+        read -rp "  HTTPS 监听端口（任意未占用端口，如 8443/9090）: " https_port
         valid_port "$https_port" || https_port="8443"
-        info "HTTPS 将监听 ${https_port}（需 SNI 分流转发）"
+        info "HTTPS 将监听 ${https_port}（内部端口，SNI 分流会转发到此）"
       fi
 
       write_nginx_https_template "$conf" "$domain" "$port" "$https_port"
@@ -1144,32 +1157,96 @@ singbox_menu(){
 
 # ─── Nginx SNI 分流 ──────────────────────────────────────
 
-# 检测 stream 模块：直接检查 nginx -V 输出 + 尝试加载
+# 检测并加载 stream 模块
 ensure_stream_module(){
-  # 方法 1：检查是否编译了 stream（静态或动态）
-  if nginx -V 2>&1 | grep -q -- '--with-stream'; then
-    # 可能是动态模块，检查 modules-enabled
-    local mod_lib
-    for mod_lib in /usr/lib/nginx/modules/ngx_stream_module.so \
-                   /usr/share/nginx/modules/ngx_stream_module.so; do
-      if [ -f "$mod_lib" ]; then
-        # 检查是否已加载
-        if grep -q "ngx_stream_module" /etc/nginx/nginx.conf 2>/dev/null; then return 0; fi
-        # 检查 modules-enabled
-        if ls /etc/nginx/modules-enabled/*stream*  >/dev/null 2>&1; then return 0; fi
-        # 手动创建加载文件
-        mkdir -p /etc/nginx/modules-enabled
-        echo "load_module $mod_lib;" > /etc/nginx/modules-enabled/stream.conf
-        return 0
-      fi
-    done
-    # stream 可能静态编译了，直接返回 OK
+  # 测试当前 nginx 是否已支持 stream
+  local test_conf
+  test_conf=$(mktemp)
+  cat > "$test_conf" <<'TC'
+events {}
+http {}
+stream {}
+TC
+  if nginx -t -c "$test_conf" 2>/dev/null; then
+    rm -f "$test_conf"
     return 0
   fi
-  # 没有 stream，装 nginx-extras
+  rm -f "$test_conf"
+
+  # stream 不可用，尝试找到 .so 并加载
+  local mod_so=""
+  for p in /usr/lib/nginx/modules/ngx_stream_module.so \
+           /usr/share/nginx/modules/ngx_stream_module.so \
+           /usr/lib/nginx/ngx_stream_module.so; do
+    [ -f "$p" ] && mod_so="$p" && break
+  done
+
+  if [ -n "$mod_so" ]; then
+    # 创建模块加载文件
+    mkdir -p /etc/nginx/modules-enabled
+    echo "load_module $mod_so;" > /etc/nginx/modules-enabled/stream.conf
+    # 测试
+    test_conf=$(mktemp)
+    cat > "$test_conf" <<TC2
+load_module $mod_so;
+events {}
+http {}
+stream {}
+TC2
+    if nginx -t -c "$test_conf" 2>/dev/null; then
+      rm -f "$test_conf"
+      ok "stream 模块已加载: $mod_so"
+      return 0
+    fi
+    rm -f "$test_conf"
+  fi
+
+  # 找不到 .so，安装 nginx-extras
   info "安装 nginx-extras 启用 stream..."
+  apt-get update -qq 2>/dev/null
   apt-get install -y -qq nginx-extras 2>/dev/null
-  return 0
+
+  # 装完再找一遍
+  for p in /usr/lib/nginx/modules/ngx_stream_module.so \
+           /usr/share/nginx/modules/ngx_stream_module.so; do
+    if [ -f "$p" ]; then
+      mkdir -p /etc/nginx/modules-enabled
+      echo "load_module $p;" > /etc/nginx/modules-enabled/stream.conf
+      mod_so="$p"; break
+    fi
+  done
+
+  # 最终测试
+  if [ -n "$mod_so" ]; then
+    test_conf=$(mktemp)
+    cat > "$test_conf" <<TC3
+load_module $mod_so;
+events {}
+http {}
+stream {}
+TC3
+    if nginx -t -c "$test_conf" 2>/dev/null; then
+      rm -f "$test_conf"
+      ok "stream 模块已加载"
+      return 0
+    fi
+    rm -f "$test_conf"
+  fi
+
+  # 最后兜底测试（可能静态编译了）
+  test_conf=$(mktemp)
+  cat > "$test_conf" <<'TC4'
+events {}
+http {}
+stream {}
+TC4
+  if nginx -t -c "$test_conf" 2>/dev/null; then
+    rm -f "$test_conf"
+    return 0
+  fi
+  rm -f "$test_conf"
+  err "stream 模块不可用，请手动安装 nginx-extras 或检查模块路径"
+  return 1
 }
 
 setup_sni_split(){
@@ -1179,7 +1256,11 @@ setup_sni_split(){
   echo "    其他 SNI → sing-box Reality（${SINGBOX_PORT}）"
   echo
 
-  ensure_stream_module
+  if ! ensure_stream_module; then
+    err "stream 模块不可用，无法配置 SNI 分流"
+    pause
+    return 1
+  fi
 
   local ng_conf="/etc/nginx/nginx.conf"
   cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
@@ -1197,14 +1278,15 @@ setup_sni_split(){
     [ -n "$domain" ] && [ "$domain" != "_" ] && web_domains="$web_domains $domain"
   done
 
-  # 问用户 HTTPS 监听端口
+  # 问用户 Web HTTPS 内部监听端口
   local https_port
   if ! is_port_in_use 443; then
     https_port="443"
   else
     echo
-    warn "443 当前被占用"
-    read -rp "  Web HTTPS 监听端口（如 8443/2053）: " https_port
+    warn "443 已被占用（stream 分流会用 443）"
+    info "Web 需要一个内部端口（仅本机监听，不暴露公网）"
+    read -rp "  Web HTTPS 内部端口（如 8443/9090）: " https_port
     valid_port "$https_port" || https_port="8443"
   fi
   info "Web HTTPS 监听: ${https_port}"
