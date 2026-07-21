@@ -39,8 +39,6 @@ SINGBOX_LISTEN_PORT=8444        # sing-box 内部监听端口（Nginx 转发）
 SINGBOX_SECRETS="/root/singbox-secrets.txt"
 
 # Cloudflare 回源端口白名单
-CF_PORTS="443 2053 2083 2087 2096 8443"
-CF_DEFAULT_PORT=8443
 CF_CREDS_DIR="/etc/letsencrypt/cloudflare"
 CERTBOT_WEBROOT="/var/www/html"
 
@@ -520,7 +518,7 @@ install_all(){
   echo
   echo "  端口布局:"
   echo "    443  → Nginx SNI 分流"
-  echo "    8443 → Nginx Web 反代"
+  echo "    ${NGINX_HTTPS_PORT:-443} → Nginx Web 反代"
   echo "    ${SINGBOX_LISTEN_PORT} → sing-box Reality"
   ok "一键安装完成"
   pause
@@ -906,16 +904,57 @@ server {
 NGINX
 }
 
-# 原生 HTTPS 模板（80→443 重定向 + 443 SSL 反代）
+# 写入 HTTPS 反代模板（自动判断监听端口 + CF 真实 IP + WebSocket）
+# 判断 Nginx HTTPS 应该监听哪个端口
+# 443 空闲 → 直接用 443（标准方案）
+# 443 被占用 → 让用户自己选一个端口
+NGINX_HTTPS_PORT=""
+get_https_listen_port(){
+  if [ -n "$NGINX_HTTPS_PORT" ]; then
+    echo "$NGINX_HTTPS_PORT"
+    return
+  fi
+  if ! is_port_in_use 443; then
+    NGINX_HTTPS_PORT="443"
+    echo "443"
+  else
+    local input
+    echo
+    warn "443 端口已被占用，HTTPS 不能监听 443"
+    read -rp "  Nginx HTTPS 监听端口（如 8443/2053/2083/2087/2096）: " input
+    if valid_port "$input"; then
+      NGINX_HTTPS_PORT="$input"
+    else
+      NGINX_HTTPS_PORT="8443"
+      info "使用默认 8443"
+    fi
+    echo "$NGINX_HTTPS_PORT"
+  fi
+}
+
 write_nginx_https_template(){
   local conf="$1" domain="$2" port="$3"
   local cert_path="/etc/letsencrypt/live/$domain"
+  local listen_port
+  listen_port=$(get_https_listen_port)
   ensure_connection_upgrade_map
+
+  local comment=""
+  if [ "$listen_port" = "8443" ]; then
+    comment="# SNI 分流模式: stream 443 → 8443 (sing-box 占了 443)"
+  else
+    comment="# 标准模式: 直接监听 443"
+  fi
+
   cat > "$conf" <<NGINX
+# ${domain} — HTTPS 反代
+# 由 vps-toolkit 生成
+${comment}
+
 server {
     listen 80;
     listen [::]:80;
-    server_name $domain;
+    server_name ${domain};
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -927,62 +966,17 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name $domain;
+    listen ${listen_port} ssl http2;
+    listen [::]:${listen_port} ssl http2;
+    server_name ${domain};
 
-    ssl_certificate     $cert_path/fullchain.pem;
-    ssl_certificate_key $cert_path/privkey.pem;
+    ssl_certificate     ${cert_path}/fullchain.pem;
+    ssl_certificate_key ${cert_path}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    location / {
-        proxy_pass http://127.0.0.1:$port;
-
-        client_max_body_size 500M;
-        proxy_buffering off;
-
-        proxy_http_version 1.1;
-
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_connect_timeout 60s;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-NGINX
-}
-
-# Cloudflare 回源模板 — Nginx 监听非标端口，CF 橙云代理回源
-# 用户访问 https://域名（不带端口）→ CF → 本机:非标端口
-write_nginx_cf_template(){
-  local conf="$1" domain="$2" port="$3" cf_port="$4"
-  local cert_path="/etc/letsencrypt/live/$domain"
-  ensure_connection_upgrade_map
-  cat > "$conf" <<NGINX
-# Cloudflare CDN 回源模式
-# Nginx 监听 ${cf_port}，CF 橙云代理回源
-# 用户访问 https://${domain}（不带端口）→ CF → 本机:${cf_port}
-server {
-    listen ${cf_port} ssl http2;
-    listen [::]:${cf_port} ssl http2;
-    server_name $domain;
-
-    ssl_certificate     $cert_path/fullchain.pem;
-    ssl_certificate_key $cert_path/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    # 信任 Cloudflare IP，获取真实客户端 IP
+    # Cloudflare 真实 IP（有 CF 代理时生效，无 CF 也无害）
     set_real_ip_from 173.245.48.0/20;
     set_real_ip_from 103.21.244.0/22;
     set_real_ip_from 103.22.200.0/22;
@@ -1025,6 +1019,7 @@ server {
 }
 NGINX
 }
+
 
 # 将证书应用到 Nginx 站点（重写为 HTTPS 配置）
 apply_cert_to_nginx(){
@@ -1132,7 +1127,7 @@ find_site_by_domain(){
 create_nginx_proxy(){
   local hint_name="$1" hint_port="$2"
   ui_header "创建反代"
-  local name domain port input tpl conf cf_port cf_valid
+  local name domain port input tpl conf
   NGINX_TESTED_OK=""
   while ! safe_name "$name"; do
     [ -n "$hint_name" ] && read -rp "  名称（默认 $hint_name）: " input || read -rp "  名称: " input
@@ -1145,19 +1140,17 @@ create_nginx_proxy(){
     [ -z "$domain" ] && return 1
   done
   while ! valid_port "$port"; do
-    [ -n "$hint_port" ] && read -rp "  端口（默认 $hint_port）: " input || read -rp "  端口: " input
+    [ -n "$hint_port" ] && read -rp "  上游服务端口（默认 $hint_port）: " input || read -rp "  上游服务端口: " input
     [ -z "$input" ] && [ -n "$hint_port" ] && port="$hint_port" && break
     [ -z "$input" ] && return 1
     port="$input"
   done
 
-  # 模板选择
+  # 模板选择（简化为 2 种）
   echo
-  echo "  [1] 通用 HTTP 模板（80 端口，后续可申请证书转 HTTPS）"
-  echo "  [2] 原生 HTTPS 模板（443 空闲，标准 80→443 方案，需提前有证书）"
-  echo "  [3] Cloudflare 回源（443 被占用，Nginx 监听非标端口，CF 代理回源）"
-  echo "  [4] 空模板（用户自写）"
-  read -rp "  请选择 [1/2/3/4]（默认 1）: " tpl
+  echo "  [1] 标准反代（先 HTTP 占位，申请证书后自动转 HTTPS 8443）"
+  echo "  [2] 空模板（用户自写）"
+  read -rp "  请选择 [1/2]（默认 1）: " tpl
   [ -z "$tpl" ] && tpl="1"
 
   conf="/etc/nginx/sites-available/$name"
@@ -1165,60 +1158,19 @@ create_nginx_proxy(){
 
   case "$tpl" in
     1)
+      # 先用 HTTP 模板占位，证书申请后自动转 HTTPS
       write_nginx_template "$conf" "$domain" "$port"
-      ok "通用模板已生成"
+      local https_port
+      https_port=$(get_https_listen_port)
+      if [ "$https_port" = "8443" ]; then
+        ok "HTTP 占位模板已生成（上游 → 127.0.0.1:$port）"
+        info "检测到 443 被占用，证书申请后 HTTPS 将监听 8443（需 SNI 分流）"
+      else
+        ok "HTTP 占位模板已生成（上游 → 127.0.0.1:$port）"
+        info "443 空闲，证书申请后 HTTPS 将监听 443（标准方案）"
+      fi
       ;;
     2)
-      # 检查 443 是否被占用
-      if is_port_in_use 443; then
-        local holder
-        holder=$(get_port_holder 443)
-        warn "443 端口已被 ${holder:-未知进程} 占用!"
-        warn "原生 HTTPS 方案需要 443 空闲，建议选择 Cloudflare 模式"
-        ask_yn "仍然继续？" "n" || return 1
-      fi
-      # 先写 HTTP 模板，证书申请后再由 apply_cert_to_nginx 改写为 HTTPS
-      write_nginx_template "$conf" "$domain" "$port"
-      ok "HTTP 模板已生成（证书申请后将自动转为 HTTPS）"
-      ;;
-    3)
-      # Cloudflare 回源模式
-      if is_port_in_use 443; then
-        local holder
-        holder=$(get_port_holder 443)
-        ok "检测到 443 被占用（${holder:-未知}），使用 Cloudflare 回源模式"
-      else
-        info "443 当前空闲，仍可使用 CF 模式（场景：将来 443 被占用 / 统一管理）"
-      fi
-
-      echo "  Cloudflare 回源端口（白名单: $CF_PORTS）"
-      read -rp "  回源端口（默认 $CF_DEFAULT_PORT）: " cf_port
-      [ -z "$cf_port" ] && cf_port="$CF_DEFAULT_PORT"
-
-      # 验证端口在白名单内
-      cf_valid=0
-      for p in $CF_PORTS; do
-        [ "$p" = "$cf_port" ] && cf_valid=1 && break
-      done
-      if [ "$cf_valid" -eq 0 ]; then
-        err "端口 $cf_port 不在 Cloudflare 回源白名单中"
-        info "白名单: $CF_PORTS"
-        return 1
-      fi
-
-      info "Cloudflare 面板配置提示:"
-      echo "    1. DNS 记录: $domain → 本服务器 IP，代理状态: 橙云"
-      echo "    2. SSL/TLS 模式: Full 或 Full (strict)"
-      echo "    3. 回源端口 $cf_port 由 Nginx 监听"
-      echo "    4. 用户访问 https://$domain（不带端口）→ CF → 本机:$cf_port"
-
-      # 先用 HTTP 模板占位，证书申请（DNS-01）后再改写为 CF 模板
-      write_nginx_template "$conf" "$domain" "$port"
-      # 记录 CF 端口，后续 apply_cert 时使用
-      CF_ORIGIN_PORT="$cf_port"
-      ok "占位模板已生成，证书申请后将自动转为 Cloudflare 回源配置"
-      ;;
-    4)
       : > "$conf"
       ok "空模板已生成"
       ;;
@@ -1233,8 +1185,8 @@ create_nginx_proxy(){
     edit_file "$conf"
   fi
 
-  # 申请并应用证书
-  if [ "$tpl" = "1" ] || [ "$tpl" = "2" ] || [ "$tpl" = "3" ]; then
+  # 申请并应用 HTTPS 证书
+  if [ "$tpl" = "1" ]; then
     if ask_yn "申请并应用 HTTPS 证书？" "y"; then
       if [ ! -s "$conf" ]; then
         write_nginx_template "$conf" "$domain" "$port"
@@ -1249,40 +1201,26 @@ create_nginx_proxy(){
         pause
         return 1
       fi
-      # 证书申请
-      if [ "$tpl" = "3" ]; then
-        # Cloudflare 模式 — 使用 DNS-01
-        certbot_get "$domain" "dns" && apply_cert_cf "$name" "$CERTBOT_DOMAIN"
+
+      # 证书申请方式选择
+      echo
+      echo "  证书验证方式:"
+      echo "  [1] HTTP-01 webroot（仅需 80 端口，无需 CF API）"
+      echo "  [2] DNS-01 Cloudflare（需 CF API Token，支持橙云 + 续期最稳）"
+      read -rp "  请选择 [1/2]（默认 2）: " cert_method
+      [ -z "$cert_method" ] && cert_method="2"
+
+      if [ "$cert_method" = "2" ]; then
+        certbot_get "$domain" "dns"
       else
-        # HTTP-01 webroot
-        certbot_get "$domain" "http" && apply_cert_to_nginx "$name" "$CERTBOT_DOMAIN"
+        certbot_get "$domain" "http"
+      fi
+
+      # 证书申请成功后自动转为 HTTPS 8443 模板
+      if [ -n "$CERTBOT_DOMAIN" ]; then
+        apply_cert_to_nginx "$name" "$CERTBOT_DOMAIN"
       fi
     fi
-  fi
-  pause
-}
-
-# 将证书应用到 Cloudflare 回源站点
-apply_cert_cf(){
-  local conf="$1" domain="$2"
-  [ -z "$domain" ] && { warn "缺少域名"; return 1; }
-  [ -z "$conf" ] && { warn "缺少站点名"; return 1; }
-  local cert_path="/etc/letsencrypt/live/$domain"
-  [ ! -d "$cert_path" ] && { warn "证书目录不存在: $cert_path"; return 1; }
-  local conffile="/etc/nginx/sites-available/$conf"
-  [ ! -f "$conffile" ] && return 1
-
-  local port="$PREV_PORT" cf_port="${CF_ORIGIN_PORT:-$CF_DEFAULT_PORT}"
-  [ -z "$port" ] && read -rp "  端口: " port
-  valid_port "$port" || { err "端口无效"; return 1; }
-
-  write_nginx_cf_template "$conffile" "$domain" "$port" "$cf_port"
-  if nginx -t 2>/dev/null; then
-    systemctl reload nginx && ok "CF 回源配置已应用，Nginx 已重载" || err "重载失败"
-  else
-    err "配置有误，保留占位 HTTP 配置"
-    nginx -t 2>&1 | head -5 | sed 's/^/  /'
-    return 1
   fi
   pause
 }
@@ -1657,8 +1595,6 @@ generate_singbox_config(){
       "tag": "vless-reality-in",
       "listen": "::",
       "listen_port": ${SINGBOX_LISTEN_PORT},
-      "sniff": true,
-      "sniff_override_destination": false,
       "users": [
         {
           "name": "user1",
@@ -1689,6 +1625,11 @@ generate_singbox_config(){
     { "type": "block", "tag": "block" }
   ],
   "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      }
+    ],
     "final": "direct"
   }
 }
@@ -1912,31 +1853,49 @@ singbox_menu(){
 
 # 检查并安装 nginx stream 模块
 ensure_stream_module(){
-  if nginx -V 2>&1 | grep -q -- '--with-stream=dynamic'; then
-    # 动态模块，检查 modules-enabled
-    if ! nginx -t 2>/dev/null; then
-      # 测试 stream 指令是否可用
-      if ! echo 'stream { }' | nginx -t -c /dev/stdin 2>/dev/null; then
-        info "安装 nginx-extras 启用 stream 模块..."
-        apt-get install -y -qq nginx-extras
-      fi
-    fi
+  # 测试 stream 指令是否可用
+  local test_conf
+  test_conf=$(mktemp)
+  cat > "$test_conf" <<'TESTEOF'
+events {}
+http {}
+stream {}
+TESTEOF
+  if nginx -t -c "$test_conf" 2>/dev/null; then
+    rm -f "$test_conf"
+    return 0
   fi
-  # 验证 stream 可用
-  if ! nginx -t 2>/dev/null; then
-    # 如果当前配置已有 stream 且通过，说明 OK
-    if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then
-      return 0
-    fi
+  rm -f "$test_conf"
+
+  info "Nginx stream 模块未加载，安装 nginx-extras..."
+  apt-get update -qq 2>/dev/null
+  apt-get install -y -qq nginx-extras 2>/dev/null
+
+  # 再次测试
+  test_conf=$(mktemp)
+  cat > "$test_conf" <<'TESTEOF'
+events {}
+http {}
+stream {}
+TESTEOF
+  if nginx -t -c "$test_conf" 2>/dev/null; then
+    rm -f "$test_conf"
+    ok "stream 模块已就绪"
+    return 0
   fi
-  return 0
+  rm -f "$test_conf"
+  err "stream 模块仍不可用，请手动安装 nginx-extras"
+  return 1
 }
 
 # 配置 SNI 分流（Nginx 接管 443，分流给 Web 和 sing-box）
 setup_sni_split(){
   ui_header "配置 Nginx SNI 分流"
+  # 先确定 HTTPS 监听端口（443 被占时需用户指定）
+  local https_port
+  https_port=$(get_https_listen_port)
   info "Nginx 接管 443，按 SNI 分流:"
-  echo "    Web 域名 → Nginx HTTPS 反代（8443）"
+  echo "    Web 域名 → Nginx HTTPS 反代（${https_port}）"
   echo "    其他 SNI → sing-box Reality（${SINGBOX_LISTEN_PORT}）"
   echo
 
@@ -1987,7 +1946,7 @@ SNIEOF
     }
 
     upstream web {
-        server 127.0.0.1:8443;
+        server 127.0.0.1:${NGINX_HTTPS_PORT:-8443};
     }
 
     upstream singbox {
@@ -2008,7 +1967,7 @@ SNIEOF
     ok "SNI 分流配置已写入 nginx.conf"
     info "端口布局:"
     echo "    443  → Nginx stream（SNI 分流）"
-    echo "    8443 → Nginx http（Web 反代）"
+    echo "    ${NGINX_HTTPS_PORT:-8443} → Nginx http（Web 反代）"
     echo "    ${SINGBOX_LISTEN_PORT} → sing-box（Reality）"
 
     # 重启 Nginx
@@ -2228,7 +2187,7 @@ health_check(){
   if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then
     ok "已配置 (Nginx 443 SNI 分流)"
     echo "    443 → stream 分流"
-    echo "    8443 → Web 反代"
+    echo "    $(grep -oP '(?<=server 127\.0\.0\.1:)\d+' /etc/nginx/nginx.conf 2>/dev/null | head -1 || echo '?') → Web 反代"
     echo "    ${SINGBOX_LISTEN_PORT} → sing-box"
     ss -tlnp 2>/dev/null | grep -E '443|8443|8444' | sed 's/^/    /'
   else
