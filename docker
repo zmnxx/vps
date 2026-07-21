@@ -313,7 +313,7 @@ EOF2
   ok "daemon.json 已配置"
   if systemctl is-active --quiet docker 2>/dev/null; then
     warn "需要重启 Docker 生效"
-    if ask_yn "立即重启 Docker？" "n"; then systemctl restart docker; ok "Docker 已重启"; fi
+    if ask_yn "立即重启 Docker？" "y"; then systemctl restart docker; ok "Docker 已重启"; fi
   fi
   pause
 }
@@ -337,9 +337,10 @@ install_docker(){
 
 install_nginx(){
   if cmd_exists nginx; then
-    # 已安装，检查 stream 模块是否可用
+    # 已安装，清理可能重复的 stream.conf，再检查
+    rm -f /etc/nginx/modules-enabled/stream.conf 2>/dev/null
     if ! ensure_stream_module 2>/dev/null; then
-      warn "Nginx 已安装但缺 stream 模块，升级到 nginx-full..."
+      warn "Nginx 缺 stream 模块，升级到 nginx-full..."
       apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
     fi
     ok "Nginx 已安装"
@@ -348,11 +349,10 @@ install_nginx(){
   info "安装 Nginx（nginx-full，自带 stream 模块）..."
   apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx
   systemctl enable --now nginx 2>/dev/null
-  # 确认 stream 模块可用
   if ensure_stream_module 2>/dev/null; then
-    ok "Nginx 安装完成（stream 模块就绪）"
+    ok "Nginx 安装完成（stream 就绪）"
   else
-    ok "Nginx 安装完成（stream 模块可能需要手动安装 nginx-extras）"
+    ok "Nginx 安装完成"
   fi
 }
 
@@ -588,25 +588,41 @@ docker_menu(){
 # ─── WebSocket map ────────────────────────────────────────
 
 ensure_connection_upgrade_map(){
-  local conf="/etc/nginx/nginx.conf" tmp testout line inserted=0
+  local conf="/etc/nginx/nginx.conf"
   [ -f "$conf" ] || { err "未找到 $conf"; return 1; }
-  if grep -q 'map[[:space:]]\+\$http_upgrade[[:space:]]\+\$connection_upgrade' "$conf" 2>/dev/null; then return 0; fi
-  tmp=$(mktemp)
+  # 已有 map 就不重复加
+  if grep -q 'map[[:space:]]\+\$http_upgrade[[:space:]]\+\$connection_upgrade' "$conf" 2>/dev/null; then
+    return 0
+  fi
+  # 在 http { 后面插入 map 块
+  cp "$conf" "${conf}.bak.$(date +%s)"
+  local tmp; tmp=$(mktemp)
+  local inserted=0
+  local line
   while IFS= read -r line || [ -n "$line" ]; do
     printf '%s\n' "$line" >> "$tmp"
     if [ "$inserted" -eq 0 ] && echo "$line" | grep -q '^[[:space:]]*http[[:space:]]*{'; then
-      printf '%s\n' '    map $http_upgrade $connection_upgrade {' >> "$tmp"
-      printf '%s\n' '        default upgrade;' >> "$tmp"
-      printf '%s\n' "        '' close;" >> "$tmp"
-      printf '%s\n' '    }' >> "$tmp"
-      printf '\n' >> "$tmp"
+      printf '    map $http_upgrade $connection_upgrade {\n' >> "$tmp"
+      printf '        default upgrade;\n' >> "$tmp"
+      printf "        '' close;\n" >> "$tmp"
+      printf '    }\n\n' >> "$tmp"
       inserted=1
     fi
   done < "$conf"
-  if [ "$inserted" -ne 1 ]; then rm -f "$tmp"; err "未找到 http 配置块"; return 1; fi
-  testout=$(nginx -t -c "$tmp" 2>&1)
-  if [ $? -ne 0 ]; then rm -f "$tmp"; err "临时配置测试失败"; return 1; fi
-  cat "$tmp" > "$conf"; rm -f "$tmp"
+  if [ "$inserted" -ne 1 ]; then
+    rm -f "$tmp"; err "未找到 http 块"; return 1
+  fi
+  # 用实际 nginx 配置测试（不是独立测试文件）
+  cp "$tmp" "$conf"
+  if ! nginx -t 2>/dev/null; then
+    err "nginx -t 失败，恢复备份"
+    nginx -t 2>&1 | head -3 | sed 's/^/  /'
+    cp "${conf}.bak."* "$conf" 2>/dev/null | tail -1
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  return 0
 }
 
 # ─── Nginx 反代模板 ──────────────────────────────────────
@@ -1157,95 +1173,41 @@ singbox_menu(){
 
 # ─── Nginx SNI 分流 ──────────────────────────────────────
 
-# 检测并加载 stream 模块
+# 检测并加载 stream 模块（绝不创建额外的 conf 文件，避免重复加载）
 ensure_stream_module(){
-  # 测试当前 nginx 是否已支持 stream
-  local test_conf
-  test_conf=$(mktemp)
-  cat > "$test_conf" <<'TC'
-events {}
-http {}
-stream {}
-TC
-  if nginx -t -c "$test_conf" 2>/dev/null; then
-    rm -f "$test_conf"
+  # 清理之前版本可能创建的冲突文件
+  rm -f /etc/nginx/modules-enabled/stream.conf 2>/dev/null
+
+  # 检查 modules-enabled 下是否有 stream 模块配置
+  if ls /etc/nginx/modules-enabled/*stream* >/dev/null 2>&1; then
     return 0
   fi
-  rm -f "$test_conf"
 
-  # stream 不可用，尝试找到 .so 并加载
+  # 检查 nginx.conf 是否已手动 load_module stream
+  if grep -q 'ngx_stream_module' /etc/nginx/nginx.conf 2>/dev/null; then
+    return 0
+  fi
+
+  # 找 .so 文件，但只在 modules-enabled 为空且无其他方式加载时才考虑
   local mod_so=""
   for p in /usr/lib/nginx/modules/ngx_stream_module.so \
-           /usr/share/nginx/modules/ngx_stream_module.so \
-           /usr/lib/nginx/ngx_stream_module.so; do
+           /usr/share/nginx/modules/ngx_stream_module.so; do
     [ -f "$p" ] && mod_so="$p" && break
   done
 
-  if [ -n "$mod_so" ]; then
-    # 创建模块加载文件
-    mkdir -p /etc/nginx/modules-enabled
-    echo "load_module $mod_so;" > /etc/nginx/modules-enabled/stream.conf
-    # 测试
-    test_conf=$(mktemp)
-    cat > "$test_conf" <<TC2
-load_module $mod_so;
-events {}
-http {}
-stream {}
-TC2
-    if nginx -t -c "$test_conf" 2>/dev/null; then
-      rm -f "$test_conf"
-      ok "stream 模块已加载: $mod_so"
-      return 0
-    fi
-    rm -f "$test_conf"
+  if [ -z "$mod_so" ]; then
+    info "安装 nginx-full 启用 stream 模块..."
+    apt-get update -qq 2>/dev/null
+    apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
   fi
 
-  # 找不到 .so，安装 nginx-extras
-  info "安装 nginx-extras 启用 stream..."
-  apt-get update -qq 2>/dev/null
-  apt-get install -y -qq nginx-extras 2>/dev/null
-
-  # 装完再找一遍
-  for p in /usr/lib/nginx/modules/ngx_stream_module.so \
-           /usr/share/nginx/modules/ngx_stream_module.so; do
-    if [ -f "$p" ]; then
-      mkdir -p /etc/nginx/modules-enabled
-      echo "load_module $p;" > /etc/nginx/modules-enabled/stream.conf
-      mod_so="$p"; break
-    fi
-  done
-
-  # 最终测试
-  if [ -n "$mod_so" ]; then
-    test_conf=$(mktemp)
-    cat > "$test_conf" <<TC3
-load_module $mod_so;
-events {}
-http {}
-stream {}
-TC3
-    if nginx -t -c "$test_conf" 2>/dev/null; then
-      rm -f "$test_conf"
-      ok "stream 模块已加载"
-      return 0
-    fi
-    rm -f "$test_conf"
-  fi
-
-  # 最后兜底测试（可能静态编译了）
-  test_conf=$(mktemp)
-  cat > "$test_conf" <<'TC4'
-events {}
-http {}
-stream {}
-TC4
-  if nginx -t -c "$test_conf" 2>/dev/null; then
-    rm -f "$test_conf"
+  # 装完再检查
+  if ls /etc/nginx/modules-enabled/*stream* >/dev/null 2>&1; then
+    ok "stream 模块已就绪"
     return 0
   fi
-  rm -f "$test_conf"
-  err "stream 模块不可用，请手动安装 nginx-extras 或检查模块路径"
+
+  err "stream 模块不可用"
   return 1
 }
 
