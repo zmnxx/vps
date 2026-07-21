@@ -335,7 +335,7 @@ install_base_env(){
 create_docker_project(){
   need_docker || return 1
   ui_header "创建 Docker 项目"
-  local name input
+  local name="" input
   while ! safe_name "$name"; do
     read -rp "  项目名称（留空返回）: " name
     [ -z "$name" ] && return 1
@@ -846,7 +846,6 @@ cf_certbot_get(){
 cf_create_site(){
   local hint_name="$1" hint_port="$2"
   need_nginx || return 1
-  need_nginx_root
   install_cf_dns_plugin || return 1
 
   ui_header "Cloudflare 站点创建"
@@ -856,7 +855,7 @@ cf_create_site(){
   # 采集凭据
   cf_collect_credentials || return 1
 
-  local name domain port cfport input conf
+  local name="" domain="" port="" cfport="" input="" conf=""
   domain="$CF_DOMAIN"
   cfport="$CF_ORIGIN_PORT"
 
@@ -1070,7 +1069,7 @@ install_all(){
 create_nginx_proxy(){
   local hint_name="$1" hint_port="$2"
   ui_header "创建反代"
-  local name domain port input tpl conf
+  local name="" domain="" port="" input="" tpl="" conf=""
   NGINX_TESTED_OK=""
   while ! safe_name "$name"; do
     [ -n "$hint_name" ] && read -rp "  名称（默认 $hint_name）: " input || read -rp "  名称: " input
