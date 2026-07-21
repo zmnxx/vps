@@ -11,11 +11,7 @@
       "store_dns": true
     },
     "clash_api": {
-      "external_controller": "127.0.0.1:9090",
-      "secret": "",
-      "default_mode": "rule",
-      "external_ui": "ui",
-      "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+      "default_mode": "rule"
     }
   },
   "http_clients": [
@@ -52,11 +48,16 @@
       {
         "type": "fakeip",
         "tag": "dns-fakeip",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
+        "inet4_range": "198.18.0.0/15"
       }
     ],
     "rules": [
+      {
+        "query_type": ["AAAA", "HTTPS", "SVCB"],
+        "action": "reject",
+        "method": "default",
+        "no_drop": true
+      },
       {
         "rule_set": "规则-广告",
         "action": "reject",
@@ -80,7 +81,7 @@
           "github.com"
         ],
         "action": "route",
-        "server": "dns-境外"
+        "server": "dns-fakeip"
       },
       {
         "domain_suffix": [
@@ -93,14 +94,12 @@
           "cf-ns.net"
         ],
         "action": "route",
-        "server": "dns-境外"
+        "server": "dns-fakeip"
       },
       {
-        "domain_suffix": [
-          "pcloud.com"
-        ],
+        "domain_suffix": ["pcloud.com"],
         "action": "route",
-        "server": "dns-境外"
+        "server": "dns-fakeip"
       },
       {
         "domain_suffix": [
@@ -120,32 +119,25 @@
         "server": "dns-国内"
       },
       {
-        "rule_set": [
-          "规则-GFW",
-          "规则-谷歌域名",
-          "规则-电报域名"
-        ],
+        "query_type": ["A"],
         "action": "route",
-        "server": "dns-境外"
-      },
-      {
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "action": "route",
-        "server": "dns-fakeip"
+        "server": "dns-fakeip",
+        "rewrite_ttl": 1
       }
     ],
     "final": "dns-国内",
-    "strategy": "prefer_ipv4",
-    "optimistic": true,
-    "timeout": "10s",
-    "reverse_mapping": true
+    "strategy": "ipv4_only",
+    "optimistic": {
+      "enabled": true,
+      "timeout": "3d"
+    },
+    "timeout": "5s",
+    "reverse_mapping": true,
+    "cache_capacity": 4096
   },
   "ntp": {
     "enabled": true,
-    "server": "ntp.aliyun.com",
+    "server": "time.apple.com",
     "server_port": 123,
     "interval": "30m",
     "domain_resolver": "dns-本地"
@@ -154,23 +146,25 @@
     {
       "type": "tun",
       "tag": "tun-in",
-      "address": [
-        "172.19.0.1/30",
-        "fdfe:dcba:9876::1/126"
-      ],
+      "address": ["172.19.0.1/30"],
+      "mtu": 1500,
       "auto_route": true,
-      "strict_route": false,
-      "stack": "gvisor"
+      "strict_route": true,
+      "stack": "system",
+      "platform": {
+        "http_proxy": {
+          "enabled": true,
+          "server": "127.0.0.1",
+          "server_port": 7890
+        }
+      }
     }
   ],
   "outbounds": [
     {
       "type": "selector",
       "tag": "手动选择",
-      "outbounds": [
-        "自动选择",
-        "DIRECT"
-      ],
+      "outbounds": ["自动选择", "DIRECT"],
       "default": "自动选择",
       "interrupt_exist_connections": true
     },
@@ -187,41 +181,25 @@
     {
       "type": "selector",
       "tag": "国内",
-      "outbounds": [
-        "DIRECT",
-        "手动选择",
-        "自动选择"
-      ],
+      "outbounds": ["DIRECT", "手动选择", "自动选择"],
       "default": "DIRECT"
     },
     {
       "type": "selector",
       "tag": "谷歌",
-      "outbounds": [
-        "手动选择",
-        "自动选择",
-        "DIRECT"
-      ],
+      "outbounds": ["手动选择", "自动选择", "DIRECT"],
       "default": "手动选择"
     },
     {
       "type": "selector",
       "tag": "电报",
-      "outbounds": [
-        "手动选择",
-        "自动选择",
-        "DIRECT"
-      ],
+      "outbounds": ["手动选择", "自动选择", "DIRECT"],
       "default": "手动选择"
     },
     {
       "type": "selector",
       "tag": "兜底",
-      "outbounds": [
-        "手动选择",
-        "自动选择",
-        "DIRECT"
-      ],
+      "outbounds": ["手动选择", "自动选择", "DIRECT"],
       "default": "手动选择"
     },
     {
@@ -231,10 +209,8 @@
   ],
   "route": {
     "auto_detect_interface": true,
-    "default_domain_resolver": {
-      "server": "dns-本地",
-      "strategy": "prefer_ipv4"
-    },
+    "override_android_vpn": true,
+    "default_domain_resolver": "dns-本地",
     "default_http_client": "http-直连下载",
     "find_process": false,
     "final": "兜底",
@@ -313,17 +289,15 @@
       }
     ],
     "rules": [
+      { "action": "sniff" },
       {
-        "action": "sniff"
-      },
-      {
-        "protocol": "dns",
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          { "protocol": "dns" },
+          { "port": 53 }
+        ],
         "action": "hijack-dns"
-      },
-      {
-        "port": 123,
-        "action": "route",
-        "outbound": "DIRECT"
       },
       {
         "domain_suffix": [
@@ -336,9 +310,7 @@
         "outbound": "国内"
       },
       {
-        "ip_cidr": [
-          "101.36.166.16/32"
-        ],
+        "ip_cidr": ["101.36.166.16/32"],
         "action": "route",
         "outbound": "国内"
       },
@@ -352,9 +324,7 @@
         "outbound": "谷歌"
       },
       {
-        "ip_cidr": [
-          "142.250.0.0/15"
-        ],
+        "ip_cidr": ["142.250.0.0/15"],
         "action": "route",
         "outbound": "谷歌"
       },
@@ -372,16 +342,12 @@
         "outbound": "兜底"
       },
       {
-        "domain_suffix": [
-          "pcloud.com"
-        ],
+        "domain_suffix": ["pcloud.com"],
         "action": "route",
         "outbound": "兜底"
       },
       {
-        "ip_cidr": [
-          "192.168.100.111/32"
-        ],
+        "ip_cidr": ["192.168.100.111/32"],
         "action": "reject",
         "method": "default",
         "no_drop": true
@@ -436,8 +402,18 @@
         "outbound": "兜底"
       },
       {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          { "port": 853 },
+          { "network": "udp", "port": 443 },
+          { "protocol": "stun" }
+        ],
+        "action": "reject"
+      },
+      {
         "action": "resolve",
-        "server": "dns-国内"
+        "strategy": "ipv4_only"
       },
       {
         "rule_set": "规则-电报IP",
