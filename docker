@@ -340,14 +340,14 @@ install_nginx(){
     # 已安装，清理可能重复的 stream.conf，再检查
     rm -f /etc/nginx/modules-enabled/stream.conf 2>/dev/null
     if ! ensure_stream_module 2>/dev/null; then
-      warn "Nginx 缺 stream 模块，升级到 nginx-full..."
-      apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
+      warn "Nginx 缺 stream 模块，升级并安装相关依赖..."
+      apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
     fi
     ok "Nginx 已安装"
     return 0
   fi
-  info "安装 Nginx（nginx-full，自带 stream 模块）..."
-  apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx
+  info "安装 Nginx（nginx-full + libnginx-mod-stream）..."
+  apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx
   systemctl enable --now nginx 2>/dev/null
   if ensure_stream_module 2>/dev/null; then
     ok "Nginx 安装完成（stream 就绪）"
@@ -1213,9 +1213,9 @@ ensure_stream_module(){
   done
 
   if [ -z "$mod_so" ]; then
-    info "安装 nginx-full 启用 stream 模块..."
+    info "安装 nginx-full 和 libnginx-mod-stream 模块..."
     apt-get update -qq 2>/dev/null
-    apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
+    apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
   fi
 
   # 重新找一次 .so 文件
