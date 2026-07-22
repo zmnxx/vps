@@ -57,6 +57,16 @@
     ],
     "rules": [
       {
+        "clash_mode": "direct",
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "server": "dns-fakeip"
+      },
+      {
         "query_type": ["AAAA", "HTTPS", "SVCB"],
         "action": "reject",
         "method": "default",
@@ -174,7 +184,7 @@
     {
       "type": "urltest",
       "tag": "自动选择",
-      "outbounds": [],
+      "outbounds": ["COMPATIBLE"],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "5m",
       "tolerance": 50,
@@ -208,6 +218,10 @@
     {
       "type": "direct",
       "tag": "DIRECT"
+    },
+    {
+      "type": "direct",
+      "tag": "COMPATIBLE"
     }
   ],
   "route": {
@@ -291,6 +305,16 @@
       }
     ],
     "rules": [
+      {
+        "clash_mode": "direct",
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "outbound": "手动选择"
+      },
       { "action": "sniff" },
       {
         "type": "logical",
