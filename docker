@@ -1164,9 +1164,12 @@ singbox_restart(){ systemctl restart sing-box && ok "已重启" || err "重启�
 singbox_delete(){
   ask_yn "确定卸载 sing-box？" "n" || return 0
   systemctl disable --now sing-box 2>/dev/null || true
-  rm -f "$SINGBOX_SERVICE"; systemctl daemon-reload
-  rm -rf /etc/sing-box; rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
-  ok "sing-box 已卸载"
+  rm -f "$SINGBOX_SERVICE"
+  systemctl daemon-reload
+  rm -rf /etc/sing-box
+  rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
+  rm -f /usr/local/bin/sing-box /usr/bin/sing-box
+  ok "sing-box 二进制文件、配置、密钥、服务已彻底清除"
   pause
 }
 
@@ -1192,17 +1195,17 @@ ensure_stream_module(){
   # 清理之前版本可能创建的冲突文件
   rm -f /etc/nginx/modules-enabled/stream.conf 2>/dev/null
 
-  # 检查 modules-enabled 下是否有 stream 模块配置
-  if ls /etc/nginx/modules-enabled/*stream* >/dev/null 2>&1; then
-    return 0
-  fi
-
   # 检查 nginx.conf 是否已手动 load_module stream
   if grep -q 'ngx_stream_module' /etc/nginx/nginx.conf 2>/dev/null; then
     return 0
   fi
 
-  # 找 .so 文件，但只在 modules-enabled 为空且无其他方式加载时才考虑
+  # 检查 modules-enabled 下是否有 stream 模块配置
+  if ls /etc/nginx/modules-enabled/*stream* >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # 找 .so 文件并尝试软链接，以防 modules-enabled 动态模块丢失
   local mod_so=""
   for p in /usr/lib/nginx/modules/ngx_stream_module.so \
            /usr/share/nginx/modules/ngx_stream_module.so; do
@@ -1213,6 +1216,24 @@ ensure_stream_module(){
     info "安装 nginx-full 启用 stream 模块..."
     apt-get update -qq 2>/dev/null
     apt-get install -y -qq nginx-full 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
+  fi
+
+  # 重新找一次 .so 文件
+  for p in /usr/lib/nginx/modules/ngx_stream_module.so \
+           /usr/share/nginx/modules/ngx_stream_module.so; do
+    [ -f "$p" ] && mod_so="$p" && break
+  done
+
+  # 如果存在模块动态链接库，直接强行在 nginx.conf 的首行插入 load_module 声明
+  if [ -n "$mod_so" ]; then
+    local ng_conf="/etc/nginx/nginx.conf"
+    if ! grep -q 'ngx_stream_module.so' "$ng_conf" 2>/dev/null; then
+      cp "$ng_conf" "${ng_conf}.bak.stream_load"
+      (echo "load_module $mod_so;"; cat "${ng_conf}.bak.stream_load") > "$ng_conf"
+      rm -f "${ng_conf}.bak.stream_load"
+      ok "已在 nginx.conf 顶部显式加载 stream 模块"
+    fi
+    return 0
   fi
 
   # 装完再检查
@@ -1470,12 +1491,14 @@ delete_all_data(){
   fi
 
   if ask_yn "卸载 sing-box？" "n"; then
-    if cmd_exists sing-box; then
-      systemctl disable --now sing-box 2>/dev/null || true
-      rm -f "$SINGBOX_SERVICE"; systemctl daemon-reload
-      rm -rf /etc/sing-box; rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
-      ok "已卸载"; deleted=1
-    else warn "未安装"; fi
+    systemctl disable --now sing-box 2>/dev/null || true
+    rm -f "$SINGBOX_SERVICE"
+    systemctl daemon-reload
+    rm -rf /etc/sing-box
+    rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
+    rm -f /usr/local/bin/sing-box /usr/bin/sing-box
+    ok "sing-box 二进制文件、配置、密钥、服务已彻底清除"
+    deleted=1
   fi
 
   if ask_yn "清除 SNI 分流配置？" "n"; then
