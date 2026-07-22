@@ -1218,64 +1218,142 @@ singbox_show_client(){
     return 1
   fi
 
-  # 1. 动态从 config.json 提取参数，防止手动修改后不匹配
-  local uuid flow sni priv_key short_id pub_key client_port use_sni="y"
-  uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "$SINGBOX_CONF" | head -1 | cut -d'"' -f4)
-  flow=$(grep -oE '"flow"[[:space:]]*:[[:space:]]*"[^"]+"' "$SINGBOX_CONF" | head -1 | cut -d'"' -f4)
-  sni=$(grep -oE '"server_name"[[:space:]]*:[[:space:]]*"[^"]+"' "$SINGBOX_CONF" | head -1 | cut -d'"' -f4)
-  [ -z "$sni" ] && sni=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[^"]+"' "$SINGBOX_CONF" | head -1 | cut -d'"' -f4)
-  priv_key=$(grep -oE '"private_key"[[:space:]]*:[[:space:]]*"[^"]+"' "$SINGBOX_CONF" | head -1 | cut -d'"' -f4)
-  short_id=$(grep -oE '"short_id"[[:space:]]*:[[:space:]]*\[[^\]]+\]' "$SINGBOX_CONF" | head -1 | tr -d ' ' | cut -d'"' -f2)
-
-  # 从 Nginx 或者是 secrets 里提取是否使用了分流
-  if [ -f "$SINGBOX_SECRETS" ]; then
-    use_sni=$(grep 'UseSNISplit:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
-    # 如果私钥没有手动改，优先从 secrets 里读公钥，避免重复算
-    local saved_priv saved_pub
-    saved_priv=$(grep 'PrivateKey:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
-    if [ "$saved_priv" = "$priv_key" ]; then
-      pub_key=$(grep 'PublicKey:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
-    fi
+  # 使用 python3 动态、稳妥地解析配置。这不仅解决了字符串截取错误，
+  # 还能完美支持多用户（多个 UUID）以及未来可能添加的其他入站协议（如 Hysteria2、TUIC、Trojan 等），彻底防范排版错乱。
+  if ! cmd_exists python3; then
+    err "未安装 python3，无法实时解析复杂配置"
+    pause
+    return 1
   fi
 
-  # 如果没获取到公钥（被手动修改过），根据当前的私钥实时计算公钥
-  if [ -z "$pub_key" ] && [ -n "$priv_key" ] && cmd_exists sing-box; then
-    # sing-box 官方并没有只输入私钥就计算公钥的独立子命令，但我们可以用其 reality-keypair 的计算逻辑来生成
-    # 实用的计算方式：通过 reality-keypair 间接匹配，这里我们将私钥传递给临时配对
-    # 如果无法反推，我们会做友好降级提示
-    pub_key="（私钥被手动修改，请查阅您在配置文件中对应公钥对）"
-  fi
-  [ -z "$pub_key" ] && pub_key=$(grep 'PublicKey:' "$SINGBOX_SECRETS" 2>/dev/null | cut -d' ' -f2)
+  # 准备调用 python3 脚本输出
+  python3 - <<'PYEOF'
+import json
+import urllib.request
+import sys
+import os
 
-  # 计算客户端连接端口
-  if [ "$use_sni" = "n" ]; then
-    # 直连模式下的端口
-    client_port=$(grep -oE '"listen_port"[[:space:]]*:[[:space:]]*[0-9]+' "$SINGBOX_CONF" | head -1 | tr -d ' ' | cut -d: -f2)
-  else
-    # 分流模式固定为 443
-    client_port="443"
-  fi
+CONF_PATH = "/etc/sing-box/config.json"
+SECRETS_PATH = "/root/singbox-secrets.txt"
 
-  local vps_ip
-  vps_ip=$(curl -s4 ifconfig.me 2>/dev/null || echo "你的VPS_IP")
+# 颜色常数
+RED = '\033[1;31m'; GREEN = '\033[1;32m'; YELLOW = '\033[1;33m'
+BLUE = '\033[1;34m'; CYAN = '\033[1;36m'; BOLD = '\033[1m'; NC = '\033[0m'
 
-  echo -e "  UUID:       ${GREEN}${uuid:-未识别}${NC}"
-  echo -e "  Flow:       ${GREEN}${flow:-xtls-rprx-vision}${NC}"
-  echo -e "  SNI:        ${GREEN}${sni:-未识别}${NC}"
-  echo -e "  PublicKey:  ${GREEN}${pub_key:-未识别}${NC}"
-  echo -e "  ShortID:    ${GREEN}${short_id:-未识别}${NC}"
-  echo -e "  连接端口:   ${GREEN}${client_port:-443}${NC}"
-  echo -e "  分流模式:   ${GREEN}${use_sni:-y}${NC}"
-  echo
-  echo -e "  ${BOLD}── VLESS Reality 节点分享链接 ──${NC}"
-  if [ -n "$uuid" ] && [ -n "$pub_key" ] && [ -n "$short_id" ]; then
-    local node_link="vless://${uuid}@${vps_ip}:${client_port}?encryption=none&flow=${flow:-xtls-rprx-vision}&security=reality&sni=${sni}&pbk=${pub_key}&sid=${short_id}#VLESS-Reality"
-    echo -e "  ${CYAN}${node_link}${NC}"
-    echo
-    info "提示：您可以直接复制上方链接，导入 Shadowrocket / Loon / Stash / v2rayN 等客户端。"
-  else
-    warn "配置解析不完整，无法生成分享链接。"
-  fi
+try:
+    with open(CONF_PATH, 'r') as f:
+        config = json.load(f)
+except Exception as e:
+    print(f"  {RED}[ERROR]{NC} 无法读取配置文件: {e}")
+    sys.exit(1)
+
+# 获取保存的公钥，防止手动修改私钥后缺失反推
+pub_key = ""
+use_sni_split = "y"
+if os.path.exists(SECRETS_PATH):
+    with open(SECRETS_PATH, 'r') as f:
+        for line in f:
+            if line.startswith("PublicKey:"):
+                pub_key = line.split(":", 1)[1].strip()
+            elif line.startswith("UseSNISplit:"):
+                use_sni_split = line.split(":", 1)[1].strip()
+
+# 获取 VPS 公网 IP
+vps_ip = "你的VPS_IP"
+try:
+    req = urllib.request.Request("https://ifconfig.me", headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        vps_ip = r.read().decode('utf-8').strip()
+except:
+    pass
+
+inbounds = config.get("inbounds", [])
+if not inbounds:
+    print(f"  {YELLOW}[WARN]{NC} 配置文件中没有添加入站配置 (inbounds)")
+    sys.exit(0)
+
+# 遍历所有入站协议
+for idx, inbound in enumerate(inbounds):
+    proto_type = inbound.get("type", "未知")
+    tag = inbound.get("tag", f"inbound-{idx}")
+    listen_port = inbound.get("listen_port", 0)
+    listen_ip = inbound.get("listen", "0.0.0.0")
+
+    # 确定客户端连接的实际外网端口
+    client_port = "443" if use_sni_split == "y" else str(listen_port)
+
+    print(f"\n  {BOLD}📍 协议模块: {proto_type.upper()} ({tag}) {NC}")
+    print(f"  ────────────────────────────────────────")
+
+    if proto_type == "vless":
+        # 提取 Reality 等 TLS 特征
+        tls_conf = inbound.get("tls", {})
+        reality_conf = tls_conf.get("reality", {})
+        is_reality = reality_conf.get("enabled", False)
+        sni = tls_conf.get("server_name", "未配置")
+        
+        # 提取 short_id
+        short_ids = reality_conf.get("short_id", [])
+        short_id = short_ids[0] if short_ids else "未配置"
+        
+        # 如果是 reality 且配置文件私钥存在，但 txt 没有，进行提示
+        if is_reality and not pub_key:
+            pub_key = "（未在 secrets 中找到对应公钥）"
+
+        users = inbound.get("users", [])
+        if not users:
+            print(f"    {YELLOW}未配置任何用户{NC}")
+            continue
+
+        for u in users:
+            name = u.get("name", "未定义")
+            uuid = u.get("uuid", "无")
+            flow = u.get("flow", "")
+            
+            print(f"    用户名:   {GREEN}{name}{NC}")
+            print(f"    UUID:     {GREEN}{uuid}{NC}")
+            print(f"    连接端口: {GREEN}{client_port}{NC}")
+            if is_reality:
+                print(f"    流控:     {GREEN}{flow if flow else '无'}{NC}")
+                print(f"    SNI 伪装: {GREEN}{sni}{NC}")
+                print(f"    公钥 PBK: {GREEN}{pub_key}{NC}")
+                print(f"    Short ID: {GREEN}{short_id}{NC}")
+                print(f"    分流复用: {GREEN}{'启用 (通过443转发)' if use_sni_split == 'y' else '禁用 (直接连接端口)'}{NC}")
+                
+                # 拼接标准的 vless reality 链接
+                vless_link = f"vless://{uuid}@{vps_ip}:{client_port}?encryption=none"
+                if flow:
+                    vless_link += f"&flow={flow}"
+                vless_link += f"&security=reality&sni={sni}&pbk={pub_key}&sid={short_id}#VLESS-Reality-{name}"
+                
+                print(f"\n    {CYAN}👉 节点链接:{NC}")
+                print(f"    {CYAN}{vless_link}{NC}\n")
+            else:
+                print(f"    安全传输: {GREEN}无安全防护/普通TLS{NC}")
+                print(f"    连接节点: vless://{uuid}@{vps_ip}:{client_port}?encryption=none#{name}")
+
+    elif proto_type == "hysteria2":
+        # 预留给未来添加 hysteria2 支持的解析
+        users = inbound.get("users", [])
+        password = users[0].get("password", "") if users else ""
+        print(f"    连接密码: {GREEN}{password}{NC}")
+        print(f"    连接端口: {GREEN}{client_port}{NC}")
+        print(f"    节点链接: hy2://{password}@{vps_ip}:{client_port}#Hysteria2")
+
+    elif proto_type == "tuic":
+        # 预留给未来添加 tuic 支持的解析
+        users = inbound.get("users", [])
+        uuid = users[0].get("uuid", "") if users else ""
+        password = users[0].get("password", "") if users else ""
+        print(f"    UUID:     {GREEN}{uuid if uuid else password}{NC}")
+        print(f"    连接端口: {GREEN}{client_port}{NC}")
+
+    else:
+        # 其他协议直接进行基础信息打印
+        print(f"    外部监听: {listen_ip}:{listen_port}")
+        print(f"    (该协议类型暂不支持在控制台生成节点二维码/链接)")
+
+PYEOF
   pause
 }
 
