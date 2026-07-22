@@ -1318,13 +1318,11 @@ setup_sni_split(){
   # 并在 nginx.conf 中加载（确保在 http{} 外面）
   # 1. 检查 nginx.conf 中是否已经包含该配置
   if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null; then
-     # 在主配置第一行插入（或通过特殊追加方式），避免被包含在 http 块内。
-     # Debian/Ubuntu 默认的 include /etc/nginx/conf.d/*.conf 位于 http 内部，
-     # 所以不能把包含 stream{} 的 stream.conf 丢进 conf.d/ 目录下被默认加载。
-     # 我们改用专用路径 `/etc/nginx/stream.conf`，并在 nginx.conf 头部引入。
+     # 我们不能盲目插在第一行，因为 `load_module` 指令必须在任何业务配置（包括 `include stream.conf`）之前。
+     # 为了解决加载顺序问题，我们将 `include /etc/nginx/stream.conf;` 始终追加在 nginx.conf 的最末尾。
+     # 因为在主配置最末尾追加，一定在 http 块闭合大括号之外，且排在开头的 load_module 之后。
      cp "$ng_conf" "${ng_conf}.bak.stream_patch"
-     (echo "include /etc/nginx/stream.conf;"; cat "${ng_conf}.bak.stream_patch") > "$ng_conf"
-     rm -f "${ng_conf}.bak.stream_patch"
+     echo "include /etc/nginx/stream.conf;" >> "$ng_conf"
   fi
 
   cat > /etc/nginx/stream.conf <<SNIEOF
@@ -1375,7 +1373,7 @@ SNIEOF
     # 恢复主配置
     local latest_bak; latest_bak=$(ls -t "${ng_conf}.bak."* 2>/dev/null | head -1)
     [ -n "$latest_bak" ] && cp "$latest_bak" "$ng_conf"
-    # 删除头部插入的 include
+    # 删除尾部插入的 include
     sed -i '/include \/etc\/nginx\/stream.conf;/d' "$ng_conf"
     rm -f /etc/nginx/stream.conf
   fi
