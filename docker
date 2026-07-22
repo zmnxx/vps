@@ -240,23 +240,44 @@ remove_cleanup_cron(){
 }
 
 write_cleanup_script(){
+  install -d -m 0755 /usr/local/bin /var/log
   cat > /usr/local/bin/docker-cleanup.sh <<'CMDEOF'
 #!/bin/bash
+set -u
 LOG="/var/log/docker-cleanup.log"
+exec 9>/run/docker-cleanup.lock
+flock -n 9 || exit 0
 ts=$(date '+%Y-%m-%d %H:%M:%S')
-echo "[$ts] 定时清理开始..." >> "$LOG"
-docker container prune -f >> "$LOG" 2>&1
-docker image prune -a -f >> "$LOG" 2>&1
-docker builder prune -a -f >> "$LOG" 2>&1
-docker volume prune -f >> "$LOG" 2>&1
-echo "[$ts] 定时清理完成" >> "$LOG"
+printf '[%s] 定时清理开始...\n' "$ts" >> "$LOG"
+timeout 30m docker container prune -f >> "$LOG" 2>&1 || true
+timeout 30m docker image prune -f >> "$LOG" 2>&1 || true
+timeout 30m docker builder prune -f >> "$LOG" 2>&1 || true
+printf '[%s] 定时清理完成\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
 CMDEOF
-  chmod +x /usr/local/bin/docker-cleanup.sh
+  chmod 0755 /usr/local/bin/docker-cleanup.sh
+  cat > /etc/logrotate.d/docker-cleanup <<'LOEOF'
+/var/log/docker-cleanup.log {
+    weekly
+    rotate 4
+    size 1M
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+LOEOF
+  touch /var/log/docker-cleanup.log
 }
 
 setup_auto_cleanup(){
   ui_header "定时维护"
-  local cron_time choice
+  local cron_time choice job
+  job=$(crontab -l 2>/dev/null | grep -F '/usr/local/bin/docker-cleanup.sh' || true)
+  if [ -n "$job" ]; then
+    ok "定时清理已存在，跳过重复配置"
+    echo "    $job"
+    ask_yn "是否重新设置时间？" "n" || { pause; return 0; }
+  fi
   echo "  [1] 每天凌晨 3 点"
   echo "  [2] 每周一凌晨 3 点"
   echo "  [3] 每月 1 号凌晨 3 点"
@@ -267,8 +288,8 @@ setup_auto_cleanup(){
   read -rp "  请选择 [1]: " choice
   [ -z "$choice" ] && choice="1"
   case "$choice" in
-    4) job=$(crontab -l 2>/dev/null | grep "docker-cleanup.sh" || true); [ -z "$job" ] && warn "未设置" || ok "$job"; pause; return 0 ;;
-    5) remove_cleanup_cron; ok "已删除"; pause; return 0 ;;
+    4) [ -z "$job" ] && warn "未设置" || ok "$job"; pause; return 0 ;;
+    5) remove_cleanup_cron; rm -f /usr/local/bin/docker-cleanup.sh /etc/logrotate.d/docker-cleanup /var/log/docker-cleanup.log; ok "已删除"; pause; return 0 ;;
     6) write_cleanup_script; /usr/local/bin/docker-cleanup.sh; ok "已执行"; pause; return 0 ;;
     0) return 0 ;;
     1) cron_time="0 3 * * *" ;;
@@ -286,42 +307,52 @@ setup_auto_cleanup(){
 # ─── Docker 日志轮转 ──────────────────────────────────────
 
 config_docker_log_rotation(){
-  ui_header "Docker 日志轮转"
+  local auto_mode="${1:-}" daemon_json="/etc/docker/daemon.json" max_size="50m" max_file="3" input tmp
+  [ "$auto_mode" != "auto" ] && ui_header "Docker 日志轮转"
   if ! cmd_exists docker; then warn "Docker 未安装，跳过"; return 1; fi
-  local daemon_json="/etc/docker/daemon.json" max_size="50m" max_file="3" input
-  info "配置 json-file 日志轮转防止日志撑爆磁盘"
-  info "默认: 每文件最大 ${max_size}，保留 ${max_file} 个"
-  if ! ask_yn "使用默认配置？" "y"; then
+  if grep -q '"max-size"' "$daemon_json" 2>/dev/null && grep -q '"max-file"' "$daemon_json" 2>/dev/null; then
+    ok "Docker 日志轮转已配置，跳过重复配置"
+    [ "$auto_mode" = "auto" ] && return 0
+    pause; return 0
+  fi
+  info "配置 json-file 日志轮转：单文件 ${max_size}，保留 ${max_file} 个"
+  if [ "$auto_mode" != "auto" ] && ! ask_yn "使用默认配置？" "y"; then
     read -rp "  单文件最大 [50m]: " input; [ -n "$input" ] && max_size="$input"
     read -rp "  保留文件数 [3]: " input; [ -n "$input" ] && max_file="$input"
   fi
   mkdir -p /etc/docker
-  if [ -f "$daemon_json" ] && cmd_exists jq; then
-    cp "$daemon_json" "${daemon_json}.bak.$(date +%s)"
-    local tmp
-    tmp=$(jq --arg s "$max_size" --arg f "$max_file" '.log-driver = "json-file" | .log-opts = {"max-size": $s, "max-file": $f}' "$daemon_json" 2>/dev/null)
-    if [ -n "$tmp" ]; then echo "$tmp" > "$daemon_json"
-    else cat > "$daemon_json" <<EOF2
-{"log-driver":"json-file","log-opts":{"max-size":"${max_size}","max-file":"${max_file}"}}
-EOF2
+  if [ -f "$daemon_json" ]; then
+    if ! cmd_exists jq || ! jq empty "$daemon_json" >/dev/null 2>&1; then
+      err "已有 daemon.json 但无法安全解析，未覆盖原配置"
+      return 1
     fi
+    tmp=$(mktemp)
+    jq --arg s "$max_size" --arg f "$max_file" '. + {"log-driver":"json-file","log-opts":{"max-size":$s,"max-file":$f}}' "$daemon_json" > "$tmp" || { rm -f "$tmp"; err "daemon.json 更新失败"; return 1; }
   else
-    cat > "$daemon_json" <<EOF2
-{"log-driver":"json-file","log-opts":{"max-size":"${max_size}","max-file":"${max_file}"}}
-EOF2
+    tmp=$(mktemp)
+    printf '{"log-driver":"json-file","log-opts":{"max-size":"%s","max-file":"%s"}}\n' "$max_size" "$max_file" > "$tmp"
   fi
-  ok "daemon.json 已配置"
+  if [ -f "$daemon_json" ]; then cp -f "$daemon_json" "${daemon_json}.bak"; fi
+  install -m 0644 "$tmp" "$daemon_json"; rm -f "$tmp"
+  ok "daemon.json 已配置（只对新建容器生效）"
   if systemctl is-active --quiet docker 2>/dev/null; then
-    warn "需要重启 Docker 生效"
-    if ask_yn "立即重启 Docker？" "y"; then systemctl restart docker; ok "Docker 已重启"; fi
+    if [ "$auto_mode" = "auto" ]; then
+      systemctl restart docker && ok "Docker 已重启，日志轮转已生效" || { err "Docker 重启失败"; return 1; }
+    elif ask_yn "立即重启 Docker？" "y"; then
+      systemctl restart docker && ok "Docker 已重启" || err "Docker 重启失败"
+    fi
   fi
-  pause
+  [ "$auto_mode" = "auto" ] || pause
 }
 
 # ─── 安装 ────────────────────────────────────────────────
 
 install_docker(){
-  docker_ready && { ok "Docker 已安装且正在运行"; return 0; }
+  if docker_ready; then
+    systemctl enable docker >/dev/null 2>&1 || true
+    ok "Docker 已安装、运行且已设置开机自启"
+    return 0
+  fi
   info "安装 Docker..."
   apt-get update -qq || { err "apt update 失败"; return 1; }
   apt-get install -y -qq ca-certificates curl gnupg
@@ -331,14 +362,14 @@ install_docker(){
   local codename; codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$ID $codename stable" > /etc/apt/sources.list.d/docker.list
   apt-get update -qq
-  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  ok "Docker 安装完成"
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || { err "Docker 安装失败"; return 1; }
+  systemctl enable --now docker || { err "Docker 服务启动失败"; return 1; }
+  ok "Docker 安装完成并已设置开机自启"
 }
 
 install_nginx(){
   if cmd_exists nginx; then
-    # 已安装，清理可能重复的 stream.conf，再检查
-    rm -f /etc/nginx/modules-enabled/stream.conf 2>/dev/null
+    # 已安装时保留发行版模块文件，只检查 stream 是否可用。
     if ! ensure_stream_module 2>/dev/null; then
       warn "Nginx 缺 stream 模块，升级并安装相关依赖..."
       apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
@@ -357,10 +388,21 @@ install_nginx(){
 }
 
 install_certbot(){
-  cmd_exists certbot && { ok "Certbot 已安装"; return 0; }
-  info "安装 Certbot..."
-  apt-get install -y -qq certbot python3-certbot-nginx
-  ok "Certbot 安装完成"
+  if cmd_exists certbot; then
+    ok "Certbot 已安装"
+  else
+    info "安装 Certbot..."
+    apt-get install -y -qq certbot python3-certbot-nginx || { err "Certbot 安装失败"; return 1; }
+    ok "Certbot 安装完成"
+  fi
+  install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/00-nginx-reload <<'HOOKEOF'
+#!/bin/sh
+if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || true
+fi
+HOOKEOF
+  chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/00-nginx-reload
 }
 
 ensure_cf_plugin(){
@@ -570,9 +612,9 @@ docker_menu(){
   while true; do
     ui_header "Docker 管理"
     echo "  [1] 项目列表  [2] 创建项目  [3] 启动/更新  [4] 停止"
-    echo "  [5] 日志      [6] 编辑配置  [7] 更新镜像  [8] 容器状态"
+    echo "  [5] 查看日志  [6] 编辑配置  [7] 更新镜像  [8] 容器状态"
     echo "  [9] 重启     [10] 项目空间 [11] 清理日志 [12] 删除项目"
-    echo " [13] 系统状态 [14] 日志轮转 [15] 清理全日志[16] 定时维护"
+    echo " [13] 系统状态 [14] 日志轮转 [15] 清空容器日志 [16] 定时维护"
     echo "  [0] 返回"
     read -rp "  请选择 [0-16]: " c
     case "$c" in
@@ -595,7 +637,8 @@ ensure_connection_upgrade_map(){
     return 0
   fi
   # 在 http { 后面插入 map 块
-  cp "$conf" "${conf}.bak.$(date +%s)"
+  local backup="${conf}.bak"
+  cp -f "$conf" "$backup"
   local tmp; tmp=$(mktemp)
   local inserted=0
   local line
@@ -617,8 +660,8 @@ ensure_connection_upgrade_map(){
   if ! nginx -t 2>/dev/null; then
     err "nginx -t 失败，恢复备份"
     nginx -t 2>&1 | head -3 | sed 's/^/  /'
-    cp "${conf}.bak."* "$conf" 2>/dev/null | tail -1
-    rm -f "$tmp"
+    cp -f "$backup" "$conf"
+    rm -f "$backup" "$tmp"
     return 1
   fi
   rm -f "$tmp"
@@ -1149,10 +1192,8 @@ setup_singbox(){
   fi
 
   if [ "$use_sni" = "n" ]; then
-    # 直连模式：放行监听端口
-    if cmd_exists ufw; then ufw allow ${SINGBOX_PORT}/tcp 2>/dev/null || true; fi
-    # 如果有 iptables 自动放行外部连接
-    if cmd_exists iptables; then iptables -I INPUT -p tcp --dport ${SINGBOX_PORT} -j ACCEPT 2>/dev/null || true; fi
+    # 防火墙由用户自行管理，脚本只提示需要开放端口。
+    info "请自行在防火墙中开放 TCP ${SINGBOX_PORT} 端口"
   else
     # 分流模式：确保 Nginx 正在运行
     if ! systemctl is-active --quiet nginx; then 
@@ -1175,8 +1216,8 @@ setup_singbox(){
 singbox_status(){
   ui_header "sing-box 状态"
   if ! cmd_exists sing-box; then warn "未安装"; pause; return; fi
-  echo "  版本: \$(sing-box version 2>/dev/null | head -1)"
-  echo "  状态: \$(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
+  echo "  版本: $(sing-box version 2>/dev/null | head -1)"
+  echo "  状态: $(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
   
   local use_sni="y"
   if [ -f "$SINGBOX_SECRETS" ]; then
@@ -1431,9 +1472,10 @@ ensure_stream_module(){
   if [ -n "$mod_so" ]; then
     local ng_conf="/etc/nginx/nginx.conf"
     if ! grep -q 'ngx_stream_module.so' "$ng_conf" 2>/dev/null; then
-      cp "$ng_conf" "${ng_conf}.bak.stream_load"
-      (echo "load_module $mod_so;"; cat "${ng_conf}.bak.stream_load") > "$ng_conf"
-      rm -f "${ng_conf}.bak.stream_load"
+      local module_backup="${ng_conf}.bak"
+      cp -f "$ng_conf" "$module_backup"
+      (echo "load_module $mod_so;"; cat "$module_backup") > "$ng_conf"
+      rm -f "$module_backup"
       ok "已在 nginx.conf 顶部显式加载 stream 模块"
     fi
     return 0
@@ -1484,7 +1526,8 @@ setup_sni_split(){
     if ! ask_yn "是否需要更新或重新配置？" "y"; then return 0; fi
   fi
 
-  cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
+  local nginx_backup="${ng_conf}.bak"
+  cp -f "$ng_conf" "$nginx_backup"
 
   # 删除旧 stream 块
   sed -i '/^stream {/,/^}/d' "$ng_conf"
@@ -1515,7 +1558,7 @@ setup_sni_split(){
 
   # Web 内部端口（首次默认 8443，已有就用已有的）
   local https_port
-  https_port=$(grep -A2 'upstream web' "${ng_conf}.bak."* 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+  https_port=$(grep -A2 'upstream web' "$nginx_backup" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
   [ -z "$https_port" ] || ! valid_port "$https_port" && https_port="8443"
   echo
   info "Web HTTPS 内部端口: ${https_port}（仅本机，不暴露公网）"
@@ -1531,7 +1574,6 @@ setup_sni_split(){
      # 我们不能盲目插在第一行，因为 `load_module` 指令必须在任何业务配置（包括 `include stream.conf`）之前。
      # 为了解决加载顺序问题，我们将 `include /etc/nginx/stream.conf;` 始终追加在 nginx.conf 的最末尾。
      # 因为在主配置最末尾追加，一定在 http 块闭合大括号之外，且排在开头的 load_module 之后。
-     cp "$ng_conf" "${ng_conf}.bak.stream_patch"
      echo "include /etc/nginx/stream.conf;" >> "$ng_conf"
   fi
 
@@ -1562,6 +1604,7 @@ SNIEOF
 SNIEOF
 
   if nginx -t 2>/dev/null; then
+    rm -f "$nginx_backup"
     ok "SNI 分流配置已写入到 /etc/nginx/stream.conf"
     info "对外 443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
     echo
@@ -1581,8 +1624,8 @@ SNIEOF
     err "nginx -t 失败，恢复备份"
     nginx -t 2>&1 | head -5 | sed 's/^/  /'
     # 恢复主配置
-    local latest_bak; latest_bak=$(ls -t "${ng_conf}.bak."* 2>/dev/null | head -1)
-    [ -n "$latest_bak" ] && cp "$latest_bak" "$ng_conf"
+    cp -f "$nginx_backup" "$ng_conf"
+    rm -f "$nginx_backup"
     # 删除尾部插入的 include
     sed -i '/include \/etc\/nginx\/stream.conf;/d' "$ng_conf"
     rm -f /etc/nginx/stream.conf
@@ -1608,14 +1651,20 @@ install_all(){
 
   ui_header "[3/6] SNI 分流"
   if cmd_exists sing-box; then
-    if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/conf.d/stream.conf ]; then ok "已配置"
+    if [ -f /etc/nginx/stream.conf ] && grep -Fq 'include /etc/nginx/stream.conf;' /etc/nginx/nginx.conf 2>/dev/null; then ok "已配置"
     elif ask_yn "配置 SNI 分流？" "y"; then setup_sni_split; fi
   else warn "sing-box 未安装，跳过"; fi
 
   ui_header "[4/6] 日志与维护"
-  if [ ! -f /etc/docker/daemon.json ] || ! grep -q "log-opts" /etc/docker/daemon.json 2>/dev/null; then
-    ask_yn "配置 Docker 日志轮转？" "y" && config_docker_log_rotation; fi
-  if has_auto_cleanup; then ok "定时维护已存在"
+  if [ ! -f /etc/docker/daemon.json ] || ! grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null || ! grep -q '"max-file"' /etc/docker/daemon.json 2>/dev/null; then
+    info "首次安装：自动配置 Docker 日志轮转"
+    config_docker_log_rotation auto || warn "Docker 日志轮转配置失败，请在 Docker 菜单中处理"
+  else
+    ok "Docker 日志轮转已存在，跳过重复配置"
+  fi
+  if has_auto_cleanup; then
+    write_cleanup_script
+    ok "定时维护已存在，跳过重复配置"
   elif ask_yn "设置定时清理？" "y"; then setup_auto_cleanup; fi
 
   ui_header "[5/6] Docker 服务"
@@ -1635,7 +1684,7 @@ install_all(){
 
   ui_header "安装摘要"
   echo "  sing-box:   ${i_sb}"
-  echo "  SNI 分流:   $( { grep -q 'stream.conf' /etc/nginx/nginx.conf || [ -f /etc/nginx/stream.conf ]; } 2>/dev/null && echo '已配置' || echo '未配置')"
+  echo "  SNI 分流:   $( { [ -f /etc/nginx/stream.conf ] && grep -Fq 'include /etc/nginx/stream.conf;' /etc/nginx/nginx.conf; } 2>/dev/null && echo '已配置' || echo '未配置')"
   echo "  Docker:     ${i_dp:-未创建}"
   echo "  反代端口:   ${i_port:-─}"
   echo "  Nginx 站点: ${i_site:-未创建}"
@@ -1651,7 +1700,7 @@ delete_all_data(){
   ui_header "一键删除"
   local deleted=0
 
-  if ask_yn "删除 Docker 项目？" "n"; then
+  if ask_yn "删除 Docker 项目？（已进入一键删除流程）" "y"; then
     local dirs files=() items=() item selected dir name port
     dirs=$(collect_compose_files)
     for item in $dirs; do files+=("$item"); done
@@ -1671,7 +1720,7 @@ delete_all_data(){
     fi
   fi
 
-  if ask_yn "删除 Nginx 站点？" "n"; then
+  if ask_yn "删除 Nginx 站点？（已进入一键删除流程）" "y"; then
     local sites=() f conf info name selected
     for f in /etc/nginx/sites-enabled/*; do
       [ -L "$f" ] || [ -f "$f" ] || continue
@@ -1685,7 +1734,7 @@ delete_all_data(){
     fi
   fi
 
-  if ask_yn "删除证书？" "n"; then
+  if ask_yn "删除证书？（已进入一键删除流程）" "y"; then
     local certs=() cert
     for cert in /etc/letsencrypt/live/*/; do [ -d "$cert" ] && certs+=("$(basename "$cert")"); done
     if [ ${#certs[@]} -eq 0 ]; then warn "没有证书"
@@ -1694,11 +1743,11 @@ delete_all_data(){
     fi
   fi
 
-  if ask_yn "删除 CF 凭据？" "n"; then
+  if ask_yn "删除 CF 凭据？（已进入一键删除流程）" "y"; then
     [ -f "${CF_CREDS_DIR}/cf.ini" ] && { rm -rf "$CF_CREDS_DIR"; ok "已删除"; deleted=1; } || warn "无 CF 凭据"
   fi
 
-  if ask_yn "卸载 sing-box？" "n"; then
+  if ask_yn "卸载 sing-box？（已进入一键删除流程）" "y"; then
     systemctl disable --now sing-box 2>/dev/null || true
     rm -f "$SINGBOX_SERVICE"
     systemctl daemon-reload
@@ -1709,17 +1758,30 @@ delete_all_data(){
     deleted=1
   fi
 
-  if ask_yn "清除 SNI 分流配置？" "n"; then
+  if ask_yn "清除 SNI 分流配置？（已进入一键删除流程）" "y"; then
     if grep -q 'stream.conf' /etc/nginx/nginx.conf 2>/dev/null || grep -q 'stream.conf' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
-      cp /etc/nginx/nginx.conf "/etc/nginx/nginx.conf.bak.$(date +%s)"
+      cp -f /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
       sed -i '/include \/etc\/nginx\/stream.conf;/d' /etc/nginx/nginx.conf
       sed -i '/include \/etc\/nginx\/conf.d\/stream.conf;/d' /etc/nginx/nginx.conf
       rm -f /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf
-      nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null && ok "已清除" && deleted=1
+      if nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null; then
+        rm -f /etc/nginx/nginx.conf.bak
+        ok "已清除"
+        deleted=1
+      else
+        err "SNI 文件已删除，但 Nginx 配置测试或重载失败"
+      fi
     else warn "无 SNI 配置"; fi
   fi
 
-  [ "$deleted" -eq 0 ] && warn "本次没删除任何内容" || ok "删除完成"
+  # 清理脚本自身的任务、日志和工具配置，不删除 Docker 引擎及用户数据。
+  remove_cleanup_cron
+  rm -f /usr/local/bin/docker-cleanup.sh /etc/logrotate.d/docker-cleanup /var/log/docker-cleanup.log
+  rm -f /etc/letsencrypt/renewal-hooks/deploy/00-nginx-reload
+  rm -f /etc/docker/daemon.json.bak /etc/nginx/nginx.conf.bak
+  rm -f "$CONF_FILE" "${CONF_DIR}/config.bak" 2>/dev/null || true
+  rmdir "$CONF_DIR" 2>/dev/null || true
+  [ "$deleted" -eq 0 ] && warn "本次没有删除业务对象，仅清理了工具自身残留" || ok "删除完成，工具自身残留已清理"
   pause
 }
 
@@ -1838,7 +1900,7 @@ vps-toolkit.sh $VERSION — VPS 一键运维工具箱
   sing-box:     /etc/sing-box/config.json
 HELP
       exit 0 ;;
-    *) err "未知命令: \$cmd (使用 --help 查看)"; exit 1 ;;
+    *) err "未知命令: $cmd (使用 --help 查看)"; exit 1 ;;
   esac
 }
 
