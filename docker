@@ -1093,7 +1093,7 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 [Service]
 Type=simple
-ExecStart=\${sb_path} run -c ${SINGBOX_CONF}
+ExecStart=${sb_path} run -c ${SINGBOX_CONF}
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
