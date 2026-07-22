@@ -47,10 +47,14 @@ ok()    { echo -e "  ${GREEN}[OK]${NC} $1"; }
 info()  { echo -e "  ${BLUE}[INFO]${NC} $1"; }
 warn()  { echo -e "  ${YELLOW}[WARN]${NC} $1"; }
 err()   { echo -e "  ${RED}[ERROR]${NC} $1"; }
-ui_line()    { echo -e "${CYAN}----------------------------------------${NC}"; }
-ui_box()     { ui_line; echo -e "  ${GREEN}${BOLD}$1${NC}"; ui_line; }
-ui_header()  { echo; ui_box "$1"; }
-pause(){ echo; read -rp "  按回车继续..." _dummy; }
+ui_line()    { printf '%b\n' "${CYAN}────────────────────────────────────────────────────────${NC}"; }
+ui_box()     { ui_line; printf '  %b\n' "${GREEN}${BOLD}$1${NC}"; ui_line; }
+ui_header()  { printf '\n'; ui_box "$1"; }
+ui_section(){ printf '\n  %b\n' "${CYAN}${BOLD}$1${NC}"; }
+ui_status(){ printf '  状态: %b\n' "$1"; }
+ui_hint(){ printf '\n  %b\n' "${BLUE}提示：$1${NC}"; }
+pause(){ printf '\n'; read -rp "  按回车返回..." _dummy; }
+menu_prompt(){ printf '\n  请输入编号 [0-%s]: ' "$1"; read -r REPLY; }
 
 # ─── 基础工具 ──────────────────────────────────────────────
 
@@ -611,18 +615,23 @@ docker_system_status(){
 docker_menu(){
   while true; do
     ui_header "Docker 管理"
-    echo "  [1] 项目列表  [2] 创建项目  [3] 启动/更新  [4] 停止"
-    echo "  [5] 查看日志  [6] 编辑配置  [7] 更新镜像  [8] 容器状态"
-    echo "  [9] 重启     [10] 项目空间 [11] 清理日志 [12] 删除项目"
-    echo " [13] 系统状态 [14] 日志轮转 [15] 清空容器日志 [16] 定时维护"
-    echo "  [0] 返回"
-    read -rp "  请选择 [0-16]: " c
+    if docker_ready; then ui_status "${GREEN}运行中${NC}  | 容器 $(docker ps -q 2>/dev/null | wc -l) 个  | 磁盘 $(df -h / | awk 'NR==2{print $5}')"; else ui_status "${RED}未运行${NC}"; fi
+    ui_section "项目操作"
+    printf '  [ 1] 项目列表       [ 2] 创建项目       [ 3] 启动 / 更新\n'
+    printf '  [ 4] 停止项目       [ 5] 查看日志       [ 6] 编辑配置\n'
+    printf '  [ 7] 更新镜像       [ 8] 容器状态       [ 9] 重启项目\n'
+    printf '  [10] 项目空间       [11] 删除项目\n'
+    ui_section "日志与维护"
+    printf '  [12] 项目日志清理   [13] 清空全部日志   [14] 日志轮转\n'
+    printf '  [15] 定时空间清理   [16] Docker 系统状态\n'
+    ui_hint "回车确认适用于删除类操作；清空全部日志默认取消。"
+    menu_prompt 16; c="$REPLY"
     case "$c" in
       0) return ;; 1) list_projects; pause ;; 2) create_docker_project ;; 3) restart_project ;;
       4) stop_project ;; 5) project_logs ;; 6) edit_project ;; 7) update_project ;; 8) project_ps ;;
-      9) project_restart_only ;; 10) project_size ;; 11) clear_project_logs ;; 12) delete_project_config ;;
-      13) docker_system_status ;; 14) config_docker_log_rotation ;; 15) clear_all_logs ;; 16) setup_auto_cleanup ;;
-      *) echo "  输入 0-16" ;;
+      9) project_restart_only ;; 10) project_size ;; 11) delete_project_config ;; 12) clear_project_logs ;;
+      13) clear_all_logs ;; 14) config_docker_log_rotation ;; 15) setup_auto_cleanup ;; 16) docker_system_status ;;
+      *) warn "请输入 0-16"; pause ;;
     esac
   done
 }
@@ -886,21 +895,28 @@ delete_nginx_site(){
 nginx_menu(){
   while true; do
     ui_header "Nginx 管理"
-    echo "  [1] 创建反代  [2] 站点列表  [3] 测试配置  [4] 重载"
-    echo "  [5] 编辑站点  [6] 删除站点  [7] map 配置 [0] 返回"
-    read -rp "  请选择 [0-7]: " c
+    if cmd_exists nginx; then
+      if systemctl is-active --quiet nginx 2>/dev/null; then ui_status "${GREEN}运行中${NC}"; else ui_status "${YELLOW}已安装 / 未运行${NC}"; fi
+    else ui_status "${RED}未安装${NC}"; fi
+    ui_section "站点管理"
+    printf '  [1] 创建反代       [2] 站点列表       [3] 编辑站点\n'
+    printf '  [4] 删除站点       [5] 测试配置       [6] 重载 Nginx\n'
+    ui_section "公共配置"
+    printf '  [7] WebSocket map   [8] SNI 分流配置\n'
+    ui_hint "修改配置后建议先测试，再执行重载。"
+    menu_prompt 8; c="$REPLY"
     case "$c" in
-      1) create_nginx_proxy ;;
-      2) list_nginx_sites ;;
-      3) nginx -t 2>/dev/null && ok "配置正确" || { err "配置错误"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; }; pause ;;
-      4) nginx -t 2>/dev/null && systemctl reload nginx && ok "已重载" || err "nginx -t 失败，未 reload"; pause ;;
-      5) local sites=() f; for f in /etc/nginx/sites-enabled/*; do [ -L "$f" ] || [ -f "$f" ] || continue; sites+=("$(basename "$f")"); done
+      1) create_nginx_proxy ;; 2) list_nginx_sites ;;
+      3) local sites=() f; for f in /etc/nginx/sites-enabled/*; do [ -L "$f" ] || [ -f "$f" ] || continue; sites+=("$(basename "$f")"); done
          select_from_list "选择要编辑的站点" "${sites[@]}" || continue
          edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"; pause ;;
-      6) delete_nginx_site ;;
+      4) delete_nginx_site ;;
+      5) nginx -t 2>/dev/null && ok "配置正确" || { err "配置错误"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; }; pause ;;
+      6) nginx -t 2>/dev/null && systemctl reload nginx && ok "已重载" || err "nginx -t 失败，未 reload"; pause ;;
       7) ensure_connection_upgrade_map && ok "map 已就绪" || err "map 配置失败"; pause ;;
+      8) setup_sni_split ;;
       0) return ;;
-      *) echo "  输入 0-7" ;;
+      *) warn "请输入 0-8"; pause ;;
     esac
   done
 }
@@ -1005,10 +1021,20 @@ cert_actions_menu(){
 certbot_menu(){
   while true; do
     ui_header "HTTPS 证书"
-    echo "  [1] 申请证书(HTTP-01)  [2] 申请证书(DNS-01 CF)"
-    echo "  [3] 证书详情  [4] 删除证书  [5] 测试续期"
-    echo "  [6] 实际续期  [7] 自动续期  [0] 返回"
-    read -rp "  请选择 [0-7]: " c
+    local cert_count=0
+    for _cert in /etc/letsencrypt/live/*/; do [ -d "$_cert" ] && cert_count=$((cert_count+1)); done
+    if systemctl is-active --quiet certbot.timer 2>/dev/null; then
+      ui_status "${GREEN}自动续期已开启${NC}  |  证书 ${cert_count} 张"
+    else
+      ui_status "${YELLOW}自动续期未开启${NC}  |  证书 ${cert_count} 张"
+    fi
+    ui_section "证书申请与查看"
+    printf '  [1] HTTP-01 申请   [2] DNS-01 / Cloudflare\n'
+    printf '  [3] 证书详情       [4] 删除证书\n'
+    ui_section "续期管理"
+    printf '  [5] 测试续期       [6] 立即续期       [7] 自动续期\n'
+    ui_hint "删除证书前请确认没有 Nginx 站点正在引用它。"
+    menu_prompt 7; c="$REPLY"
     case "$c" in
       1) certbot_get "" "http" ;;
       2) certbot_get "" "dns" ;;
@@ -1025,7 +1051,7 @@ certbot_menu(){
          else warn "未开启"; ask_yn "开启？" "y" && { systemctl enable --now certbot.timer; ok "已开启"; }; fi
          pause ;;
       0) return ;;
-      *) echo "  输入 0-7" ;;
+      *) warn "请输入 0-7"; pause ;;
     esac
   done
 }
@@ -1420,14 +1446,21 @@ singbox_delete(){
 singbox_menu(){
   while true; do
     ui_header "sing-box 管理"
-    echo "  [1] 安装/配置  [2] 运行状态  [3] 查看日志  [4] 编辑配置"
-    echo "  [5] 客户端参数 [6] 重启服务  [7] 卸载服务  [0] 返回"
-    read -rp "  请选择 [0-7]: " c
+    if cmd_exists sing-box; then
+      if systemctl is-active --quiet sing-box 2>/dev/null; then ui_status "${GREEN}运行中${NC}  |  监听 ${SINGBOX_PORT}"; else ui_status "${YELLOW}已安装 / 未运行${NC}"; fi
+    else ui_status "${RED}未安装${NC}"; fi
+    ui_section "服务与配置"
+    printf '  [1] 安装 / 配置    [2] 运行状态       [3] 查看日志\n'
+    printf '  [4] 编辑配置       [5] 重启服务       [6] 客户端参数\n'
+    ui_section "卸载"
+    printf '  [7] 卸载 sing-box\n'
+    ui_hint "修改配置后会先校验 JSON，再决定是否重启。"
+    menu_prompt 7; c="$REPLY"
     case "$c" in
       1) setup_singbox ;; 2) singbox_status ;; 3) singbox_logs ;; 4) singbox_edit ;;
-      5) singbox_show_client ;; 6) singbox_restart ;; 7) singbox_delete ;;
+      5) singbox_restart ;; 6) singbox_show_client ;; 7) singbox_delete ;;
       0) return ;;
-      *) echo "  输入 0-7" ;;
+      *) warn "请输入 0-7"; pause ;;
     esac
   done
 }
@@ -1850,16 +1883,24 @@ main_menu(){
   while true; do
     get_os_name
     ui_header "VPS Toolkit $VERSION"
-    echo "  系统: $OS_NAME"
-    echo
-    echo "  [1] 一键安装  [2] 基础环境  [3] Docker  [4] Nginx"
-    echo "  [5] HTTPS证书 [6] sing-box  [7] SNI分流 [8] 一键删除"
-    echo "  [9] 健康检查  [0] 退出"
-    read -rp "  请选择 [0-9]: " c
+    printf '  系统: %s\n' "$OS_NAME"
+    ui_section "运行概览"
+    if docker_ready; then printf '  Docker       %b\n' "${GREEN}运行中${NC}"; else printf '  Docker       %b\n' "${YELLOW}未就绪${NC}"; fi
+    if cmd_exists nginx && systemctl is-active --quiet nginx 2>/dev/null; then printf '  Nginx        %b\n' "${GREEN}运行中${NC}"; else printf '  Nginx        %b\n' "${YELLOW}未就绪${NC}"; fi
+    if cmd_exists sing-box && systemctl is-active --quiet sing-box 2>/dev/null; then printf '  sing-box     %b\n' "${GREEN}运行中${NC}"; else printf '  sing-box     %b\n' "${YELLOW}未运行${NC}"; fi
+    if systemctl is-active --quiet certbot.timer 2>/dev/null; then printf '  证书续期     %b\n' "${GREEN}已开启${NC}"; else printf '  证书续期     %b\n' "${YELLOW}未开启${NC}"; fi
+    if [ -f /etc/docker/daemon.json ] && grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null; then printf '  Docker日志   %b\n' "${GREEN}已轮转${NC}"; else printf '  Docker日志   %b\n' "${YELLOW}未配置${NC}"; fi
+    ui_section "常用操作"
+    printf '  [1] 一键安装       [2] 基础环境       [3] Docker 管理\n'
+    printf '  [4] Nginx 管理      [5] HTTPS 证书     [6] sing-box\n'
+    printf '  [7] SNI 分流        [8] 一键删除       [9] 健康检查\n'
+    printf '  [0] 退出\n'
+    ui_hint "建议先运行健康检查，再执行删除或重配置。"
+    menu_prompt 9; c="$REPLY"
     case "$c" in
       1) install_all ;; 2) install_base_env ;; 3) docker_menu ;; 4) nginx_menu ;;
       5) certbot_menu ;; 6) singbox_menu ;; 7) setup_sni_split ;; 8) delete_all_data ;;
-      9) health_check ;; 0) echo; exit 0 ;; *) echo "  输入 0-9" ;;
+      9) health_check ;; 0) printf '\n'; exit 0 ;; *) warn "请输入 0-9"; pause ;;
     esac
   done
 }
