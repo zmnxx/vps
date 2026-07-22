@@ -999,7 +999,7 @@ install_singbox(){
 }
 
 generate_singbox_config(){
-  local uuid priv_key short_id sni sb_port use_sni="y" listen_ip="127.0.0.1" client_port="443"
+  local uuid priv_key short_id sni sb_port use_sni="y" listen_ip="127.0.0.1" client_port="443" force_sni="${1:-}"
   info "生成 Reality 密钥..."
   uuid=$(sing-box generate uuid)
   local keypair; keypair=$(sing-box generate reality-keypair)
@@ -1012,28 +1012,44 @@ generate_singbox_config(){
   [ -z "$sni" ] && sni="www.bing.com"
 
   echo
-  if ask_yn "使用 Nginx SNI 分流共用 443 端口？" "y"; then
+  if [ "$force_sni" = "force_sni" ]; then
+    # 一键安装模式下，不打扰用户，强制采用 Nginx SNI 分流模式，内部监听 8444
     use_sni="y"
     listen_ip="127.0.0.1"
     client_port="443"
-    info "已选择【分流模式】：sing-box 绑定于 127.0.0.1，公网流量通过 443 端口分流进入。"
+    sb_port="$SINGBOX_DEFAULT_PORT"
+    info "一键安装模式：默认采用【分流模式】，sing-box 绑定于 127.0.0.1:${sb_port}，对外共用 443 端口。"
   else
-    use_sni="n"
-    listen_ip="::"
-    info "已选择【独立直连】：sing-box 将直接绑定 IPv4/IPv6 公网，请直接连接其监听端口。"
+    # 仅在 sing-box 独立安装时让用户选择
+    echo "  请选择安装模式:"
+    echo "  [1] Nginx SNI 分流模式（将 443 端口流量分流转发给网站与 sing-box，最推荐且隐蔽）"
+    echo "  [2] 独立直连模式（不依赖 Nginx，直接使用公网 443 或自定义端口对外，极简快捷）"
+    local mode_choice
+    read -rp "  请选择 [1/2]（默认 1）: " mode_choice
+    [ -z "$mode_choice" ] && mode_choice="1"
+
+    if [ "$mode_choice" = "1" ]; then
+      use_sni="y"
+      listen_ip="127.0.0.1"
+      client_port="443"
+      echo
+      info "【分流模式】sing-box 监听内部端口（Nginx SNI 分流会转发到此端口）"
+      read -rp "  内部监听端口（默认 $SINGBOX_DEFAULT_PORT）: " sb_port
+      [ -z "$sb_port" ] && sb_port="$SINGBOX_DEFAULT_PORT"
+      valid_port "$sb_port" || sb_port="$SINGBOX_DEFAULT_PORT"
+    else
+      use_sni="n"
+      listen_ip="::"
+      echo
+      info "【独立直连模式】sing-box 外部监听端口（请确保防火墙放行该端口）"
+      read -rp "  独立对外监听端口（默认 443，如被占用可改 8443）: " sb_port
+      [ -z "$sb_port" ] && sb_port="443"
+      valid_port "$sb_port" || sb_port="443"
+      client_port="$sb_port"
+    fi
   fi
 
-  echo
-  if [ "$use_sni" = "y" ]; then
-    info "sing-box 内部监听端口（Nginx SNI 分流会转发到此端口）"
-  else
-    info "sing-box 独立公开监听端口（请确保防火墙已放行此端口）"
-  fi
-  read -rp "  端口（默认 $SINGBOX_DEFAULT_PORT）: " sb_port
-  [ -z "$sb_port" ] && sb_port="$SINGBOX_DEFAULT_PORT"
-  valid_port "$sb_port" || sb_port="$SINGBOX_DEFAULT_PORT"
   SINGBOX_PORT="$sb_port"
-  [ "$use_sni" = "n" ] && client_port="$sb_port"
   save_conf
 
   mkdir -p /etc/sing-box; chmod 700 /etc/sing-box
@@ -1126,9 +1142,10 @@ EOF
 }
 
 setup_singbox(){
+  local force_sni="${1:-}"
   ui_header "sing-box 安装（VLESS + Reality + Vision）"
   install_singbox || return 1
-  generate_singbox_config
+  generate_singbox_config "$force_sni"
   create_singbox_service
   if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then ok "配置正确"
   else err "配置错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; return 1; fi
@@ -1452,7 +1469,7 @@ install_all(){
 
   ui_header "[2/6] sing-box"
   if cmd_exists sing-box; then ok "已安装"; i_sb="已安装"
-  elif ask_yn "安装 sing-box？" "y"; then setup_singbox; i_sb="已安装"; fi
+  elif ask_yn "安装 sing-box？" "y"; then setup_singbox "force_sni"; i_sb="已安装"; fi
 
   ui_header "[3/6] SNI 分流"
   if cmd_exists sing-box; then
