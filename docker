@@ -53,6 +53,30 @@ ui_header()  { printf '\n'; ui_box "$1"; }
 ui_section(){ printf '\n  %b\n' "${CYAN}${BOLD}$1${NC}"; }
 ui_status(){ printf '  状态: %b\n' "$1"; }
 ui_hint(){ printf '\n  %b\n' "${BLUE}提示：$1${NC}"; }
+ui_cell(){
+  local no="$1" label="$2" chars bytes width pad
+  chars=${#label}
+  bytes=$(LC_ALL=C printf '%s' "$label" | wc -c)
+  width=$((chars + (bytes - chars) / 2))
+  pad=$((18 - width)); [ "$pad" -lt 2 ] && pad=2
+  printf '  [%2s] %s%*s' "$no" "$label" "$pad" ''
+}
+ui_item(){ ui_cell "$1" "$2"; }
+ui_item2(){ ui_cell "$1" "$2"; ui_cell "$3" "$4"; printf '\n'; }
+ui_text_pad(){
+  local label="$1" target="$2" chars bytes width pad
+  chars=${#label}
+  bytes=$(LC_ALL=C printf '%s' "$label" | wc -c)
+  width=$((chars + (bytes - chars) / 2))
+  pad=$((target - width)); [ "$pad" -lt 1 ] && pad=1
+  printf '%s%*s' "$label" "$pad" ''
+}
+ui_state2(){
+  printf '  '; ui_text_pad "$1" 12; printf ' %b' "$2"
+  if [ -n "$3" ]; then printf '    '; ui_text_pad "$3" 12; printf ' %b' "$4"; fi
+  printf '\n'
+}
+ui_return(){ printf '  [ 0] 返回\n'; }
 pause(){ printf '\n'; read -rp "  按回车返回..." _dummy; }
 menu_prompt(){ printf '\n  请输入编号 [0-%s]: ' "$1"; read -r REPLY; }
 
@@ -617,13 +641,16 @@ docker_menu(){
     ui_header "Docker 管理"
     if docker_ready; then ui_status "${GREEN}运行中${NC}  | 容器 $(docker ps -q 2>/dev/null | wc -l) 个  | 磁盘 $(df -h / | awk 'NR==2{print $5}')"; else ui_status "${RED}未运行${NC}"; fi
     ui_section "项目操作"
-    printf '  [ 1] 项目列表       [ 2] 创建项目       [ 3] 启动 / 更新\n'
-    printf '  [ 4] 停止项目       [ 5] 查看日志       [ 6] 编辑配置\n'
-    printf '  [ 7] 更新镜像       [ 8] 容器状态       [ 9] 重启项目\n'
-    printf '  [10] 项目空间       [11] 删除项目\n'
+    ui_item2 1  "项目列表"     2  "创建项目"
+    ui_item2 3  "启动 / 更新"   4  "停止项目"
+    ui_item2 5  "查看日志"     6  "编辑配置"
+    ui_item2 7  "更新镜像"     8  "容器状态"
+    ui_item2 9  "重启项目"    10  "项目空间"
+    ui_item2 11 "删除项目"    12  "项目日志清理"
     ui_section "日志与维护"
-    printf '  [12] 项目日志清理   [13] 清空全部日志   [14] 日志轮转\n'
-    printf '  [15] 定时空间清理   [16] Docker 系统状态\n'
+    ui_item2 13 "清空全部日志" 14 "日志轮转"
+    ui_item2 15 "定时空间清理" 16 "系统状态"
+    ui_return
     ui_hint "回车确认适用于删除类操作；清空全部日志默认取消。"
     menu_prompt 16; c="$REPLY"
     case "$c" in
@@ -899,10 +926,12 @@ nginx_menu(){
       if systemctl is-active --quiet nginx 2>/dev/null; then ui_status "${GREEN}运行中${NC}"; else ui_status "${YELLOW}已安装 / 未运行${NC}"; fi
     else ui_status "${RED}未安装${NC}"; fi
     ui_section "站点管理"
-    printf '  [1] 创建反代       [2] 站点列表       [3] 编辑站点\n'
-    printf '  [4] 删除站点       [5] 测试配置       [6] 重载 Nginx\n'
+    ui_item2 1 "创建反代" 2 "站点列表"
+    ui_item2 3 "编辑站点" 4 "删除站点"
+    ui_item2 5 "测试配置" 6 "重载 Nginx"
     ui_section "公共配置"
-    printf '  [7] WebSocket map   [8] SNI 分流配置\n'
+    ui_item2 7 "WebSocket map" 8 "SNI 分流配置"
+    ui_return
     ui_hint "修改配置后建议先测试，再执行重载。"
     menu_prompt 8; c="$REPLY"
     case "$c" in
@@ -1029,10 +1058,12 @@ certbot_menu(){
       ui_status "${YELLOW}自动续期未开启${NC}  |  证书 ${cert_count} 张"
     fi
     ui_section "证书申请与查看"
-    printf '  [1] HTTP-01 申请   [2] DNS-01 / Cloudflare\n'
-    printf '  [3] 证书详情       [4] 删除证书\n'
+    ui_item2 1 "HTTP-01 申请" 2 "DNS-01 / Cloudflare"
+    ui_item2 3 "证书详情" 4 "删除证书"
     ui_section "续期管理"
-    printf '  [5] 测试续期       [6] 立即续期       [7] 自动续期\n'
+    ui_item2 5 "测试续期" 6 "立即续期"
+    ui_item 7 "自动续期"; printf '\n'
+    ui_return
     ui_hint "删除证书前请确认没有 Nginx 站点正在引用它。"
     menu_prompt 7; c="$REPLY"
     case "$c" in
@@ -1450,10 +1481,12 @@ singbox_menu(){
       if systemctl is-active --quiet sing-box 2>/dev/null; then ui_status "${GREEN}运行中${NC}  |  监听 ${SINGBOX_PORT}"; else ui_status "${YELLOW}已安装 / 未运行${NC}"; fi
     else ui_status "${RED}未安装${NC}"; fi
     ui_section "服务与配置"
-    printf '  [1] 安装 / 配置    [2] 运行状态       [3] 查看日志\n'
-    printf '  [4] 编辑配置       [5] 重启服务       [6] 客户端参数\n'
+    ui_item2 1 "安装 / 配置" 2 "运行状态"
+    ui_item2 3 "查看日志" 4 "编辑配置"
+    ui_item2 5 "重启服务" 6 "客户端参数"
     ui_section "卸载"
-    printf '  [7] 卸载 sing-box\n'
+    ui_item 7 "卸载 sing-box"; printf '\n'
+    ui_return
     ui_hint "修改配置后会先校验 JSON，再决定是否重启。"
     menu_prompt 7; c="$REPLY"
     case "$c" in
@@ -1885,16 +1918,21 @@ main_menu(){
     ui_header "VPS Toolkit $VERSION"
     printf '  系统: %s\n' "$OS_NAME"
     ui_section "运行概览"
-    if docker_ready; then printf '  Docker       %b\n' "${GREEN}运行中${NC}"; else printf '  Docker       %b\n' "${YELLOW}未就绪${NC}"; fi
-    if cmd_exists nginx && systemctl is-active --quiet nginx 2>/dev/null; then printf '  Nginx        %b\n' "${GREEN}运行中${NC}"; else printf '  Nginx        %b\n' "${YELLOW}未就绪${NC}"; fi
-    if cmd_exists sing-box && systemctl is-active --quiet sing-box 2>/dev/null; then printf '  sing-box     %b\n' "${GREEN}运行中${NC}"; else printf '  sing-box     %b\n' "${YELLOW}未运行${NC}"; fi
-    if systemctl is-active --quiet certbot.timer 2>/dev/null; then printf '  证书续期     %b\n' "${GREEN}已开启${NC}"; else printf '  证书续期     %b\n' "${YELLOW}未开启${NC}"; fi
-    if [ -f /etc/docker/daemon.json ] && grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null; then printf '  Docker日志   %b\n' "${GREEN}已轮转${NC}"; else printf '  Docker日志   %b\n' "${YELLOW}未配置${NC}"; fi
+    if docker_ready; then d_state="${GREEN}运行中${NC}"; else d_state="${YELLOW}未就绪${NC}"; fi
+    if cmd_exists nginx && systemctl is-active --quiet nginx 2>/dev/null; then n_state="${GREEN}运行中${NC}"; else n_state="${YELLOW}未就绪${NC}"; fi
+    if cmd_exists sing-box && systemctl is-active --quiet sing-box 2>/dev/null; then s_state="${GREEN}运行中${NC}"; else s_state="${YELLOW}未运行${NC}"; fi
+    if systemctl is-active --quiet certbot.timer 2>/dev/null; then c_state="${GREEN}已开启${NC}"; else c_state="${YELLOW}未开启${NC}"; fi
+    if [ -f /etc/docker/daemon.json ] && grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null; then l_state="${GREEN}已轮转${NC}"; else l_state="${YELLOW}未配置${NC}"; fi
+    ui_state2 "Docker" "$d_state" "Nginx" "$n_state"
+    ui_state2 "sing-box" "$s_state" "证书续期" "$c_state"
+    ui_state2 "Docker日志" "$l_state" "" ""
     ui_section "常用操作"
-    printf '  [1] 一键安装       [2] 基础环境       [3] Docker 管理\n'
-    printf '  [4] Nginx 管理      [5] HTTPS 证书     [6] sing-box\n'
-    printf '  [7] SNI 分流        [8] 一键删除       [9] 健康检查\n'
-    printf '  [0] 退出\n'
+    ui_item2 1 "一键安装" 2 "基础环境"
+    ui_item2 3 "Docker 管理" 4 "Nginx 管理"
+    ui_item2 5 "HTTPS 证书" 6 "sing-box"
+    ui_item2 7 "SNI 分流" 8 "一键删除"
+    ui_item 9 "健康检查"; printf '\n'
+    ui_item 0 "退出"; printf '\n'
     ui_hint "建议先运行健康检查，再执行删除或重配置。"
     menu_prompt 9; c="$REPLY"
     case "$c" in
