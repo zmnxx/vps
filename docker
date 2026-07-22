@@ -850,7 +850,7 @@ create_nginx_proxy(){
       local https_port
       if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then
         # 已有 SNI 分流：从 stream 块读取 web upstream 端口
-        https_port=$(grep -A2 'upstream web' /etc/nginx/nginx.conf 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+        https_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' /etc/nginx/stream.conf 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
         if [ -z "$https_port" ] || ! valid_port "$https_port"; then
           # 读不到就用默认
           https_port="8443"
@@ -1573,7 +1573,7 @@ setup_sni_split(){
     return 1
   fi
 
-  local ng_conf="/etc/nginx/nginx.conf"
+  local ng_conf="/etc/nginx/nginx.conf" web_domains="" f domain raw_domains=""
 
   # 如果已有 stream 块，显示当前配置，问是否重建
   if grep -q 'stream.conf' "$ng_conf" 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
@@ -1582,14 +1582,19 @@ setup_sni_split(){
     echo "  当前 Web 域名:"
     local target_file="/etc/nginx/stream.conf"
     [ -f "$target_file" ] || target_file="$ng_conf"
-    grep -oP '(?<=\s)[a-z0-9.-]+\.[a-z]{2,}(?=\s+web;)' "$target_file" 2>/dev/null | sed 's/^/    /' || echo "    （无）"
+    local current_domains
+    current_domains=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/^[[:space:]]*([A-Za-z0-9.-]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
+    printf '    %s\n' "${current_domains:-（无）}"
     local cur_web_port cur_sb_port
-    cur_web_port=$(grep -A2 'upstream web' "$target_file" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
-    cur_sb_port=$(grep -A2 'upstream singbox' "$target_file" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
-    echo "  Nginx(Web) 内部端口: ${cur_web_port:-?}"
-    echo "  sing-box 内部端口  : ${cur_sb_port:-?}"
-    echo
-    if ! ask_yn "是否需要更新或重新配置？" "y"; then return 0; fi
+    cur_web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+    cur_sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+    ui_section "当前分流状态"
+    printf '  %-16s %s\n' "公网入口" "443 (Nginx stream)"
+    printf '  %-16s %s\n' "Web 内部端口" "${cur_web_port:-未识别}"
+    printf '  %-16s %s\n' "sing-box 端口" "${cur_sb_port:-未识别}"
+    printf '  %-16s %s\n' "Web 域名" "${current_domains:-未识别}"
+    ui_hint "回车保持当前配置；输入 y 才会重新生成分流配置。"
+    ask_yn "是否重新配置 SNI 分流？" "n" || return 0
   fi
 
   local nginx_backup="${ng_conf}.bak"
@@ -1599,7 +1604,7 @@ setup_sni_split(){
   sed -i '/^stream {/,/^}/d' "$ng_conf"
 
   # 自动读取已有反代站点的域名并去重
-  local web_domains="" f domain raw_domains=""
+  local f domain raw_domains=""
   for f in /etc/nginx/sites-enabled/*; do
     [ -L "$f" ] || [ -f "$f" ] || continue
     domain=$(grep -E '^[[:space:]]*server_name' "$f" 2>/dev/null | head -1 | sed 's/.*server_name\s*//;s/;.*//' | awk '{print $1}')
@@ -1624,7 +1629,7 @@ setup_sni_split(){
 
   # Web 内部端口（首次默认 8443，已有就用已有的）
   local https_port
-  https_port=$(grep -A2 'upstream web' "$nginx_backup" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+  https_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$nginx_backup" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
   [ -z "$https_port" ] || ! valid_port "$https_port" && https_port="8443"
   echo
   info "Web HTTPS 内部端口: ${https_port}（仅本机，不暴露公网）"
@@ -1897,12 +1902,31 @@ health_check(){
     else
       target_file="/etc/nginx/nginx.conf"
     fi
-    web_port=$(grep -A2 'upstream web' "$target_file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    sb_port=$(grep -A2 'upstream singbox' "$target_file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    echo "    443 → stream 分流"
-    echo "    ${web_port:-?} → Web 反代"
-    echo "    ${sb_port:-?} → sing-box"
-    ss -tlnp 2>/dev/null | grep -E '443|8443|8444' | sed 's/^/    /'
+    web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+    sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+    ui_section "分流路径"
+    printf '  %-16s %s\n' "公网入口" "443 / Nginx stream"
+    printf '  %-16s %s\n' "Web 上游" "127.0.0.1:${web_port:-?}"
+    printf '  %-16s %s\n' "sing-box 上游" "127.0.0.1:${sb_port:-?}"
+    ui_section "监听检查"
+    print_listener(){
+      local port="$1" label="$2" line addr proc
+      if ! valid_port "$port"; then
+        printf '  %-16s %s\n' "$label" "未识别端口"
+        return 0
+      fi
+      line=$(ss -H -ltnp "sport = :$port" 2>/dev/null | head -1)
+      if [ -n "$line" ]; then
+        addr=$(awk '{print $4}' <<< "$line")
+        proc=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<< "$line")
+        printf '  %-16s %-22s %s\n' "$label" "$addr" "${proc:-已监听}"
+      else
+        printf '  %-16s %-22s %s\n' "$label" "-$port" "${RED}未监听${NC}"
+      fi
+    }
+    print_listener 443 "公网 443"
+    print_listener "${web_port:-0}" "Web 内部"
+    print_listener "${sb_port:-0}" "sing-box"
   else warn "未配置"; fi
   echo
   echo "  ── Docker 日志轮转 ──"
