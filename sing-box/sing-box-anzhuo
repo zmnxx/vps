@@ -11,6 +11,7 @@
       "store_dns": true
     },
     "clash_api": {
+      "external_controller": "127.0.0.1:9090",
       "default_mode": "rule"
     }
   },
@@ -52,6 +53,16 @@
       }
     ],
     "rules": [
+      {
+        "clash_mode": "direct",
+        "action": "route",
+        "server": "dns-国内"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "server": "dns-fakeip"
+      },
       {
         "query_type": ["AAAA", "HTTPS", "SVCB"],
         "action": "reject",
@@ -150,14 +161,7 @@
       "mtu": 1500,
       "auto_route": true,
       "strict_route": true,
-      "stack": "system",
-      "platform": {
-        "http_proxy": {
-          "enabled": true,
-          "server": "127.0.0.1",
-          "server_port": 7890
-        }
-      }
+      "stack": "system"
     }
   ],
   "outbounds": [
@@ -171,7 +175,7 @@
     {
       "type": "urltest",
       "tag": "自动选择",
-      "outbounds": [],
+      "outbounds": ["COMPATIBLE"],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "5m",
       "tolerance": 50,
@@ -205,11 +209,14 @@
     {
       "type": "direct",
       "tag": "DIRECT"
+    },
+    {
+      "type": "direct",
+      "tag": "COMPATIBLE"
     }
   ],
   "route": {
     "auto_detect_interface": true,
-    "override_android_vpn": true,
     "default_domain_resolver": "dns-本地",
     "default_http_client": "http-直连下载",
     "find_process": false,
@@ -289,6 +296,16 @@
       }
     ],
     "rules": [
+      {
+        "clash_mode": "direct",
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "outbound": "手动选择"
+      },
       { "action": "sniff" },
       {
         "type": "logical",
