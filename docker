@@ -460,7 +460,7 @@ project_logs(){
   need_docker || return 1; select_compose_dir || return 1
   local name; name=$(basename "$SELECTED_DIR")
   ui_header "$name 日志"
-  echo "  [1] 查看最近 200 行  [2] 实时跟踪"
+  echo "  [1] 查看稳妥 200 行  [2] 实时跟踪"
   read -rp "  请选择 [1/2]: " c
   if [ "$c" = "2" ]; then warn "按 Ctrl+C 返回"; docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200 -f
   else docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200; pause; fi
@@ -796,7 +796,7 @@ create_nginx_proxy(){
         nginx -t 2>&1 | head -5 | sed 's/^/  /'
         # 恢复 HTTP 占位模板（不删除站点！）
         write_nginx_http_template "$conf" "$domain" "$port"
-        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+        nginx -t/dev/null && systemctl reload nginx 2>/dev/null || true
       fi
     fi
   fi
@@ -1026,8 +1026,10 @@ generate_singbox_config(){
     {
       "type": "vless",
       "tag": "vless-reality-in",
-      "listen": "::",
+      "listen": "127.0.0.1",
       "listen_port": ${sb_port},
+      "sniff": true,
+      "sniff_override_destination": true,
       "users": [
         { "name": "user1", "uuid": "${uuid}", "flow": "xtls-rprx-vision" }
       ],
@@ -1049,7 +1051,7 @@ generate_singbox_config(){
     { "type": "block", "tag": "block" }
   ],
   "route": {
-    "rules": [ { "action": "sniff" } ],
+    "rules": [],
     "final": "direct"
   }
 }
@@ -1070,7 +1072,7 @@ EOF
   ok "配置已生成"
   echo
   echo -e "  ${BOLD}── 客户端参数 ──${NC}"
-  echo "  地址:   $(curl -s4 ifconfig.me 2>/dev/null || echo '你的VPS_IP')"
+  echo "  地址:   \$(curl -s4 ifconfig.me 2>/dev/null || echo '你的VPS_IP')"
   echo "  端口:   443"
   echo "  UUID:   $uuid"
   echo "  Flow:   xtls-rprx-vision"
@@ -1088,7 +1090,7 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 [Service]
 Type=simple
-ExecStart=${sb_path} run -c ${SINGBOX_CONF}
+ExecStart=\${sb_path} run -c ${SINGBOX_CONF}
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
@@ -1120,8 +1122,8 @@ setup_singbox(){
 singbox_status(){
   ui_header "sing-box 状态"
   if ! cmd_exists sing-box; then warn "未安装"; pause; return; fi
-  echo "  版本: $(sing-box version 2>/dev/null | head -1)"
-  echo "  状态: $(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
+  echo "  版本: \$(sing-box version 2>/dev/null | head -1)"
+  echo "  状态: \$(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
   echo "  监听: ${SINGBOX_PORT} (对外 443 via Nginx SNI)"
   echo
   ss -tlnp | grep -E "443|${SINGBOX_PORT}" 2>/dev/null || echo "  未检测到端口"
@@ -1137,7 +1139,6 @@ singbox_logs(){
 }
 
 singbox_edit(){
-  [ ! -f "$SINGBOX_CONF" ] && { warn "配置不存在"; return 1; }
   edit_file "$SINGBOX_CONF"
   if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then
     ok "语法正确"; ask_yn "重启？" "y" && systemctl restart sing-box && ok "已重启"
@@ -1147,8 +1148,11 @@ singbox_edit(){
 
 singbox_show_client(){
   ui_header "sing-box 客户端参数"
-  [ -f "$SINGBOX_SECRETS" ] && cat "$SINGBOX_SECRETS" || warn "密钥文件不存在"
-  echo; echo "  客户端连 443（不是 ${SINGBOX_PORT}）"
+  if [ -f "$SINGBOX_SECRETS" ]; then
+    cat "$SINGBOX_SECRETS"
+  else
+    warn "未找到密钥记录"
+  fi
   pause
 }
 
@@ -1166,13 +1170,14 @@ singbox_delete(){
 singbox_menu(){
   while true; do
     ui_header "sing-box 管理"
-    echo "  [1] 安装/初始化  [2] 状态  [3] 日志  [4] 编辑配置"
-    echo "  [5] 客户端参数   [6] 重启  [7] 卸载 [0] 返回"
-    read -rp "  [0-7]: " c
+    echo "  [1] 安装/配置  [2] 运行状态  [3] 查看日志  [4] 编辑配置"
+    echo "  [5] 客户端参数 [6] 重启服务  [7] 卸载服务  [0] 返回"
+    read -rp "  请选择 [0-7]: " c
     case "$c" in
       1) setup_singbox ;; 2) singbox_status ;; 3) singbox_logs ;; 4) singbox_edit ;;
       5) singbox_show_client ;; 6) singbox_restart ;; 7) singbox_delete ;;
-      0) return ;; *) echo "  输入 0-7" ;;
+      0) return ;;
+      *) echo "  输入 0-7" ;;
     esac
   done
 }
@@ -1250,7 +1255,7 @@ setup_sni_split(){
     if ! ask_yn "重新配置？" "n"; then return 0; fi
   fi
 
-  cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
+  cp "$ng_conf" "${ng_conf}.bak.\$(date +%s)"
 
   # 删除旧 stream 块
   sed -i '/^stream {/,/^}/d' "$ng_conf"
@@ -1265,37 +1270,44 @@ setup_sni_split(){
 
   # 让用户补充域名（已有的 + 新输入的）
   echo
-  if [ -n "$(echo $web_domains | tr -d ' ')" ]; then
+  if [ -n "\$(echo $web_domains | tr -d ' ')" ]; then
     info "已检测到反代域名: ${web_domains}"
     read -rp "  补充其他域名（空格分隔，回车跳过）: " extra_domains
     web_domains="${web_domains} ${extra_domains}"
   else
     read -rp "  输入 Web 域名（空格分隔，如 a.xxx.com b.xxx.com）: " extra_domains
-    web_domains="$extra_domains"
+    web_domains="\$extra_domains"
   fi
 
   # Web 内部端口（首次默认 8443，已有就用已有的）
   local https_port
-  https_port=$(grep -A2 'upstream web' "${ng_conf}.bak.$(date +%s)" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+  https_port=$(grep -A2 'upstream web' "${ng_conf}.bak.\$(date +%s)" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
   [ -z "$https_port" ] || ! valid_port "$https_port" && https_port="8443"
   echo
-  info "Web HTTPS 内部端口: ${https_port}（仅本机，不暴露公网）"
+  info "Web HTTPS 内部端口: \${https_port}（仅本机，不暴露公网）"
   info "sing-box 端口: ${SINGBOX_PORT}"
   ask_yn "修改 Web 内部端口？" "n" && {
-    read -rp "  端口: " https_port; valid_port "$https_port" || https_port="8443"
+    read -rp "  端口: " https_port; valid_port "\$https_port" || https_port="8443"
   }
 
-  # 写入 stream 块
-  cat >> "$ng_conf" <<SNIEOF
+  # 写入 stream 块到外部独立的配置文件，避免污染 nginx.conf
+  # 并在 nginx.conf 中加载（确保在 http{} 外面）
+  # 1. 检查 nginx.conf 中是否已经包含了 stream 包含项
+  if ! grep -q 'include /etc/nginx/conf.d/\*.conf;' "$ng_conf" && ! grep -q 'include /etc/nginx/conf.d/stream.conf;' "$ng_conf"; then
+     # 在最外层追加包含 stream.conf 的指令
+     echo "include /etc/nginx/conf.d/stream.conf;" >> "$ng_conf"
+  fi
 
+  mkdir -p /etc/nginx/conf.d
+  cat > /etc/nginx/conf.d/stream.conf <<SNIEOF
 stream {
     map \$ssl_preread_server_name \$upstream {
 SNIEOF
   for domain in $web_domains; do
     [ -z "$domain" ] && continue
-    echo "        $domain    web;" >> "$ng_conf"
+    echo "        $domain    web;" >> /etc/nginx/conf.d/stream.conf
   done
-  cat >> "$ng_conf" <<SNIEOF
+  cat >> /etc/nginx/conf.d/stream.conf <<SNIEOF
         default         singbox;
     }
     upstream web {
@@ -1314,11 +1326,11 @@ SNIEOF
 SNIEOF
 
   if nginx -t 2>/dev/null; then
-    ok "SNI 分流配置已写入"
-    info "对外 443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
+    ok "SNI 分流配置已写入到 /etc/nginx/conf.d/stream.conf"
+    info "对外 443 → \${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
     echo
-    info "Web 域名: $(echo $web_domains | tr '\n' ' ')"
-    info "创建反代时 HTTPS 会自动监听 ${https_port}"
+    info "Web 域名: \$(echo \$web_domains | tr '\n' ' ')"
+    info "创建反代时 HTTPS 会自动监听 \${https_port}"
     if systemctl is-active --quiet sing-box 2>/dev/null; then
       warn "重启顺序: Nginx 先 → sing-box 后"
       ask_yn "执行重启？" "y" || return 0
@@ -1334,6 +1346,7 @@ SNIEOF
     nginx -t 2>&1 | head -5 | sed 's/^/  /'
     local latest_bak; latest_bak=$(ls -t "${ng_conf}.bak."* 2>/dev/null | head -1)
     [ -n "$latest_bak" ] && cp "$latest_bak" "$ng_conf"
+    rm -f /etc/nginx/conf.d/stream.conf
   fi
   pause
 }
@@ -1356,7 +1369,7 @@ install_all(){
 
   ui_header "[3/6] SNI 分流"
   if cmd_exists sing-box; then
-    if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then ok "已配置"
+    if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/conf.d/stream.conf ]; then ok "已配置"
     elif ask_yn "配置 SNI 分流？" "y"; then setup_sni_split; fi
   else warn "sing-box 未安装，跳过"; fi
 
@@ -1382,13 +1395,13 @@ install_all(){
   fi
 
   ui_header "安装摘要"
-  echo "  sing-box:   ${i_sb}"
-  echo "  SNI 分流:   $(grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null && echo '已配置' || echo '未配置')"
-  echo "  Docker:     ${i_dp:-未创建}"
-  echo "  反代端口:   ${i_port:-─}"
-  echo "  Nginx 站点: ${i_site:-未创建}"
-  echo "  域名:       ${i_dom:-─}"
-  echo "  证书:       ${i_cert:-未申请}"
+  echo "  sing-box:   \${i_sb}"
+  echo "  SNI 分流:   \$( { grep -q '^stream' /etc/nginx/nginx.conf || [ -f /etc/nginx/conf.d/stream.conf ]; } 2>/dev/null && echo '已配置' || echo '未配置')"
+  echo "  Docker:     \${i_dp:-未创建}"
+  echo "  反代端口:   \${i_port:-─}"
+  echo "  Nginx 站点: \${i_site:-未创建}"
+  echo "  域名:       \${i_dom:-─}"
+  echo "  证书:       \${i_cert:-未申请}"
   ok "一键安装完成"
   pause
 }
@@ -1410,12 +1423,11 @@ delete_all_data(){
         [ -z "$port" ] && port="未识别"; items+=("$name | $port | $(dirname "$item")")
       done
       if select_from_list "选择要删除的项目" "${items[@]}"; then
-        dir="$(echo "$SELECTED_ITEM" | awk -F' \\| ' '{print $3}'); name=$(basename "$dir")"
-        dir="$(echo "$SELECTED_ITEM" | awk -F' \\| ' '{print $3}')"
+        dir=$(echo "$SELECTED_ITEM" | awk -F' \\| ' '{print $3}')
         name=$(basename "$dir")
         if ask_yn "同时删除容器和卷？" "y"; then docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
         else docker compose -f "$dir/docker-compose.yml" down 2>/dev/null || true; fi
-        rm -rf -- "$dir" && ok "$name 已删除"; deleted=1
+        rm -rf -- "$dir" && ok "$name 已删除" && deleted=1
       fi
     fi
   fi
@@ -1457,9 +1469,11 @@ delete_all_data(){
   fi
 
   if ask_yn "清除 SNI 分流配置？" "n"; then
-    if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then
+    if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/conf.d/stream.conf ]; then
       cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.$(date +%s)
       sed -i '/^stream {/,/^}/d' /etc/nginx/nginx.conf
+      sed -i '/include \/etc\/nginx\/conf.d\/stream.conf;/d' /etc/nginx/nginx.conf
+      rm -f /etc/nginx/conf.d/stream.conf
       nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null && ok "已清除" && deleted=1
     else warn "无 SNI 配置"; fi
   fi
@@ -1504,11 +1518,16 @@ health_check(){
   else echo "  未安装"; fi
   echo
   echo "  ── SNI 分流 ──"
-  if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null; then
+  if grep -q '^stream' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/conf.d/stream.conf ]; then
     ok "已配置"
-    local web_port sb_port
-    web_port=$(grep -A2 'upstream web' /etc/nginx/nginx.conf 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    sb_port=$(grep -A2 'upstream singbox' /etc/nginx/nginx.conf 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    local web_port sb_port target_file
+    if [ -f /etc/nginx/conf.d/stream.conf ]; then
+      target_file="/etc/nginx/conf.d/stream.conf"
+    else
+      target_file="/etc/nginx/nginx.conf"
+    fi
+    web_port=$(grep -A2 'upstream web' "$target_file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    sb_port=$(grep -A2 'upstream singbox' "$target_file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
     echo "    443 → stream 分流"
     echo "    ${web_port:-?} → Web 反代"
     echo "    ${sb_port:-?} → sing-box"
@@ -1576,7 +1595,7 @@ vps-toolkit.sh $VERSION — VPS 一键运维工具箱
   sing-box:     /etc/sing-box/config.json
 HELP
       exit 0 ;;
-    *) err "未知命令: $cmd (使用 --help 查看)"; exit 1 ;;
+    *) err "未知命令: \$cmd (使用 --help 查看)"; exit 1 ;;
   esac
 }
 
