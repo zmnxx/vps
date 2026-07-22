@@ -999,7 +999,7 @@ install_singbox(){
 }
 
 generate_singbox_config(){
-  local uuid priv_key short_id sni sb_port
+  local uuid priv_key short_id sni sb_port use_sni="y" listen_ip="127.0.0.1" client_port="443"
   info "生成 Reality 密钥..."
   uuid=$(sing-box generate uuid)
   local keypair; keypair=$(sing-box generate reality-keypair)
@@ -1012,11 +1012,28 @@ generate_singbox_config(){
   [ -z "$sni" ] && sni="www.bing.com"
 
   echo
-  info "sing-box 内部监听端口（Nginx SNI 分流会转发到此端口）"
+  if ask_yn "使用 Nginx SNI 分流共用 443 端口？" "y"; then
+    use_sni="y"
+    listen_ip="127.0.0.1"
+    client_port="443"
+    info "已选择【分流模式】：sing-box 绑定于 127.0.0.1，公网流量通过 443 端口分流进入。"
+  else
+    use_sni="n"
+    listen_ip="::"
+    info "已选择【独立直连】：sing-box 将直接绑定 IPv4/IPv6 公网，请直接连接其监听端口。"
+  fi
+
+  echo
+  if [ "$use_sni" = "y" ]; then
+    info "sing-box 内部监听端口（Nginx SNI 分流会转发到此端口）"
+  else
+    info "sing-box 独立公开监听端口（请确保防火墙已放行此端口）"
+  fi
   read -rp "  端口（默认 $SINGBOX_DEFAULT_PORT）: " sb_port
   [ -z "$sb_port" ] && sb_port="$SINGBOX_DEFAULT_PORT"
   valid_port "$sb_port" || sb_port="$SINGBOX_DEFAULT_PORT"
   SINGBOX_PORT="$sb_port"
+  [ "$use_sni" = "n" ] && client_port="$sb_port"
   save_conf
 
   mkdir -p /etc/sing-box; chmod 700 /etc/sing-box
@@ -1027,7 +1044,7 @@ generate_singbox_config(){
     {
       "type": "vless",
       "tag": "vless-reality-in",
-      "listen": "127.0.0.1",
+      "listen": "${listen_ip}",
       "listen_port": ${sb_port},
       "users": [
         { "name": "user1", "uuid": "${uuid}", "flow": "xtls-rprx-vision" }
@@ -1069,15 +1086,16 @@ PublicKey: ${pub_key}
 ShortID: ${short_id}
 SNI: ${sni}
 ListenPort: ${sb_port}
-ClientPort: 443
+ClientPort: ${client_port}
+UseSNISplit: ${use_sni}
 EOF
   chmod 600 "$SINGBOX_SECRETS"
 
   ok "配置已生成"
   echo
   echo -e "  ${BOLD}── 客户端参数 ──${NC}"
-  echo "  地址:   \$(curl -s4 ifconfig.me 2>/dev/null || echo '你的VPS_IP')"
-  echo "  端口:   443"
+  echo "  地址:   $(curl -s4 ifconfig.me 2>/dev/null || echo '你的VPS_IP')"
+  echo "  端口:   ${client_port}"
   echo "  UUID:   $uuid"
   echo "  Flow:   xtls-rprx-vision"
   echo "  SNI:    $sni"
@@ -1109,16 +1127,38 @@ EOF
 
 setup_singbox(){
   ui_header "sing-box 安装（VLESS + Reality + Vision）"
-  info "sing-box 监听内部端口（由 Nginx SNI 分流转发）"
   install_singbox || return 1
   generate_singbox_config
   create_singbox_service
   if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then ok "配置正确"
   else err "配置错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; return 1; fi
-  if cmd_exists ufw; then ufw allow ${SINGBOX_PORT}/tcp 2>/dev/null || true; fi
-  if ! systemctl is-active --quiet nginx; then warn "Nginx 未运行，先启动"; systemctl start nginx 2>/dev/null || true; fi
+  
+  # 读取配置文件确定是否使用了 Nginx 分流
+  local use_sni="y"
+  if [ -f "$SINGBOX_SECRETS" ]; then
+    use_sni=$(grep 'UseSNISplit:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
+  fi
+
+  if [ "$use_sni" = "n" ]; then
+    # 直连模式：放行监听端口
+    if cmd_exists ufw; then ufw allow ${SINGBOX_PORT}/tcp 2>/dev/null || true; fi
+    # 如果有 iptables 自动放行外部连接
+    if cmd_exists iptables; then iptables -I INPUT -p tcp --dport ${SINGBOX_PORT} -j ACCEPT 2>/dev/null || true; fi
+  else
+    # 分流模式：确保 Nginx 正在运行
+    if ! systemctl is-active --quiet nginx; then 
+      warn "检测到选择了 Nginx 分流模式，但 Nginx 未运行，尝试启动..."
+      systemctl start nginx 2>/dev/null || true
+    fi
+  fi
+
   systemctl enable --now sing-box
-  ok "sing-box 已启动 (监听 ${SINGBOX_PORT})"
+  ok "sing-box 已启动"
+  if [ "$use_sni" = "y" ]; then
+    info "模式: Nginx SNI 共用 443 分流模式 (内部监听 ${SINGBOX_PORT})"
+  else
+    info "模式: 独立直连模式 (公开监听并对外放行端口 ${SINGBOX_PORT})"
+  fi
   echo; info "完整参数: cat $SINGBOX_SECRETS"
   pause
 }
@@ -1128,9 +1168,19 @@ singbox_status(){
   if ! cmd_exists sing-box; then warn "未安装"; pause; return; fi
   echo "  版本: \$(sing-box version 2>/dev/null | head -1)"
   echo "  状态: \$(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
-  echo "  监听: ${SINGBOX_PORT} (对外 443 via Nginx SNI)"
+  
+  local use_sni="y"
+  if [ -f "$SINGBOX_SECRETS" ]; then
+    use_sni=$(grep 'UseSNISplit:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
+  fi
+
+  if [ "$use_sni" = "y" ]; then
+    echo "  模式: Nginx SNI 共用 443 分流模式 (内部监听 ${SINGBOX_PORT})"
+  else
+    echo "  模式: 独立直连模式 (直接公开暴露 ${SINGBOX_PORT})"
+  fi
   echo
-  ss -tlnp | grep -E "443|${SINGBOX_PORT}" 2>/dev/null || echo "  未检测到端口"
+  ss -tlnp | grep -E "443|${SINGBOX_PORT}" 2>/dev/null || echo "  未检测到本地端口运行"
   pause
 }
 
