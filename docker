@@ -1265,21 +1265,23 @@ setup_sni_split(){
   local ng_conf="/etc/nginx/nginx.conf"
 
   # 如果已有 stream 块，显示当前配置，问是否重建
-  if grep -q '^stream' "$ng_conf" 2>/dev/null; then
+  if grep -q 'stream.conf' "$ng_conf" 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
     ok "已有 SNI 分流配置"
     echo
     echo "  当前 Web 域名:"
-    grep -oP '(?<=\s)[a-z0-9.]+\.[a-z]{2,}(?=\s+web;)' "$ng_conf" 2>/dev/null | sed 's/^/    /' || echo "    （无）"
+    local target_file="/etc/nginx/stream.conf"
+    [ -f "$target_file" ] || target_file="$ng_conf"
+    grep -oP '(?<=\s)[a-z0-9.-]+\.[a-z]{2,}(?=\s+web;)' "$target_file" 2>/dev/null | sed 's/^/    /' || echo "    （无）"
     local cur_web_port cur_sb_port
-    cur_web_port=$(grep -A2 'upstream web' "$ng_conf" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
-    cur_sb_port=$(grep -A2 'upstream singbox' "$ng_conf" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+    cur_web_port=$(grep -A2 'upstream web' "$target_file" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+    cur_sb_port=$(grep -A2 'upstream singbox' "$target_file" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
     echo "  Web 内部端口: ${cur_web_port:-?}"
     echo "  sing-box 端口: ${cur_sb_port:-?}"
     echo
-    if ! ask_yn "重新配置？" "n"; then return 0; fi
+    if ! ask_yn "重新配置？" "y"; then return 0; fi
   fi
 
-  cp "$ng_conf" "${ng_conf}.bak.\$(date +%s)"
+  cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
 
   # 删除旧 stream 块
   sed -i '/^stream {/,/^}/d' "$ng_conf"
@@ -1294,13 +1296,13 @@ setup_sni_split(){
 
   # 让用户补充域名（已有的 + 新输入的）
   echo
-  if [ -n "\$(echo $web_domains | tr -d ' ')" ]; then
+  if [ -n "$(echo $web_domains | tr -d ' ')" ]; then
     info "已检测到反代域名: ${web_domains}"
     read -rp "  补充其他域名（空格分隔，回车跳过）: " extra_domains
     web_domains="${web_domains} ${extra_domains}"
   else
     read -rp "  输入 Web 域名（空格分隔，如 a.xxx.com b.xxx.com）: " extra_domains
-    web_domains="\$extra_domains"
+    web_domains="$extra_domains"
   fi
 
   # Web 内部端口（首次默认 8443，已有就用已有的）
@@ -1424,13 +1426,13 @@ install_all(){
   fi
 
   ui_header "安装摘要"
-  echo "  sing-box:   \${i_sb}"
-  echo "  SNI 分流:   \$( { grep -q '^stream' /etc/nginx/nginx.conf || [ -f /etc/nginx/conf.d/stream.conf ]; } 2>/dev/null && echo '已配置' || echo '未配置')"
-  echo "  Docker:     \${i_dp:-未创建}"
-  echo "  反代端口:   \${i_port:-─}"
-  echo "  Nginx 站点: \${i_site:-未创建}"
-  echo "  域名:       \${i_dom:-─}"
-  echo "  证书:       \${i_cert:-未申请}"
+  echo "  sing-box:   ${i_sb}"
+  echo "  SNI 分流:   $( { grep -q 'stream.conf' /etc/nginx/nginx.conf || [ -f /etc/nginx/stream.conf ]; } 2>/dev/null && echo '已配置' || echo '未配置')"
+  echo "  Docker:     ${i_dp:-未创建}"
+  echo "  反代端口:   ${i_port:-─}"
+  echo "  Nginx 站点: ${i_site:-未创建}"
+  echo "  域名:       ${i_dom:-─}"
+  echo "  证书:       ${i_cert:-未申请}"
   ok "一键安装完成"
   pause
 }
