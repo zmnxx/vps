@@ -668,8 +668,9 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 server {
-    listen ${listen_port} ssl http2;
-    listen [::]:${listen_port} ssl http2;
+    listen ${listen_port} ssl;
+    listen [::]:${listen_port} ssl;
+    http2 on;
     server_name ${domain};
     ssl_certificate     ${cert_path}/fullchain.pem;
     ssl_certificate_key ${cert_path}/privkey.pem;
@@ -1039,7 +1040,7 @@ generate_singbox_config(){
           "handshake": { "server": "${sni}", "server_port": 443 },
           "private_key": "${priv_key}",
           "short_id": ["${short_id}"],
-          "max_time_difference": "1m"
+          "max_time_difference": "2m"
         }
       }
     }
@@ -1275,10 +1276,10 @@ setup_sni_split(){
     local cur_web_port cur_sb_port
     cur_web_port=$(grep -A2 'upstream web' "$target_file" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
     cur_sb_port=$(grep -A2 'upstream singbox' "$target_file" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
-    echo "  Web 内部端口: ${cur_web_port:-?}"
-    echo "  sing-box 端口: ${cur_sb_port:-?}"
+    echo "  Nginx(Web) 内部端口: ${cur_web_port:-?}"
+    echo "  sing-box 内部端口  : ${cur_sb_port:-?}"
     echo
-    if ! ask_yn "重新配置？" "y"; then return 0; fi
+    if ! ask_yn "是否需要更新或重新配置？" "y"; then return 0; fi
   fi
 
   cp "$ng_conf" "${ng_conf}.bak.$(date +%s)"
@@ -1286,23 +1287,28 @@ setup_sni_split(){
   # 删除旧 stream 块
   sed -i '/^stream {/,/^}/d' "$ng_conf"
 
-  # 自动读取已有反代站点的域名
-  local web_domains="" f domain
+  # 自动读取已有反代站点的域名并去重
+  local web_domains="" f domain raw_domains=""
   for f in /etc/nginx/sites-enabled/*; do
     [ -L "$f" ] || [ -f "$f" ] || continue
     domain=$(grep -E '^[[:space:]]*server_name' "$f" 2>/dev/null | head -1 | sed 's/.*server_name\s*//;s/;.*//' | awk '{print $1}')
-    [ -n "$domain" ] && [ "$domain" != "_" ] && web_domains="$web_domains $domain"
+    [ -n "$domain" ] && [ "$domain" != "_" ] && raw_domains="$raw_domains $domain"
   done
+  # 去重去空
+  web_domains=$(echo "$raw_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
 
-  # 让用户补充域名（已有的 + 新输入的）
+  # 让用户补充域名（已有的 + 新输入的，防重）
   echo
-  if [ -n "$(echo $web_domains | tr -d ' ')" ]; then
-    info "已检测到反代域名: ${web_domains}"
-    read -rp "  补充其他域名（空格分隔，回车跳过）: " extra_domains
-    web_domains="${web_domains} ${extra_domains}"
+  if [ -n "$web_domains" ]; then
+    info "系统已为您自动载入以下反代域名: ${web_domains}"
+    info "（自动扫描出的域名会自动添加到分流，无需重复手动输入）"
+    read -rp "  补充其他域名（仅用于补充未检测到的，无则回车跳过）: " extra_domains
+    if [ -n "$extra_domains" ]; then
+      web_domains=$(echo "$web_domains $extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+    fi
   else
     read -rp "  输入 Web 域名（空格分隔，如 a.xxx.com b.xxx.com）: " extra_domains
-    web_domains="$extra_domains"
+    web_domains=$(echo "$extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
   fi
 
   # Web 内部端口（首次默认 8443，已有就用已有的）
