@@ -1028,8 +1028,6 @@ generate_singbox_config(){
       "tag": "vless-reality-in",
       "listen": "127.0.0.1",
       "listen_port": ${sb_port},
-      "sniff": true,
-      "sniff_override_destination": true,
       "users": [
         { "name": "user1", "uuid": "${uuid}", "flow": "xtls-rprx-vision" }
       ],
@@ -1051,7 +1049,12 @@ generate_singbox_config(){
     { "type": "block", "tag": "block" }
   ],
   "route": {
-    "rules": [],
+    "rules": [
+      {
+        "inbound": "vless-reality-in",
+        "action": "sniff"
+      }
+    ],
     "final": "direct"
   }
 }
