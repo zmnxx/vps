@@ -1261,11 +1261,17 @@ if os.path.exists(SECRETS_PATH):
 # 获取 VPS 公网 IP
 vps_ip = "你的VPS_IP"
 try:
-    req = urllib.request.Request("https://ifconfig.me", headers={'User-Agent': 'Mozilla/5.0'})
+    # 强制请求纯文本接口以防返回 HTML 网页
+    req = urllib.request.Request("https://api.ipify.org", headers={'User-Agent': 'curl/7.81.0'})
     with urllib.request.urlopen(req, timeout=3) as r:
         vps_ip = r.read().decode('utf-8').strip()
 except:
-    pass
+    try:
+        req = urllib.request.Request("https://ifconfig.me", headers={'User-Agent': 'curl/7.81.0'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            vps_ip = r.read().decode('utf-8').strip()
+    except:
+        pass
 
 inbounds = config.get("inbounds", [])
 if not inbounds:
