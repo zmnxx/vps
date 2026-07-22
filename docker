@@ -670,7 +670,6 @@ server {
 server {
     listen ${listen_port} ssl;
     listen [::]:${listen_port} ssl;
-    http2 on;
     server_name ${domain};
     ssl_certificate     ${cert_path}/fullchain.pem;
     ssl_certificate_key ${cert_path}/privkey.pem;
@@ -797,7 +796,7 @@ create_nginx_proxy(){
         nginx -t 2>&1 | head -5 | sed 's/^/  /'
         # 恢复 HTTP 占位模板（不删除站点！）
         write_nginx_http_template "$conf" "$domain" "$port"
-        nginx -t/dev/null && systemctl reload nginx 2>/dev/null || true
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
       fi
     fi
   fi
