@@ -40,13 +40,6 @@
         "domain_resolver": "dns-本地"
       },
       {
-        "type": "https",
-        "tag": "dns-境外",
-        "server": "1.1.1.1",
-        "domain_resolver": "dns-本地",
-        "detour": "手动选择"
-      },
-      {
         "type": "fakeip",
         "tag": "dns-fakeip",
         "inet4_range": "198.18.0.0/15"
@@ -160,7 +153,6 @@
       "address": ["172.19.0.1/30"],
       "mtu": 1500,
       "auto_route": true,
-      "strict_route": true,
       "stack": "system"
     }
   ],
@@ -441,6 +433,11 @@
         "rule_set": "规则-国内IP",
         "action": "route",
         "outbound": "国内"
+      },
+      {
+        "clash_mode": "rule",
+        "action": "route",
+        "outbound": "兜底"
       }
     ]
   }
