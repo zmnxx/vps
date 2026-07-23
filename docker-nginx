@@ -316,8 +316,8 @@ setup_auto_cleanup(){
   echo "  [5] 删除任务"
   echo "  [6] 立即执行"
   echo "  [0] 返回"
-  read -rp "  请选择 [1]: " choice
-  [ -z "$choice" ] && choice="1"
+  read -rp "  请选择 [2]: " choice
+  [ -z "$choice" ] && choice="2"
   case "$choice" in
     4) [ -z "$job" ] && warn "未设置" || ok "$job"; pause; return 0 ;;
     5) remove_cleanup_cron; rm -f /usr/local/bin/docker-cleanup.sh /etc/logrotate.d/docker-cleanup /var/log/docker-cleanup.log; ok "已删除"; pause; return 0 ;;
@@ -600,7 +600,7 @@ delete_project_config(){
   if ask_yn "同时删除容器和数据卷？" "y"; then
     docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
   else docker compose -f "$dir/docker-compose.yml" down 2>/dev/null || true; fi
-  rm -rf -- "$dir" && ok "$name 已删除"
+  if rm -rf -- "$dir"; then ok "$name 已删除"; else err "$name 目录删除失败，请手动检查"; fi
   # 询问是否清理该项目的镜像，避免残留占用磁盘
   if ask_yn "清理本项目相关镜像？" "y"; then
     docker image prune -f >/dev/null 2>&1 && ok "已清理未使用镜像" || warn "无未使用镜像"
@@ -652,7 +652,6 @@ docker_menu(){
     ui_item2 13 "清空全部日志" 14 "日志轮转"
     ui_item2 15 "定时空间清理" 16 "系统状态"
     ui_return
-    ui_hint "回车确认适用于删除类操作；清空全部日志默认取消。"
     menu_prompt 16; c="$REPLY"
     case "$c" in
       0) return ;; 1) list_projects; pause ;; 2) create_docker_project ;; 3) restart_project ;;
@@ -850,9 +849,33 @@ delete_nginx_site(){
   select_from_list "选择要删除的站点" "${sites[@]}" || return 1
   local name="$SELECTED_ITEM"
   ask_yn "删除站点 $name？" "y" || return 1
+  # 备份恢复点（单份，操作成功即删）
+  local ng_bak="/etc/nginx/nginx.conf.bak"
+  cp -f /etc/nginx/nginx.conf "$ng_bak" 2>/dev/null || true
   rm -f "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
-  ok "已删除 $name"
+  if nginx -t 2>/dev/null; then
+    rm -f "$ng_bak"
+    systemctl reload nginx 2>/dev/null && ok "已删除 $name，Nginx 已重载" || ok "已删除 $name（Nginx 重载失败，请手动重载）"
+  else
+    err "删除后 nginx -t 失败，请检查其余站点配置"
+    nginx -t 2>&1 | head -5 | sed 's/^/  /'
+    rm -f "$ng_bak"
+  fi
+  pause
+}
+
+# 预览反代 HTTPS 模板内容
+nginx_show_template(){
+  ui_header "反代 HTTPS 模板预览"
+  local tmp; tmp=$(mktemp)
+  # 用临时 conf 生成模板预览（domain/port/上游 用占位值）
+  ACME_SSL_DIR="/etc/nginx/ssl"
+  ensure_connection_upgrade_map >/dev/null 2>&1
+  write_nginx_https_template "$tmp" "example.com" "5244"
+  # 替换占位使其更易读
+  sed -i 's#example.com#<你的域名>#g; s#/etc/nginx/ssl/<你的域名>#/etc/nginx/ssl/<域名>#g; s#5244#<上游端口>#g; s#127.0.0.1:<上游端口>#127.0.0.1:<上游端口>#g' "$tmp"
+  cat "$tmp"
+  rm -f "$tmp"
   pause
 }
 
@@ -866,21 +889,23 @@ nginx_menu(){
     ui_item2 1 "创建反代" 2 "站点列表"
     ui_item2 3 "编辑站点" 4 "删除站点"
     ui_item2 5 "测试配置" 6 "重载 Nginx"
-    ui_section "公共配置"
-    ui_item2 7 "WebSocket map" 8 "SNI 分流配置"
+    ui_section "模板与分流"
+    ui_item2 7 "查看反代模板" 8 "SNI 分流管理"
     ui_return
-    ui_hint "修改配置后建议先测试，再执行重载。"
     menu_prompt 8; c="$REPLY"
     case "$c" in
       1) create_nginx_proxy ;; 2) list_nginx_sites ;;
       3) local sites=() f; for f in /etc/nginx/sites-enabled/*; do [ -L "$f" ] || [ -f "$f" ] || continue; sites+=("$(basename "$f")"); done
          select_from_list "选择要编辑的站点" "${sites[@]}" || continue
-         edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"; pause ;;
+         edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"
+         if nginx -t 2>/dev/null; then systemctl reload nginx 2>/dev/null && ok "已重载"
+         else err "配置错误"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; fi
+         pause ;;
       4) delete_nginx_site ;;
       5) nginx -t 2>/dev/null && ok "配置正确" || { err "配置错误"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; }; pause ;;
       6) nginx -t 2>/dev/null && systemctl reload nginx && ok "已重载" || err "nginx -t 失败，未 reload"; pause ;;
-      7) ensure_connection_upgrade_map && ok "map 已就绪" || err "map 配置失败"; pause ;;
-      8) setup_sni_split ;;
+      7) nginx_show_template ;;
+      8) sni_menu ;;
       0) return ;;
       *) warn "请输入 0-8"; pause ;;
     esac
@@ -1046,7 +1071,6 @@ acme_menu(){
     ui_item2 4 "测试续期" 5 "立即续期"
     ui_item 6 "续期 cron"; printf '\n'
     ui_return
-    ui_hint "验证方式: Cloudflare DNS-01；删除前请确认无 Nginx 站点引用。"
     menu_prompt 6; c="$REPLY"
     case "$c" in
       1) acme_issue "" ;;
@@ -1463,7 +1487,6 @@ singbox_menu(){
     ui_section "卸载"
     ui_item 7 "卸载 sing-box"; printf '\n'
     ui_return
-    ui_hint "修改配置后会先校验 JSON，再决定是否重启。"
     menu_prompt 7; c="$REPLY"
     case "$c" in
       1) setup_singbox ;; 2) singbox_status ;; 3) singbox_logs ;; 4) singbox_edit ;;
@@ -1534,67 +1557,22 @@ ensure_stream_module(){
 }
 
 setup_sni_split(){
-  ui_header "配置 Nginx SNI 分流"
-  info "Nginx 接管 443，按 SNI 分流:"
-  echo "    匹配的域名 → Nginx Web 反代（内部端口）"
-  echo "    其他流量   → sing-box Reality（${SINGBOX_PORT}）"
-  echo
-  info "「Web 域名」= 哪些域名走网站（不写就都走 sing-box）"
-  info "这些域名必须和反代站点里的 server_name 一致"
-  echo
-
+  ui_header "SNI 分流配置"
   if ! ensure_stream_module; then
     err "stream 模块不可用，无法配置 SNI 分流"
-    pause
-    return 1
+    pause; return 1
   fi
+  local ng_conf="/etc/nginx/nginx.conf"
 
-  local ng_conf="/etc/nginx/nginx.conf" web_domains="" f domain raw_domains=""
+  local web_domains
+  web_domains=$(grep -E '^[[:space:]]*server_name' /etc/nginx/sites-enabled/* 2>/dev/null \
+    | sed 's/.*server_name\s*//;s/;.*//' | awk '{print $1}' | grep -v '^_$' | sort -u | tr '\n' ' ' | xargs)
 
-  # 如果已有 stream 块，显示当前配置，问是否重建
-  if grep -q 'stream.conf' "$ng_conf" 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
-    ok "已有 SNI 分流配置"
-    echo
-    echo "  当前 Web 域名:"
-    local target_file="/etc/nginx/stream.conf"
-    [ -f "$target_file" ] || target_file="$ng_conf"
-    local current_domains
-    current_domains=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/^[[:space:]]*([A-Za-z0-9.-]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
-    printf '    %s\n' "${current_domains:-（无）}"
-    local cur_web_port cur_sb_port
-    cur_web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-    cur_sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-    ui_section "当前分流状态"
-    printf '  %-16s %s\n' "公网入口" "443 (Nginx stream)"
-    printf '  %-16s %s\n' "Web 内部端口" "${cur_web_port:-未识别}"
-    printf '  %-16s %s\n' "sing-box 端口" "${cur_sb_port:-未识别}"
-    printf '  %-16s %s\n' "Web 域名" "${current_domains:-未识别}"
-    ui_hint "回车保持当前配置；输入 y 才会重新生成分流配置。"
-    ask_yn "是否重新配置 SNI 分流？" "n" || return 0
-  fi
-
-  local nginx_backup="${ng_conf}.bak"
-  cp -f "$ng_conf" "$nginx_backup"
-
-  # 删除旧 stream 块
-  sed -i '/^stream {/,/^}/d' "$ng_conf"
-
-  # 自动读取已有反代站点的域名并去重
-  local f domain raw_domains=""
-  for f in /etc/nginx/sites-enabled/*; do
-    [ -L "$f" ] || [ -f "$f" ] || continue
-    domain=$(grep -E '^[[:space:]]*server_name' "$f" 2>/dev/null | head -1 | sed 's/.*server_name\s*//;s/;.*//' | awk '{print $1}')
-    [ -n "$domain" ] && [ "$domain" != "_" ] && raw_domains="$raw_domains $domain"
-  done
-  # 去重去空
-  web_domains=$(echo "$raw_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
-
-  # 让用户补充域名（已有的 + 新输入的，防重）
   echo
   if [ -n "$web_domains" ]; then
-    info "系统已为您自动载入以下反代域名: ${web_domains}"
-    info "（自动扫描出的域名会自动添加到分流，无需重复手动输入）"
-    read -rp "  补充其他域名（仅用于补充未检测到的，无则回车跳过）: " extra_domains
+    info "自动扫描到反代域名: ${web_domains}"
+    info "（扫描出的域名会自动加入分流，无需重复输入）"
+    read -rp "  补充其他域名（空格分隔，无则回车跳过）: " extra_domains
     if [ -n "$extra_domains" ]; then
       web_domains=$(echo "$web_domains $extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
     fi
@@ -1603,20 +1581,15 @@ setup_sni_split(){
     web_domains=$(echo "$extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
   fi
 
-  # Web HTTPS 内部端口固定 8443（与反代模板 listen 8443 一致）
   local https_port="8443"
   echo
-  info "Web HTTPS 内部端口: ${https_port}（固定，与反代模板一致）"
-  info "sing-box 端口: ${SINGBOX_PORT}"
+  info "Web 端口: ${https_port}（固定）  |  sing-box: ${SINGBOX_PORT}"
 
-  # 写入 stream 块到外部独立的配置文件，避免污染 nginx.conf
-  # 并在 nginx.conf 中加载（确保在 http{} 外面）
-  # 1. 检查 nginx.conf 中是否已经包含该配置
+  local nginx_backup="${ng_conf}.bak"
+  cp -f "$ng_conf" "$nginx_backup"
+  sed -i '/^stream {/,/^}/d' "$ng_conf"
   if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null; then
-     # 我们不能盲目插在第一行，因为 `load_module` 指令必须在任何业务配置（包括 `include stream.conf`）之前。
-     # 为了解决加载顺序问题，我们将 `include /etc/nginx/stream.conf;` 始终追加在 nginx.conf 的最末尾。
-     # 因为在主配置最末尾追加，一定在 http 块闭合大括号之外，且排在开头的 load_module 之后。
-     echo "include /etc/nginx/stream.conf;" >> "$ng_conf"
+    echo "include /etc/nginx/stream.conf;" >> "$ng_conf"
   fi
 
   cat > /etc/nginx/stream.conf <<SNIEOF
@@ -1647,32 +1620,101 @@ SNIEOF
 
   if nginx -t 2>/dev/null; then
     rm -f "$nginx_backup"
-    ok "SNI 分流配置已写入到 /etc/nginx/stream.conf"
-    info "对外 443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
-    echo
+    ok "SNI 分流已写入 /etc/nginx/stream.conf"
+    info "443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
     info "Web 域名: $(echo $web_domains | tr '\n' ' ')"
-    info "创建反代时 HTTPS 会自动监听 ${https_port}"
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-      warn "重启顺序: Nginx 先 → sing-box 后"
-      ask_yn "执行重启？" "y" || return 0
-      systemctl stop sing-box 2>/dev/null || true
-      systemctl restart nginx
-      systemctl start sing-box
-      ok "重启完成"
-    else
-      systemctl restart nginx; ok "Nginx 已重启"
-    fi
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl restart nginx && ok "Nginx 已重启" || err "Nginx 重启失败"
+    systemctl start sing-box 2>/dev/null || true
   else
     err "nginx -t 失败，恢复备份"
     nginx -t 2>&1 | head -5 | sed 's/^/  /'
-    # 恢复主配置
     cp -f "$nginx_backup" "$ng_conf"
     rm -f "$nginx_backup"
-    # 删除尾部插入的 include
     sed -i '/include \/etc\/nginx\/stream.conf;/d' "$ng_conf"
     rm -f /etc/nginx/stream.conf
   fi
   pause
+}
+
+# SNI 分流 — 删除（彻底清理，无残留）
+sni_remove(){
+  ui_header "删除 SNI 分流"
+  local ng_conf="/etc/nginx/nginx.conf"
+  if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null && [ ! -f /etc/nginx/stream.conf ]; then
+    warn "未配置 SNI 分流"; pause; return 0
+  fi
+  ask_yn "删除 SNI 分流配置？" "y" || return 0
+  local nginx_backup="${ng_conf}.bak"
+  cp -f "$ng_conf" "$nginx_backup"
+  sed -i '/include \/etc\/nginx\/stream.conf;/d' "$ng_conf"
+  sed -i '/include \/etc\/nginx\/conf.d\/stream.conf;/d' "$ng_conf"
+  rm -f /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf
+  if nginx -t 2>/dev/null; then
+    rm -f "$nginx_backup"
+    systemctl reload nginx 2>/dev/null && ok "已删除，Nginx 已重载" || ok "已删除（Nginx 重载失败，请手动检查）"
+  else
+    err "nginx -t 失败，恢复配置"
+    cp -f "$nginx_backup" "$ng_conf"
+    rm -f "$nginx_backup"
+  fi
+  pause
+}
+
+# SNI 分流 — 状态查看
+sni_status(){
+  ui_header "SNI 分流状态"
+  local ng_conf="/etc/nginx/nginx.conf"
+  if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null && [ ! -f /etc/nginx/stream.conf ]; then
+    warn "未配置 SNI 分流"; pause; return 0
+  fi
+  local target_file="/etc/nginx/stream.conf"
+  [ -f "$target_file" ] || target_file="$ng_conf"
+  local current_domains web_port sb_port
+  current_domains=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$target_file" 2>/dev/null \
+    | sed -nE 's/^[[:space:]]*([A-Za-z0-9.-]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
+  web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null \
+    | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+  sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null \
+    | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+  echo "  ─────────────────────────────────"
+  printf '  %-16s %s\n' "公网入口" "443 (Nginx stream)"
+  printf '  %-16s %s\n' "Web 端口" "${web_port:-未识别}"
+  printf '  %-16s %s\n' "sing-box 端口" "${sb_port:-未识别}"
+  printf '  %-16s %s\n' "Web 域名" "${current_domains:-无}"
+  echo "  ─────────────────────────────────"
+  local p
+  for p in 443 ${web_port:-0} ${sb_port:-0}; do
+    valid_port "$p" || continue
+    if ss -H -ltn "sport = :$p" 2>/dev/null | grep -q .; then
+      printf '  %-16s %s\n' "端口 $p" "已监听"
+    else
+      printf '  %-16s %s\n' "端口 $p" "${RED}未监听${NC}"
+    fi
+  done
+  pause
+}
+
+sni_menu(){
+  while true; do
+    ui_header "SNI 分流管理"
+    local active="n"
+    grep -q 'stream.conf' /etc/nginx/nginx.conf 2>/dev/null && [ -f /etc/nginx/stream.conf ] && active="y"
+    if [ "$active" = "y" ]; then ui_status "${GREEN}已启用${NC}  |  443 → 8443(Web)+${SINGBOX_PORT}(sing-box)"
+    else ui_status "${YELLOW}未启用${NC}"; fi
+    ui_item2 1 "重新配置" 2 "查看状态"
+    ui_item2 3 "删除分流" 4 "查看 stream.conf"
+    ui_return
+    menu_prompt 4; c="$REPLY"
+    case "$c" in
+      1) setup_sni_split ;;
+      2) sni_status ;;
+      3) sni_remove ;;
+      4) [ -f /etc/nginx/stream.conf ] && { edit_file /etc/nginx/stream.conf; nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null; } || { warn "未配置分流"; pause; } ;;
+      0) return ;;
+      *) warn "请输入 0-4"; pause ;;
+    esac
+  done
 }
 
 # ─── 一条龙安装 ──────────────────────────────────────────
@@ -1757,7 +1799,7 @@ delete_all_data(){
         name=$(basename "$dir")
         if ask_yn "同时删除容器和卷？" "y"; then docker compose -f "$dir/docker-compose.yml" down -v 2>/dev/null || true
         else docker compose -f "$dir/docker-compose.yml" down 2>/dev/null || true; fi
-        rm -rf -- "$dir" && ok "$name 已删除" && deleted=1
+        if rm -rf -- "$dir"; then ok "$name 已删除"; deleted=1; else err "$name 删除失败"; fi
       fi
     fi
   fi
@@ -1939,11 +1981,10 @@ main_menu(){
     ui_item2 7 "SNI 分流" 8 "一键删除"
     ui_item 9 "健康检查"; printf '\n'
     ui_item 0 "退出"; printf '\n'
-    ui_hint "建议先运行健康检查，再执行删除或重配置。"
     menu_prompt 9; c="$REPLY"
     case "$c" in
       1) install_all ;; 2) install_base_env ;; 3) docker_menu ;; 4) nginx_menu ;;
-      5) acme_menu ;; 6) singbox_menu ;; 7) setup_sni_split ;; 8) delete_all_data ;;
+      5) acme_menu ;; 6) singbox_menu ;; 7) sni_menu ;; 8) delete_all_data ;;
       9) health_check ;; 0) printf '\n'; exit 0 ;; *) warn "请输入 0-9"; pause ;;
     esac
   done
@@ -1959,7 +2000,7 @@ dispatch_cli(){
     nginx|n)     nginx_menu; exit 0 ;;
     cert|c)      acme_menu; exit 0 ;;
     singbox|sb)  singbox_menu; exit 0 ;;
-    sni)         setup_sni_split; exit 0 ;;
+    sni)         sni_menu; exit 0 ;;
     --help|-h|help) cat <<HELP
 vps-toolkit.sh $VERSION — VPS 一键运维工具箱
 
