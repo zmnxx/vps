@@ -996,11 +996,14 @@ acme_issue(){
   local certdir; certdir=$(acme_cert_dir "$domain")
   mkdir -p "$certdir"
 
-  # 账户邮箱: <8随机>@<已配置公开邮箱域名>（QQ/163/Gmail 等，LE 接受）
+  # 账户邮箱: 默认 <8随机>@<已配置公开邮箱域名>，支持手动输入测试
   # acme.sh 首次签发据此注册账户，已有账户则复用
-  local acct_email; acct_email=$(gen_random_email)
+  local acct_email input
+  acct_email=$(gen_random_email)
   info "颁发机构: Let's Encrypt  |  验证: Cloudflare DNS-01"
-  info "邮箱: $acct_email（自动生成，LE 不验证真实性）"
+  read -rp "  账户邮箱（回车默认 $acct_email）: " input
+  [ -n "$input" ] && acct_email="$input"
+  info "使用邮箱: $acct_email"
 
   # --issue 签发；--install-cert 安装到固定路径（覆盖式，无 archive 残留）
   # --reloadcmd 在续期后自动重载 nginx（acme.sh cron 续期会执行此命令）
@@ -1080,6 +1083,18 @@ acme_toggle_cron(){
   pause
 }
 
+acme_reset_account(){
+  ui_header "重置 acme.sh 账户"
+  warn "将删除 ~/.acme.sh 下的账户与证书记录（已安装的 /etc/nginx/ssl 证书不动）"
+  warn "用于账户注册失败、邮箱被 LE 拒绝后重置"
+  ask_yn "确认重置？" "n" || return 0
+  # 保留 ca 设置，删除账户 key 与注册信息，强制下次重新注册
+  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" >/dev/null 2>&1 || true
+  rm -rf "$ACME_HOME/ca" "$ACME_HOME/account.conf" 2>/dev/null
+  ok "账户已重置，下次申请证书将重新注册"
+  pause
+}
+
 acme_menu(){
   while true; do
     ui_header "证书管理 · acme.sh"
@@ -1093,18 +1108,20 @@ acme_menu(){
     ui_section "续期"
     ui_item2 4 "测试续期" 5 "立即续期"
     ui_item 6 "续期 cron"; printf '\n'
+    ui_item 7 "重置账户"; printf '\n'
     ui_return
-    menu_prompt 6; c="$REPLY"
+    menu_prompt 7; c="$REPLY"
     case "$c" in
       1) acme_issue "" ;;
       2) acme_list >/dev/null || { pause; continue; }; select_from_list "选择证书" $(acme_list) || continue; acme_show "$SELECTED_ITEM" ;;
       3) acme_list >/dev/null || { pause; continue; }; select_from_list "选择要删除的证书" $(acme_list) || continue; acme_remove "$SELECTED_ITEM"; pause ;;
-      4) acme_list >/dev/null || { pause; continue; }; select_from_list "测试续期" $(acme_list) || continue; acme_renew_test "$SELECTED_ITEM" | sed 's/^/  /'; pause ;;
+      4) acme_list >/dev/null || { pause; continue; }; select_from_list "测试续期" $(acme_list) || continue; sed 's/^/  /' <(acme_renew_test "$SELECTED_ITEM"); pause ;;
       5) acme_list >/dev/null || { pause; continue; }; select_from_list "实际续期" $(acme_list) || continue
          "$ACME_BIN" --renew -d "$SELECTED_ITEM" --dnssleep 30 >/dev/null 2>&1 && ok "续期完成" || err "续期失败"; systemctl reload nginx 2>/dev/null || true; pause ;;
       6) acme_toggle_cron ;;
+      7) acme_reset_account ;;
       0) return ;;
-      *) warn "请输入 0-6"; pause ;;
+      *) warn "请输入 0-7"; pause ;;
     esac
   done
 }
@@ -1392,20 +1409,20 @@ except:
     except:
         pass
 
-# 获取 IP 对应地区名（中文），用作节点备注名（如：春川、东京、洛杉矶）
+# 获取 IP 对应的国家代码（大写，如 US/JP/KR），用作节点备注名
 node_region = "VPS"
 try:
-    req = urllib.request.Request(f"http://ip-api.com/json/{vps_ip}?lang=zh-CN&fields=city,regionName,country",
+    req = urllib.request.Request(f"http://ip-api.com/json/{vps_ip}?fields=countryCode",
                                 headers={'User-Agent': 'curl/7.81.0'})
     with urllib.request.urlopen(req, timeout=4) as r:
         geo = json.loads(r.read().decode('utf-8'))
-        # 优先城市，其次区域，最后国家
-        node_region = geo.get("city") or geo.get("regionName") or geo.get("country") or "VPS"
+        cc = geo.get("countryCode")
+        if cc:
+            node_region = cc.upper()
 except:
     pass
-# URL 编码地区名（中文需 percent-encode 进 fragment）
-import urllib.parse as _up
-node_label = _up.quote(node_region)
+# 国家代码纯 ASCII，无需编码
+node_label = node_region
 
 inbounds = config.get("inbounds", [])
 if not inbounds:
