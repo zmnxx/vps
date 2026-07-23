@@ -201,6 +201,53 @@ service_state(){
   echo "未安装"
 }
 
+# 管理页面只允许显示可验证的事实，不把“命令执行完”当成“服务成功”。
+run_checked(){
+  local label="$1"; shift
+  if "$@"; then ok "$label"; return 0; fi
+  err "$label失败"; return 1
+}
+
+singbox_config_port(){
+  [ -f "$SINGBOX_CONF" ] || return 1
+  sed -nE 's/^[[:space:]]*"listen_port"[[:space:]]*:[[:space:]]*([0-9]+),?$/\1/p' "$SINGBOX_CONF" | head -1
+}
+
+singbox_mode(){
+  local p; p=$(singbox_config_port 2>/dev/null || true)
+  if [ -f "$SINGBOX_SECRETS" ] && grep -q '^UseSNISplit: y$' "$SINGBOX_SECRETS"; then
+    printf 'SNI 分流（内部端口 %s）' "${p:-未知}"
+  elif [ -f "$SINGBOX_CONF" ]; then
+    printf '独立直连（端口 %s）' "${p:-未知}"
+  else
+    printf '未配置'
+  fi
+}
+
+singbox_listener_ok(){
+  local port="$1"
+  valid_port "$port" || return 1
+  ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+}
+
+sni_conf_path(){
+  if [ -f /etc/nginx/stream.conf ]; then echo /etc/nginx/stream.conf
+  elif [ -f /etc/nginx/conf.d/stream.conf ]; then echo /etc/nginx/conf.d/stream.conf
+  else echo /etc/nginx/stream.conf; fi
+}
+
+sni_loaded(){
+  local f; f=$(sni_conf_path)
+  [ -f "$f" ] && grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$f" &&
+    grep -Eq "^[[:space:]]*include[[:space:]]+$f;" /etc/nginx/nginx.conf
+}
+
+nginx_reload_checked(){
+  nginx -t >/dev/null 2>&1 || { err "Nginx 配置校验失败"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; return 1; }
+  systemctl reload nginx >/dev/null 2>&1 || { err "Nginx 重载失败"; return 1; }
+  systemctl is-active --quiet nginx || { err "Nginx 重载后未运行"; return 1; }
+}
+
 collect_compose_files(){
   local dirs="$LAST_BASE /docker /opt/docker-apps /opt/compose /app"
   { for d in $dirs; do [ -d "$d" ] && find "$d" -name "docker-compose.yml" -type f 2>/dev/null; done; } | sort -u
@@ -360,8 +407,8 @@ config_docker_log_rotation(){
     tmp=$(mktemp)
     printf '{"log-driver":"json-file","log-opts":{"max-size":"%s","max-file":"%s"}}\n' "$max_size" "$max_file" > "$tmp"
   fi
-  if [ -f "$daemon_json" ]; then cp -f "$daemon_json" "${daemon_json}.bak"; fi
-  install -m 0644 "$tmp" "$daemon_json"; rm -f "$tmp"
+  install -m 0644 "$tmp" "$daemon_json" || { rm -f "$tmp"; err "daemon.json 写入失败"; return 1; }
+  rm -f "$tmp"
   ok "daemon.json 已配置（只对新建容器生效）"
   if systemctl is-active --quiet docker 2>/dev/null; then
     if [ "$auto_mode" = "auto" ]; then
@@ -673,8 +720,8 @@ ensure_connection_upgrade_map(){
     return 0
   fi
   # 在 http { 后面插入 map 块
-  local backup="${conf}.bak"
-  cp -f "$conf" "$backup"
+  local backup; backup=$(mktemp) || { err "无法创建临时回滚文件"; return 1; }
+  cp -f "$conf" "$backup" || { rm -f "$backup"; err "无法读取 $conf"; return 1; }
   local tmp; tmp=$(mktemp)
   local inserted=0
   local line
@@ -1092,9 +1139,10 @@ certbot_menu(){
 install_singbox(){
   if cmd_exists sing-box; then ok "sing-box 已安装: $(sing-box version 2>/dev/null | head -1)"; return 0; fi
   info "安装 sing-box（官方脚本）..."
-  apt-get install -y -qq curl wget openssl ca-certificates
-  curl -fsSL https://sing-box.app/install.sh | sh
-  ok "sing-box 安装完成"; sing-box version 2>&1 | head -1
+  apt-get install -y -qq curl wget openssl ca-certificates || { err "基础依赖安装失败"; return 1; }
+  curl -fsSL https://sing-box.app/install.sh | sh || { err "sing-box 安装脚本执行失败"; return 1; }
+  cmd_exists sing-box || { err "安装命令返回成功，但未找到 sing-box 二进制"; return 1; }
+  ok "sing-box 已安装: $(sing-box version 2>/dev/null | head -1)"
 }
 
 generate_singbox_config(){
@@ -1152,7 +1200,8 @@ generate_singbox_config(){
   save_conf
 
   mkdir -p /etc/sing-box; chmod 700 /etc/sing-box
-  cat > "$SINGBOX_CONF" <<EOF
+  local config_tmp; config_tmp=$(mktemp /etc/sing-box/config.json.tmp.XXXXXX) || return 1
+  cat > "$config_tmp" <<EOF
 {
   "log": { "level": "warn", "timestamp": true },
   "inbounds": [
@@ -1192,7 +1241,14 @@ generate_singbox_config(){
   }
 }
 EOF
-  chmod 600 "$SINGBOX_CONF"
+  chmod 600 "$config_tmp"
+  if ! sing-box check -c "$config_tmp" >/dev/null 2>&1; then
+    err "生成的 sing-box 配置校验失败，未覆盖现有配置"
+    sing-box check -c "$config_tmp" 2>&1 | head -8 | sed 's/^/  /'
+    rm -f "$config_tmp"
+    return 1
+  fi
+  mv -f "$config_tmp" "$SINGBOX_CONF"
 
   cat > "$SINGBOX_SECRETS" <<EOF
 UUID: ${uuid}
@@ -1206,9 +1262,7 @@ UseSNISplit: ${use_sni}
 EOF
   chmod 600 "$SINGBOX_SECRETS"
 
-  ok "配置已生成"
-  # 调用实时解析函数以显示最新的客户端参数和分享链接，防止生成时与后面不一致
-  singbox_show_client
+  ok "配置已生成并通过校验"
 }
 
 create_singbox_service(){
@@ -1234,60 +1288,64 @@ EOF
 }
 
 setup_singbox(){
-  local force_sni="${1:-}"
-  ui_header "sing-box 安装（VLESS + Reality + Vision）"
-  install_singbox || return 1
-  generate_singbox_config "$force_sni"
-  create_singbox_service
-  if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then ok "配置正确"
-  else err "配置错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; return 1; fi
-  
-  # 读取配置文件确定是否使用了 Nginx 分流
-  local use_sni="y"
+  local force_sni="${1:-}" use_sni="y" port
+  ui_header "sing-box 安装 / 配置"
+  install_singbox || { pause; return 1; }
+  generate_singbox_config "$force_sni" || { err "配置生成失败，未启动服务"; pause; return 1; }
+  if ! sing-box check -c "$SINGBOX_CONF" >/dev/null 2>&1; then
+    err "sing-box 配置校验失败，未启动服务"
+    sing-box check -c "$SINGBOX_CONF" 2>&1 | head -8 | sed 's/^/  /'
+    pause; return 1
+  fi
+  ok "配置校验通过"
+  create_singbox_service || { err "systemd 服务创建失败，未启动服务"; pause; return 1; }
   if [ -f "$SINGBOX_SECRETS" ]; then
-    use_sni=$(grep 'UseSNISplit:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
+    use_sni=$(sed -n 's/^UseSNISplit:[[:space:]]*//p' "$SINGBOX_SECRETS")
   fi
-
-  if [ "$use_sni" = "n" ]; then
-    # 防火墙由用户自行管理，脚本只提示需要开放端口。
-    info "请自行在防火墙中开放 TCP ${SINGBOX_PORT} 端口"
-  else
-    # 分流模式：确保 Nginx 正在运行
-    if ! systemctl is-active --quiet nginx; then 
-      warn "检测到选择了 Nginx 分流模式，但 Nginx 未运行，尝试启动..."
-      systemctl start nginx 2>/dev/null || true
-    fi
+  port=$(singbox_config_port 2>/dev/null || true)
+  [ -n "$port" ] || { err "无法从实际配置识别监听端口，未启动服务"; pause; return 1; }
+  if [ "$use_sni" = "y" ] && ! systemctl is-active --quiet nginx; then
+    warn "SNI 模式依赖 Nginx；Nginx 当前未运行，先启动失败则不启动 sing-box"
+    systemctl start nginx >/dev/null 2>&1 || { err "Nginx 启动失败"; pause; return 1; }
+    systemctl is-active --quiet nginx || { err "Nginx 启动后仍未运行"; pause; return 1; }
   fi
-
-  systemctl enable --now sing-box
-  ok "sing-box 已启动"
-  if [ "$use_sni" = "y" ]; then
-    info "模式: Nginx SNI 共用 443 分流模式 (内部监听 ${SINGBOX_PORT})"
-  else
-    info "模式: 独立直连模式 (公开监听并对外放行端口 ${SINGBOX_PORT})"
+  if ! systemctl enable --now sing-box >/dev/null 2>&1; then
+    err "sing-box 启动失败"
+    systemctl status sing-box --no-pager -l 2>&1 | tail -12
+    pause; return 1
   fi
-  echo; info "完整参数: cat $SINGBOX_SECRETS"
+  if ! systemctl is-active --quiet sing-box || ! singbox_listener_ok "$port"; then
+    err "sing-box 启动命令已返回，但服务或端口验证失败"
+    systemctl status sing-box --no-pager -l 2>&1 | tail -12
+    pause; return 1
+  fi
+  ok "sing-box 已启动并监听 127.0.0.1:${port}（以实际配置为准）"
+  info "模式: $(singbox_mode)"
+  info "完整参数文件: $SINGBOX_SECRETS"
   pause
 }
 
 singbox_status(){
-  ui_header "sing-box 状态"
-  if ! cmd_exists sing-box; then warn "未安装"; pause; return; fi
-  echo "  版本: $(sing-box version 2>/dev/null | head -1)"
-  echo "  状态: $(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
-  
-  local use_sni="y"
-  if [ -f "$SINGBOX_SECRETS" ]; then
-    use_sni=$(grep 'UseSNISplit:' "$SINGBOX_SECRETS" | cut -d' ' -f2)
-  fi
-
-  if [ "$use_sni" = "y" ]; then
-    echo "  模式: Nginx SNI 共用 443 分流模式 (内部监听 ${SINGBOX_PORT})"
+  ui_header "sing-box 运行状态"
+  if ! cmd_exists sing-box; then ui_status "未安装"; pause; return 0; fi
+  local port state listener
+  port=$(singbox_config_port 2>/dev/null || true)
+  state=$(systemctl is-active sing-box 2>/dev/null || true)
+  if [ "$state" = "active" ] && singbox_listener_ok "$port"; then
+    ui_status "运行中（服务 active，端口 ${port} 正在监听）"
+  elif [ "$state" = "active" ]; then
+    ui_status "异常：服务 active，但端口 ${port:-未知} 未监听"
   else
-    echo "  模式: 独立直连模式 (直接公开暴露 ${SINGBOX_PORT})"
+    ui_status "未运行（systemd: ${state:-unknown}）"
   fi
-  echo
-  ss -tlnp | grep -E "443|${SINGBOX_PORT}" 2>/dev/null || echo "  未检测到本地端口运行"
+  echo "  版本: $(sing-box version 2>/dev/null | head -1)"
+  echo "  配置: $([ -f "$SINGBOX_CONF" ] && echo 存在 || echo 缺失)"
+  echo "  模式: $(singbox_mode)"
+  if [ -n "$port" ]; then
+    listener=$(ss -H -ltnp "sport = :$port" 2>/dev/null | head -1)
+    printf '  监听: %s\n' "${listener:-未监听}"
+  fi
+  if sni_loaded; then echo "  SNI: 已加载到 Nginx"; else echo "  SNI: 未确认加载"; fi
   pause
 }
 
@@ -1300,10 +1358,27 @@ singbox_logs(){
 }
 
 singbox_edit(){
-  edit_file "$SINGBOX_CONF"
-  if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then
-    ok "语法正确"; ask_yn "重启？" "y" && systemctl restart sing-box && ok "已重启"
-  else err "语法错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; fi
+  [ -f "$SINGBOX_CONF" ] || { err "配置文件不存在"; pause; return 1; }
+  local edit_tmp; edit_tmp=$(mktemp /etc/sing-box/config.json.edit.XXXXXX) || { err "无法创建临时编辑文件"; pause; return 1; }
+  cp -f "$SINGBOX_CONF" "$edit_tmp" || { err "无法准备编辑文件"; rm -f "$edit_tmp"; pause; return 1; }
+  edit_file "$edit_tmp"
+  if ! sing-box check -c "$edit_tmp" >/dev/null 2>&1; then
+    err "配置校验失败，正式配置未改变"
+    sing-box check -c "$edit_tmp" 2>&1 | head -8 | sed 's/^/  /'
+    rm -f "$edit_tmp"
+    pause; return 1
+  fi
+  ok "配置校验通过"
+  mv -f "$edit_tmp" "$SINGBOX_CONF"
+  if ask_yn "重启并验证 sing-box？" "y"; then
+    local port; port=$(singbox_config_port 2>/dev/null || true)
+    if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box && singbox_listener_ok "$port"; then
+      ok "sing-box 已重启并确认监听 ${port}"
+    else
+      err "重启后验证失败，配置已通过但服务未确认可用"
+      systemctl status sing-box --no-pager -l 2>&1 | tail -12
+    fi
+  fi
   pause
 }
 
@@ -1460,17 +1535,34 @@ PYEOF
   pause
 }
 
-singbox_restart(){ systemctl restart sing-box && ok "已重启" || err "重启失败"; pause; }
+singbox_restart(){
+  local port; port=$(singbox_config_port 2>/dev/null || true)
+  if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box && singbox_listener_ok "$port"; then
+    ok "sing-box 已重启并确认监听 ${port}"
+  else
+    err "sing-box 重启后验证失败"
+    systemctl status sing-box --no-pager -l 2>&1 | tail -12
+  fi
+  pause
+}
 
 singbox_delete(){
   ask_yn "确定卸载 sing-box？" "n" || return 0
   systemctl disable --now sing-box 2>/dev/null || true
-  rm -f "$SINGBOX_SERVICE"
-  systemctl daemon-reload
-  rm -rf /etc/sing-box
+  if dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'install ok installed'; then
+    apt-get purge -y -qq sing-box || { err "sing-box 软件包卸载失败，未宣称完成"; pause; return 1; }
+  fi
+  rm -f "$SINGBOX_SERVICE" /lib/systemd/system/sing-box.service /usr/lib/systemd/system/sing-box.service
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed sing-box 2>/dev/null || true
+  rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box
   rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
-  rm -f /usr/local/bin/sing-box /usr/bin/sing-box
-  ok "sing-box 二进制文件、配置、密钥、服务已彻底清除"
+  rm -f /usr/local/bin/sing-box /usr/bin/sing-box /usr/sbin/sing-box
+  if cmd_exists sing-box || [ -e "$SINGBOX_SERVICE" ] || [ -d /etc/sing-box ] || [ -f "$SINGBOX_SECRETS" ]; then
+    err "sing-box 仍有可检测残留，未宣称卸载完成"
+    return 1
+  fi
+  ok "sing-box 二进制、软件包、配置、密钥和服务已清除"
   pause
 }
 
@@ -1478,7 +1570,13 @@ singbox_menu(){
   while true; do
     ui_header "sing-box 管理"
     if cmd_exists sing-box; then
-      if systemctl is-active --quiet sing-box 2>/dev/null; then ui_status "${GREEN}运行中${NC}  |  监听 ${SINGBOX_PORT}"; else ui_status "${YELLOW}已安装 / 未运行${NC}"; fi
+      local menu_port menu_state
+      menu_port=$(singbox_config_port 2>/dev/null || true)
+      if systemctl is-active --quiet sing-box && singbox_listener_ok "$menu_port"; then
+        ui_status "${GREEN}运行中${NC}  |  已确认监听 ${menu_port}"
+      elif systemctl is-active --quiet sing-box; then
+        ui_status "${YELLOW}异常${NC}  |  服务 active 但未确认端口 ${menu_port:-未知}"
+      else ui_status "${YELLOW}已安装 / 未运行${NC}"; fi
     else ui_status "${RED}未安装${NC}"; fi
     ui_section "服务与配置"
     ui_item2 1 "安装 / 配置" 2 "运行状态"
@@ -1502,9 +1600,8 @@ singbox_menu(){
 
 # 检测并加载 stream 模块（绝不创建额外的 conf 文件，避免重复加载）
 ensure_stream_module(){
-  # 清理之前版本可能创建的冲突文件
-  rm -f /etc/nginx/modules-enabled/stream.conf 2>/dev/null
-
+  # 不删除系统 modules-enabled 文件；它可能是发行版提供的有效模块配置。
+  # 仅检查现状，缺失时再安装并验证，避免“检测”本身破坏 Nginx。
   # 检查 nginx.conf 是否已手动 load_module stream
   if grep -q 'ngx_stream_module' /etc/nginx/nginx.conf 2>/dev/null; then
     return 0
@@ -1538,8 +1635,8 @@ ensure_stream_module(){
   if [ -n "$mod_so" ]; then
     local ng_conf="/etc/nginx/nginx.conf"
     if ! grep -q 'ngx_stream_module.so' "$ng_conf" 2>/dev/null; then
-      local module_backup="${ng_conf}.bak"
-      cp -f "$ng_conf" "$module_backup"
+      local module_backup; module_backup=$(mktemp) || return 1
+      cp -f "$ng_conf" "$module_backup" || { rm -f "$module_backup"; return 1; }
       (echo "load_module $mod_so;"; cat "$module_backup") > "$ng_conf"
       rm -f "$module_backup"
       ok "已在 nginx.conf 顶部显式加载 stream 模块"
@@ -1574,8 +1671,25 @@ setup_sni_split(){
   fi
 
   local ng_conf="/etc/nginx/nginx.conf" web_domains="" f domain raw_domains=""
+  local managed_file="/etc/nginx/stream.conf"
+  local https_port=""
 
-  # 如果已有 stream 块，显示当前配置，问是否重建
+  # 分流只能转发到真实存在且已监听的 HTTPS 站点，不能让用户填写一个未实现的虚拟端口。
+  for f in /etc/nginx/sites-enabled/*; do
+    [ -L "$f" ] || [ -f "$f" ] || continue
+    if grep -Eq '^[[:space:]]*listen[[:space:]]+[0-9]+[[:space:]]+ssl' "$f" 2>/dev/null; then
+      domain=$(grep -E '^[[:space:]]*server_name[[:space:]]+' "$f" 2>/dev/null | head -1 | sed -E 's/^[[:space:]]*server_name[[:space:]]+//;s/;.*//' | awk '{print $1}')
+      [ -n "$domain" ] && [ "$domain" != "_" ] && raw_domains="$raw_domains $domain"
+      https_port=$(grep -E '^[[:space:]]*listen[[:space:]]+[0-9]+[[:space:]]+ssl' "$f" | head -1 | sed -E 's/.*listen[[:space:]]+([0-9]+).*/\1/')
+    fi
+  done
+  web_domains=$(printf '%s\n' "$raw_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+  if [ -z "$https_port" ] || ! valid_port "$https_port"; then
+    https_port=""
+    [ -n "$web_domains" ] && warn "未检测到真实 HTTPS 站点，Web 域名不会写入分流"
+  else
+    info "已检测真实 HTTPS 上游: 127.0.0.1:${https_port}"
+  fi
   if grep -q 'stream.conf' "$ng_conf" 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
     ok "已有 SNI 分流配置"
     echo
@@ -1597,74 +1711,55 @@ setup_sni_split(){
     ask_yn "是否重新配置 SNI 分流？" "n" || return 0
   fi
 
-  local nginx_backup="${ng_conf}.bak"
-  cp -f "$ng_conf" "$nginx_backup"
+  local nginx_backup; nginx_backup=$(mktemp) || { err "无法创建临时回滚文件"; pause; return 1; }
+  cp -f "$ng_conf" "$nginx_backup" || { rm -f "$nginx_backup"; err "无法读取 Nginx 主配置"; pause; return 1; }
 
-  # 删除旧 stream 块
-  sed -i '/^stream {/,/^}/d' "$ng_conf"
-
-  # 自动读取已有反代站点的域名并去重
-  local f domain raw_domains=""
-  for f in /etc/nginx/sites-enabled/*; do
-    [ -L "$f" ] || [ -f "$f" ] || continue
-    domain=$(grep -E '^[[:space:]]*server_name' "$f" 2>/dev/null | head -1 | sed 's/.*server_name\s*//;s/;.*//' | awk '{print $1}')
-    [ -n "$domain" ] && [ "$domain" != "_" ] && raw_domains="$raw_domains $domain"
-  done
-  # 去重去空
-  web_domains=$(echo "$raw_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
-
-  # 让用户补充域名（已有的 + 新输入的，防重）
-  echo
-  if [ -n "$web_domains" ]; then
-    info "系统已为您自动载入以下反代域名: ${web_domains}"
-    info "（自动扫描出的域名会自动添加到分流，无需重复手动输入）"
-    read -rp "  补充其他域名（仅用于补充未检测到的，无则回车跳过）: " extra_domains
-    if [ -n "$extra_domains" ]; then
-      web_domains=$(echo "$web_domains $extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
-    fi
-  else
-    read -rp "  输入 Web 域名（空格分隔，如 a.xxx.com b.xxx.com）: " extra_domains
-    web_domains=$(echo "$extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+  # 只管理本工具自己的独立文件，不删除 nginx.conf 中未知的 stream 块。
+  # 主配置中的 include 也只在明确存在时保留，避免误伤用户配置。
+  local sni_file; sni_file=$(sni_conf_path)
+  local sni_backup=""
+  if [ -f "$sni_file" ]; then
+    sni_backup=$(mktemp) || { rm -f "$nginx_backup"; err "无法创建临时回滚文件"; pause; return 1; }
+    cp -f "$sni_file" "$sni_backup" || { rm -f "$nginx_backup" "$sni_backup"; err "无法读取 SNI 配置"; pause; return 1; }
   fi
 
-  # Web 内部端口（首次默认 8443，已有就用已有的）
-  local https_port
-  https_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$nginx_backup" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-  [ -z "$https_port" ] || ! valid_port "$https_port" && https_port="8443"
+  if [ -z "$https_port" ] || ! valid_port "$https_port"; then
+    err "没有可验证的 HTTPS Web 上游，不能启用 Web SNI 分流"
+    err "请先为站点申请证书并确认其 listen ssl 端口，再回到此页面配置"
+    rm -f "$nginx_backup" "$sni_backup"
+    pause; return 1
+  fi
+  valid_port "$SINGBOX_PORT" || { err "sing-box 内部端口无效，不能生成 SNI 配置"; rm -f "$nginx_backup" "$sni_backup"; pause; return 1; }
   echo
-  info "Web HTTPS 内部端口: ${https_port}（仅本机，不暴露公网）"
-  info "sing-box 端口: ${SINGBOX_PORT}"
-  ask_yn "修改 Web 内部端口？" "n" && {
-    read -rp "  端口: " https_port; valid_port "$https_port" || https_port="8443"
-  }
-
-  # 写入 stream 块到外部独立的配置文件，避免污染 nginx.conf
-  # 并在 nginx.conf 中加载（确保在 http{} 外面）
-  # 1. 检查 nginx.conf 中是否已经包含该配置
-  if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null; then
-     # 我们不能盲目插在第一行，因为 `load_module` 指令必须在任何业务配置（包括 `include stream.conf`）之前。
-     # 为了解决加载顺序问题，我们将 `include /etc/nginx/stream.conf;` 始终追加在 nginx.conf 的最末尾。
-     # 因为在主配置最末尾追加，一定在 http 块闭合大括号之外，且排在开头的 load_module 之后。
-     echo "include /etc/nginx/stream.conf;" >> "$ng_conf"
+  info "Web HTTPS 上游: 127.0.0.1:${https_port}（自动识别，不提供虚假端口选择）"
+  info "sing-box 上游: 127.0.0.1:${SINGBOX_PORT}（必须已实际监听）"
+  if ! singbox_listener_ok "$SINGBOX_PORT"; then
+    err "sing-box 未确认监听 ${SINGBOX_PORT}，不能宣称 SNI 可用"
+    rm -f "$nginx_backup" "$sni_backup"
+    pause; return 1
   fi
 
-  cat > /etc/nginx/stream.conf <<SNIEOF
+  # 事务式写入：先生成临时配置，再校验并重载，失败时恢复两份备份。
+  local managed_file="/etc/nginx/stream.conf"
+  local managed_tmp; managed_tmp=$(mktemp /etc/nginx/stream.conf.tmp.XXXXXX)
+  if ! grep -Fq 'include /etc/nginx/stream.conf;' "$ng_conf"; then
+    printf '\ninclude /etc/nginx/stream.conf;\n' >> "$ng_conf"
+  fi
+
+  cat > "$managed_tmp" <<SNIEOF
 stream {
     map \$ssl_preread_server_name \$upstream {
 SNIEOF
   for domain in $web_domains; do
     [ -z "$domain" ] && continue
-    echo "        $domain    web;" >> /etc/nginx/stream.conf
+    valid_domain "$domain" || { err "非法 Web 域名: $domain"; rm -f "$managed_tmp" "$nginx_backup" "$sni_backup"; pause; return 1; }
+    printf '        %s    web;\n' "$domain" >> "$managed_tmp"
   done
-  cat >> /etc/nginx/stream.conf <<SNIEOF
+  cat >> "$managed_tmp" <<SNIEOF
         default         singbox;
     }
-    upstream web {
-        server 127.0.0.1:${https_port};
-    }
-    upstream singbox {
-        server 127.0.0.1:${SINGBOX_PORT};
-    }
+    upstream web { server 127.0.0.1:${https_port}; }
+    upstream singbox { server 127.0.0.1:${SINGBOX_PORT}; }
     server {
         listen 443;
         listen [::]:443;
@@ -1673,35 +1768,108 @@ SNIEOF
     }
 }
 SNIEOF
+  mv -f "$managed_tmp" "$managed_file"
 
-  if nginx -t 2>/dev/null; then
-    rm -f "$nginx_backup"
-    ok "SNI 分流配置已写入到 /etc/nginx/stream.conf"
-    info "对外 443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
-    echo
-    info "Web 域名: $(echo $web_domains | tr '\n' ' ')"
-    info "创建反代时 HTTPS 会自动监听 ${https_port}"
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-      warn "重启顺序: Nginx 先 → sing-box 后"
-      ask_yn "执行重启？" "y" || return 0
-      systemctl stop sing-box 2>/dev/null || true
-      systemctl restart nginx
-      systemctl start sing-box
-      ok "重启完成"
-    else
-      systemctl restart nginx; ok "Nginx 已重启"
-    fi
+  if nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
+    rm -f "$nginx_backup" "$sni_backup"
+    ok "SNI 配置已校验、加载并确认 443 正在监听"
+    info "对外 443 → Web ${https_port} / sing-box ${SINGBOX_PORT}"
+    info "Web 域名: ${web_domains:-（无，全部进入 sing-box）}"
   else
-    err "nginx -t 失败，恢复备份"
-    nginx -t 2>&1 | head -5 | sed 's/^/  /'
-    # 恢复主配置
+    err "SNI 配置未生效，恢复原 Nginx 配置"
+    nginx -t 2>&1 | head -8 | sed 's/^/  /'
     cp -f "$nginx_backup" "$ng_conf"
-    rm -f "$nginx_backup"
-    # 删除尾部插入的 include
-    sed -i '/include \/etc\/nginx\/stream.conf;/d' "$ng_conf"
-    rm -f /etc/nginx/stream.conf
+    if [ -n "$sni_backup" ] && [ -f "$sni_backup" ]; then cp -f "$sni_backup" /etc/nginx/stream.conf; else rm -f /etc/nginx/stream.conf; fi
+    rm -f "$nginx_backup" "$sni_backup"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    pause; return 1
   fi
   pause
+  pause
+}
+
+sni_status(){
+  ui_header "SNI 分流状态"
+  local f web_port sb_port domains listener
+  f=$(sni_conf_path)
+  web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$f" 2>/dev/null | sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+  sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$f" 2>/dev/null | sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+  domains=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$f" 2>/dev/null | sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
+  listener=$(ss -H -ltnp 'sport = :443' 2>/dev/null | head -1)
+  if sni_loaded && nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx && [ -n "$listener" ]; then
+    ui_status "已生效（配置已加载、Nginx active、443 正在监听）"
+  elif [ -f "$f" ]; then
+    ui_status "未确认生效（配置文件存在，但加载/服务/监听至少一项异常）"
+  else
+    ui_status "未配置"
+  fi
+  printf '  %-14s %s\n' "配置文件" "$([ -f "$f" ] && echo "$f" || echo 不存在)"
+  printf '  %-14s %s\n' "Web 上游" "${web_port:-未识别}"
+  printf '  %-14s %s\n' "sing-box 上游" "${sb_port:-未识别}"
+  printf '  %-14s %s\n' "Web 域名" "${domains:-无}"
+  printf '  %-14s %s\n' "443 监听" "${listener:-未监听}"
+  pause
+}
+
+sni_reload(){
+  if ! sni_loaded; then err "未检测到已加载的 SNI 配置"; pause; return 1; fi
+  if nginx_reload_checked && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
+    ok "SNI 配置已验证、重载并确认 443 监听"
+  else
+    err "SNI 配置未确认生效"
+  fi
+  pause
+}
+
+sni_delete(){
+  local ng_conf=/etc/nginx/nginx.conf sni_file
+  sni_file=$(sni_conf_path)
+  if [ ! -f "$sni_file" ] && ! grep -Eq '^[[:space:]]*include[[:space:]]+[^;]*stream\.conf;' "$ng_conf" 2>/dev/null; then
+    warn "未检测到 SNI 分流配置"
+    pause; return 0
+  fi
+  ask_yn "删除 SNI 分流并重载 Nginx？" "n" || return 0
+
+  # 只使用当前操作的临时回滚文件，不留下 .bak 或第二份用户备份。
+  local tmp_conf tmp_sni had_sni=0
+  tmp_conf=$(mktemp) || { err "无法创建临时回滚文件"; pause; return 1; }
+  cp -f "$ng_conf" "$tmp_conf" || { rm -f "$tmp_conf"; err "无法读取 Nginx 主配置"; pause; return 1; }
+  if [ -f "$sni_file" ]; then
+    tmp_sni=$(mktemp); cp -f "$sni_file" "$tmp_sni"; had_sni=1
+  fi
+
+  sed -i -E '\#^[[:space:]]*include[[:space:]]+(/etc/nginx/(stream\.conf|conf\.d/stream\.conf));#d' "$ng_conf"
+  rm -f /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf
+  if nginx_reload_checked && ! grep -Eq '^[[:space:]]*include[[:space:]]+[^;]*stream\.conf;' "$ng_conf" &&
+     [ ! -f /etc/nginx/stream.conf ] && [ ! -f /etc/nginx/conf.d/stream.conf ]; then
+    rm -f "$tmp_conf" "$tmp_sni"
+    ok "SNI 文件、include 引用已删除，并确认 Nginx 重载成功"
+  else
+    cp -f "$tmp_conf" "$ng_conf"
+    [ "$had_sni" -eq 1 ] && cp -f "$tmp_sni" "$sni_file"
+    rm -f "$tmp_conf" "$tmp_sni"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    err "SNI 删除未验证成功，已恢复当前配置"
+    pause; return 1
+  fi
+  pause
+}
+
+sni_menu(){
+  while true; do
+    ui_header "SNI 分流管理"
+    if sni_loaded && systemctl is-active --quiet nginx && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
+      ui_status "已生效"
+    elif [ -f /etc/nginx/stream.conf ]; then ui_status "配置存在 / 未确认生效"
+    else ui_status "未配置"; fi
+    ui_section "配置与验证"
+    ui_item2 1 "查看真实状态" 2 "配置 / 重建"
+    ui_item2 3 "验证并重载" 4 "删除分流"
+    ui_return
+    ui_hint "成功状态要求配置已加载、Nginx 运行且 443 实际监听。"
+    menu_prompt 4; c="$REPLY"
+    case "$c" in 1) sni_status ;; 2) setup_sni_split ;; 3) sni_reload ;; 4) sni_delete ;; 0) return ;; *) warn "请输入 0-4"; pause ;; esac
+  done
 }
 
 # ─── 一条龙安装 ──────────────────────────────────────────
@@ -1717,14 +1885,17 @@ install_all(){
   ok "基础环境完成"
 
   ui_header "[2/6] sing-box"
-  if cmd_exists sing-box; then ok "已安装"; i_sb="已安装"
-  elif ask_yn "安装 sing-box？" "y"; then setup_singbox "force_sni"; i_sb="已安装"; fi
+  if cmd_exists sing-box && [ -f "$SINGBOX_CONF" ] && systemctl is-active --quiet sing-box; then ok "已安装并运行"; i_sb="已安装并运行"
+  elif ask_yn "安装 sing-box？" "y"; then
+    if setup_singbox "force_sni"; then i_sb="已安装并运行"; else i_sb="安装/启动失败"; fi
+  fi
 
   ui_header "[3/6] SNI 分流"
-  if cmd_exists sing-box; then
-    if [ -f /etc/nginx/stream.conf ] && grep -Fq 'include /etc/nginx/stream.conf;' /etc/nginx/nginx.conf 2>/dev/null; then ok "已配置"
-    elif ask_yn "配置 SNI 分流？" "y"; then setup_sni_split; fi
-  else warn "sing-box 未安装，跳过"; fi
+  if cmd_exists sing-box && [ -f "$SINGBOX_CONF" ]; then
+    if sni_loaded && nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then ok "已加载并生效"
+    elif ask_yn "配置 SNI 分流？" "y"; then setup_sni_split || warn "SNI 配置未生效"
+    fi
+  else warn "sing-box 未完成安装，跳过"; fi
 
   ui_header "[4/6] 日志与维护"
   if [ ! -f /etc/docker/daemon.json ] || ! grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null || ! grep -q '"max-file"' /etc/docker/daemon.json 2>/dev/null; then
@@ -1820,23 +1991,32 @@ delete_all_data(){
 
   if ask_yn "卸载 sing-box？（已进入一键删除流程）" "y"; then
     systemctl disable --now sing-box 2>/dev/null || true
-    rm -f "$SINGBOX_SERVICE"
-    systemctl daemon-reload
-    rm -rf /etc/sing-box
+    if dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'install ok installed'; then
+      apt-get purge -y -qq sing-box || { err "sing-box 软件包卸载失败"; return 1; }
+    fi
+    rm -f "$SINGBOX_SERVICE" /lib/systemd/system/sing-box.service /usr/lib/systemd/system/sing-box.service
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed sing-box 2>/dev/null || true
+    rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box
     rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
-    rm -f /usr/local/bin/sing-box /usr/bin/sing-box
-    ok "sing-box 二进制文件、配置、密钥、服务已彻底清除"
-    deleted=1
+    rm -f /usr/local/bin/sing-box /usr/bin/sing-box /usr/sbin/sing-box
+    if cmd_exists sing-box || [ -e "$SINGBOX_SERVICE" ] || [ -d /etc/sing-box ] || [ -f "$SINGBOX_SECRETS" ]; then
+      err "sing-box 仍有残留，未标记删除成功"
+    else
+      ok "sing-box 软件包、二进制、配置、密钥和服务已清除"
+      deleted=1
+    fi
   fi
 
   if ask_yn "清除 SNI 分流配置？（已进入一键删除流程）" "y"; then
     if grep -q 'stream.conf' /etc/nginx/nginx.conf 2>/dev/null || grep -q 'stream.conf' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
-      cp -f /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+      local delete_backup; delete_backup=$(mktemp) || { err "无法创建临时回滚文件"; pause; return 1; }
+      cp -f /etc/nginx/nginx.conf "$delete_backup" || { rm -f "$delete_backup"; err "无法读取 Nginx 主配置"; pause; return 1; }
       sed -i '/include \/etc\/nginx\/stream.conf;/d' /etc/nginx/nginx.conf
       sed -i '/include \/etc\/nginx\/conf.d\/stream.conf;/d' /etc/nginx/nginx.conf
       rm -f /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf
       if nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null; then
-        rm -f /etc/nginx/nginx.conf.bak
+        rm -f "$delete_backup"
         ok "已清除"
         deleted=1
       else
@@ -1849,7 +2029,6 @@ delete_all_data(){
   remove_cleanup_cron
   rm -f /usr/local/bin/docker-cleanup.sh /etc/logrotate.d/docker-cleanup /var/log/docker-cleanup.log
   rm -f /etc/letsencrypt/renewal-hooks/deploy/00-nginx-reload
-  rm -f /etc/docker/daemon.json.bak /etc/nginx/nginx.conf.bak
   rm -f "$CONF_FILE" "${CONF_DIR}/config.bak" 2>/dev/null || true
   rmdir "$CONF_DIR" 2>/dev/null || true
   [ "$deleted" -eq 0 ] && warn "本次没有删除业务对象，仅清理了工具自身残留" || ok "删除完成，工具自身残留已清理"
@@ -1961,7 +2140,7 @@ main_menu(){
     menu_prompt 9; c="$REPLY"
     case "$c" in
       1) install_all ;; 2) install_base_env ;; 3) docker_menu ;; 4) nginx_menu ;;
-      5) certbot_menu ;; 6) singbox_menu ;; 7) setup_sni_split ;; 8) delete_all_data ;;
+      5) certbot_menu ;; 6) singbox_menu ;; 7) sni_menu ;; 8) delete_all_data ;;
       9) health_check ;; 0) printf '\n'; exit 0 ;; *) warn "请输入 0-9"; pause ;;
     esac
   done
@@ -1977,7 +2156,7 @@ dispatch_cli(){
     nginx|n)     nginx_menu; exit 0 ;;
     cert|c)      certbot_menu; exit 0 ;;
     singbox|sb)  singbox_menu; exit 0 ;;
-    sni)         setup_sni_split; exit 0 ;;
+    sni)         sni_menu; exit 0 ;;
     --help|-h|help) cat <<HELP
 vps-toolkit.sh $VERSION — VPS 一键运维工具箱
 
