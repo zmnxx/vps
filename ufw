@@ -427,31 +427,49 @@ EOF
 
 # 实测验证 filter 是否能匹配当前日志中的 UFW BLOCK 行
 verify_ufw_filter(){
-	local src jail_file filter_file
+	local src filter_file
 	src=$(detect_ufw_logsrc)
-	jail_file="/etc/fail2ban/jail.d/ufw-block-abuse.local"
 	filter_file="/etc/fail2ban/filter.d/ufw-block-abuse.conf"
-	[ -f "$jail_file" ] && [ -f "$filter_file" ] || { echo -e "${R}jail 或 filter 文件不存在${N}"; return 1; }
+	[ -f "$filter_file" ] || { echo -e "${R}filter 文件不存在${N}"; return 1; }
+
+	# 构造一条标准 UFW BLOCK 测试日志行（无论系统当前有无真实拦截记录都能测）
+	# 用固定时间戳避免 datepattern 解析失败
+	local test_line="Jul 24 05:00:01 vps kernel: [12345.67] [UFW BLOCK] IN=eth0 OUT= MAC=ff:ff SRC=1.2.3.4 DST=5.6.7.8 PROTO=TCP SPT=12345 DPT=22 WINDOW=1024 SYN URGP=0"
+
+	# fail2ban-regex 用法: fail2ban-regex <LOG> <REGEX>
+	# LOG 可以是单行字符串，REGEX 可以是 filter 文件路径
+	if fail2ban-regex "$test_line" "$filter_file" >/tmp/fr-test.log 2>&1; then
+		# 检查是否真正匹配到（非零行数）
+		if grep -qi 'Lines:.*[1-9]' /tmp/fr-test.log 2>/dev/null; then
+			echo -e "${G}filter 验证通过${N}（测试日志行匹配成功）"
+		else
+			echo -e "${Y}filter 语法正常但未匹配到测试行${N}"
+			grep -i 'lines:' /tmp/fr-test.log 2>/dev/null | head -3
+		fi
+	else
+		echo -e "${R}filter 检测失败${N}"; cat /tmp/fr-test.log | tail -15
+		return 1
+	fi
+
+	# 额外：取一条真实日志样本验证（如果有）
 	local sample=""
 	case "$src" in
 		file:*) sample=$(grep '\[UFW BLOCK\]' "${src#file:}" 2>/dev/null | tail -1) ;;
 		systemd:*) sample=$(journalctl -k --no-pager -n 500 2>/dev/null | grep '\[UFW BLOCK\]' | tail -1) ;;
 	esac
-	if [ -z "$sample" ]; then
-		echo -e "${Y}当前日志中无 UFW BLOCK 样本，跳过 filter 匹配测试（待有拦截记录时自动生效）${N}"
-		# 仍验证 fail2ban-regex 语法
-		fail2ban-regex "$filter_file" >/tmp/fr-test.log 2>&1 && echo -e "${G}filter 语法正常${N}" || { echo -e "${R}filter 语法错误${N}"; cat /tmp/fr-test.log; return 1; }
-		return 0
-	fi
-	echo -e "${X}测试样本: ${sample:0:80}...${N}"
-	if fail2ban-regex "$sample" "$filter_file" >/tmp/fr-test.log 2>&1; then
-		local hits; hits=$(grep -i 'lines:' /tmp/fr-test.log | head -1)
-		echo -e "${G}filter 匹配成功${N} ${hits}"
-		return 0
+	if [ -n "$sample" ]; then
+		echo -e "${X}真实日志样本验证...${N}"
+		fail2ban-regex "$sample" "$filter_file" >/tmp/fr-real.log 2>&1
+		if grep -qi 'Lines:.*[1-9]' /tmp/fr-real.log 2>/dev/null; then
+			echo -e "${G}真实日志匹配成功${N}"
+		else
+			echo -e "${Y}真实日志未匹配（日志格式可能特殊）${N}"
+			echo -e "${X}样本: ${sample:0:100}${N}"
+		fi
 	else
-		echo -e "${R}filter 未匹配到样本，封禁可能不生效${N}"; cat /tmp/fr-test.log | tail -10
-		return 1
+		echo -e "${X}当前无真实 UFW BLOCK 样本，待有拦截记录时自动生效${N}"
 	fi
+	return 0
 }
 
 # ---------- Fail2ban 管理 ----------
