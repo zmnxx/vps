@@ -43,10 +43,10 @@ svc_restart(){ systemctl restart "$1"; }
 svc_is_active(){ systemctl is-active --quiet "$1"; }
 
 # ---------- 状态显示 ----------
-ufw_st(){ has_cmd ufw || return 0 && { echo -e "${X}未安装${N}"; return; }; local e; e=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2); [ "${e^^}" = "YES" ] && echo -e "${G}运行中${N}" || echo -e "${Y}已停止${N}"; }
+ufw_st(){ has_cmd ufw || { echo -e "${X}未安装${N}"; return; }; local e; e=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2); [ "${e^^}" = "YES" ] && echo -e "${G}运行中${N}" || echo -e "${Y}已停止${N}"; }
 f2b_st(){ has_cmd fail2ban-client || { echo -e "${X}未安装${N}"; return; }; if fail2ban-client ping >/dev/null 2>&1; then local c; c=$(fail2ban-client status 2>/dev/null | awk -F: '/Number of jail/{gsub(/[ \t]/,"",$2);print $2}'); echo -e "${G}运行中${N} (Jail: ${c:-0})"; else echo -e "${Y}已停止${N}"; fi; }
 bbr_st(){ local cc qd; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null); qd=$(sysctl -n net.core.default_qdisc 2>/dev/null); [ "$cc" = "bbr" ] && [ "$qd" = "fq" ] && echo -e "${G}已开启${N}" || echo -e "${X}未开启${N}"; }
-swap_st(){ local t s; t=$(free 2>/dev/null | awk '/Swap/{print $2}'); if [ "${t:-0}" -gt 0 ] 2>/dev/null; then s=$(free -h 2>/dev/null | awk '/Swap/{print $2}'); echo -e "${G}已启用${N} (${s})"; else echo -e "${X}未启用${N}"; fi; }
+swap_st(){ local t s; t=$(free 2>/dev/null | awk '/Swap/{print $2}'); if [ -n "$t" ] && [ "$t" -gt 0 ] 2>/dev/null; then s=$(free -h 2>/dev/null | awk '/Swap/{print $2}'); echo -e "${G}已启用${N} (${s})"; else echo -e "${X}未启用${N}"; fi; }
 
 # ---------- 探测函数 ----------
 get_ssh_port(){ local p; p=$(sshd -T 2>/dev/null | awk '/^port/{print $2;exit}'); [ -z "$p" ] && p=$(awk 'tolower($1)=="port"&&$2~/^[0-9]+$/{p=$2}END{print p}' /etc/ssh/sshd_config 2>/dev/null); echo "${p:-22}"; }
@@ -459,7 +459,7 @@ manage_fail2ban(){
 	has_cmd fail2ban-client || { echo -e "${R}未安装 Fail2ban${N}"; pause; return; }
 	while true; do
 		clear; echo -e "${P}=== Fail2ban 安全管理 ===${N}"; echo -e "状态: $(f2b_st)\n"
-		echo -e "  ${Y}1.${N} SSH 暴力破解防护"; echo -e "  ${Y}2.${N} UFW 拦截联动封禁"; echo -e "  ${Y}3.${N} 运行状态概览"; echo -e "  ${Y}4.${N} 监狱详情查看"; echo -e "  ${Y}5.${N} 一键清除所有封禁 IP"; echo -e "  ${Y}6.${N} 日志来源与轮转检查"; echo -e "  ${Y}7.${N} 解封指定 IP"; echo -e "  ${X}0. 返回主菜单${N}"
+		echo -e "  ${Y}1.${N} SSH 暴力破解防护"; echo -e "  ${Y}2.${N} UFW 拦截联动封禁"; echo -e "  ${Y}3.${N} 运行状态概览"; echo -e "  ${Y}4.${N} 监狱详情查看"; echo -e "  ${Y}5.${N} 一键清除所有封禁 IP"; echo -e "  ${Y}6.${N} 解封指定 IP"; echo -e "  ${X}0. 返回主菜单${N}"
 		read -r -p "请选择: " c
 		case $c in
 			1) echo -e "\n${C}--- SSH 防护配置 ---${N}"
@@ -475,27 +475,16 @@ manage_fail2ban(){
 				read -r -p "日志路径 [${lp_display}]: " lp; lp=${lp:-$dl}
 				[[ "$lp" != systemd:* ]] && [ ! -f "$lp" ] && touch "$lp" 2>/dev/null
 				echo -e "端口:${C}${pt}${N} 封禁:${C}${bt}${N} 重试:${C}${mr}${N} 日志:${C}${lp_display}${N} 白名单:${C}${ssh_ignoreips:-仅本机}${N}"
-				echo -e "${X}封禁策略: 递增封禁(首次${bt}，累犯翻倍，上限1周)${N}"
 				confirm "应用?" && { write_sshd_jail "$bt" "$mr" "$pt" "$lp" "$ssh_ignoreips"; restart_f2b && { verify_banaction; echo -e "${G}SSH 防护已生效${N}"; } || echo -e "${R}配置未生效，请按提示修复${N}"; }
 				pause ;;
 			2) has_cmd ufw || { echo -e "${R}未安装 UFW${N}"; pause; continue; }
 				echo -e "\n${C}--- UFW 拦截联动封禁 ---${N}"
-				echo -e "${Y}⚠ 重要提醒:${N}"
-				echo -e "${X}  代理节点(vless/reality/xtls/trojan 等)客户端在网络波动时会频繁重连，${N}"
-				echo -e "${X}  若代理端口未被 UFW 放行或回落到未放行端口，客户端 IP 会被误判为扫描而封禁！${N}"
-				echo -e "${X}  当前 UFW 放行端口:${N} ${C}$(ufw status 2>/dev/null | awk '/ALLOW/{print $3}' | tr '\n' ' ')${N}"
-				echo ""
-				# 白名单输入
 				local cur_ignore; cur_ignore=$(get_jail_value /etc/fail2ban/jail.d/ufw-block-abuse.local ignoreip 2>/dev/null | sed 's/127.0.0.1\/8 ::1//')
-				echo -e "${X}白名单(忽略封禁的 IP，空格分隔，支持 CIDR 如 1.2.3.0/24)${N}"
 				[ -n "$cur_ignore" ] && echo -e "${X}当前白名单:${C}${cur_ignore}${N}"
-				echo -e "${X}→ 强烈建议填入你的手机/家庭出口 IP 或代理客户端 IP${N}"
 				read -r -p "白名单 IP [留空=无]: " ignoreips
 				read -r -p "封禁时长 [12h]: " bt; bt=${bt:-12h}
 				read -r -p "触发阈值 [10]: " mr; mr=${mr:-10}
-				echo -e "\n封禁:${C}${bt}${N} 阈值:${C}${mr}${N} 白名单:${C}${ignoreips:-无}${N}"
-				echo -e "${X}说明: 对被 UFW 拦截(端口扫描/连未放行端口)的 IP，达到阈值后封禁。白名单 IP 不受限制。${N}"
-				echo -e "${X}封禁策略: 递增封禁(首次${bt}，累犯翻倍，上限1周)${N}"
+				echo -e "白名单:${C}${ignoreips:-无}${N} 封禁:${C}${bt}${N} 阈值:${C}${mr}${N}"
 				confirm "应用?" && {
 					ufw logging on 2>&1 | grep -vi '^$'
 					ensure_ufw_log_readable
@@ -506,10 +495,10 @@ manage_fail2ban(){
 						verify_ufw_filter
 						show_log_health
 						if fail2ban-client status ufw-block-abuse >/dev/null 2>&1; then
-							echo -e "${G}jail 'ufw-block-abuse' 已在运行${N}"
-							[ -n "$ignoreips" ] && echo -e "${G}白名单已生效:${C} $ignoreips${N}"
+							echo -e "${G}已生效${N}"
+							[ -n "$ignoreips" ] && echo -e "${G}白名单:${C} $ignoreips${N}"
 						else
-							echo -e "${R}jail 'ufw-block-abuse' 未加载，请检查日志${N}"
+							echo -e "${R}jail 未加载，请检查日志${N}"
 						fi
 					else
 						echo -e "${R}启动失败，配置未生效${N}"
@@ -535,8 +524,7 @@ manage_fail2ban(){
 				confirm "解封所有 IP?" && {
 					if fail2ban-client unban --all 2>&1; then echo -e "${G}已解封所有 IP${N}"; else echo -e "${R}解封失败${N}"; fi
 				}; pause ;;
-			6) show_log_health; pause ;;
-			7) f2b_ping || { echo -e "${R}未运行${N}"; pause; continue; }
+			6) f2b_ping || { echo -e "${R}未运行${N}"; pause; continue; }
 				echo -e "\n${C}--- 解封指定 IP ---${N}"
 				# 先列出当前所有被封 IP
 				local js banned_all=""
@@ -654,69 +642,6 @@ apply_bbr(){
 	fi
 }
 
-# ---------- 网络加固（ICMP 限速 + 内核硬化）----------
-manage_hardening(){
-	while true; do
-		clear
-		echo -e "${P}=== 网络加固 ===${N}\n"
-		# 当前状态
-		local icmp_bogus irc limit rfc4821
-		icmp_bogus=$(sysctl -n net.ipv4.icmp_echo_ignore_bogus_responses 2>/dev/null || echo "?")
-		irc=$(sysctl -n net.ipv4.icmp_ratelimit 2>/dev/null || echo "?")
-		limit=$(sysctl -n net.ipv4.icmp_msgs_limit_per_sec 2>/dev/null || echo "?")
-		rfc4821=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "?")
-		echo -e "  ${X}ICMP 限速:${C} ${irc}/ms burst=${limit}/s${N}"
-		echo -e "  ${X}忽略 bogus ICMP:${C} ${icmp_bogus}${N}"
-		echo -e "  ${X}其他: 同步 SYN(syncookies)/反 IP 伪装/反向过滤${N}\n"
-		echo -e "  ${Y}1.${N} ICMP 限速+硬化 (推荐小内存 VPS)"
-		echo -e "  ${Y}2.${N} 查看当前所有内核网络参数"
-		echo -e "  ${Y}3.${N} 恢复内核网络默认"
-		echo -e "  ${X}0. 返回主菜单${N}"
-		read -r -p "请选择: " c
-		case $c in
-			1) echo -e "\n${C}--- ICMP 限速 + 内核硬化 ---${N}"
-				echo -e "${X}说明: 对 ICMP 做内核级限速(非 fail2ban)，防止洪水吃满 CPU/带宽。${N}"
-				echo -e "${X}      同时开启 syncookies 等基础硬化。不影响正常少量 ping。${N}"
-				confirm "应用?" && {
-					# 先清除本工具之前写入的硬化行（标记为 # vps-mgmt-hardening）
-					sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-					cat >> /etc/sysctl.conf <<'EOF'
-net.ipv4.icmp_echo_ignore_bogus_responses = 1     # vps-mgmt-hardening
-net.ipv4.icmp_ratelimit = 1000                     # vps-mgmt-hardening (ms 间隔)
-net.ipv4.icmp_msgs_per_sec = 100                   # vps-mgmt-hardening (全局 ICMP/s 上限)
-net.ipv4.icmp_msgs_limit_per_sec = 100             # vps-mgmt-hardening
-net.ipv4.tcp_syncookies = 1                        # vps-mgmt-hardening (防 SYN 洪水)
-net.ipv4.conf.all.rp_filter = 1                    # vps-mgmt-hardening (反源地址欺骗)
-net.ipv4.conf.default.rp_filter = 1                # vps-mgmt-hardening
-EOF
-					if sysctl -p >/tmp/harden-apply.log 2>&1; then
-						local v1 v2 v3
-						v1=$(sysctl -n net.ipv4.icmp_ratelimit 2>/dev/null)
-						v2=$(sysctl -n net.ipv4.icmp_msgs_limit_per_sec 2>/dev/null)
-						v3=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null)
-						echo -e "${G}已应用${N} icmp_ratelimit=${v1} icmp_limit=${v2}/s syncookies=${v3}"
-						echo -e "${X}ICMP 现被内核限速，洪水不再能吃满 CPU。少量 ping 正常。${N}"
-					else
-						echo -e "${R}应用失败${N}"; cat /tmp/harden-apply.log
-					fi
-				}
-				pause ;;
-			2) echo -e "\n${C}=== 内核网络参数 ===${N}"
-				sysctl net.ipv4.icmp_echo_ignore_bogus_responses net.ipv4.icmp_ratelimit \
-					net.ipv4.icmp_msgs_limit_per_sec net.ipv4.tcp_syncookies \
-					net.ipv4.conf.all.rp_filter net.ipv4.tcp_max_syn_backlog 2>/dev/null | sed 's/^/  /'
-				pause ;;
-			3) confirm "恢复内核网络默认? (删除本工具添加的硬化参数)" || { pause; continue; }
-				sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-				sysctl -p >/dev/null 2>&1
-				echo -e "${G}已清理本工具添加的硬化参数${N}"
-				pause ;;
-			0) break ;;
-			*) echo -e "${R}无效${N}"; sleep 1 ;;
-		esac
-	done
-}
-
 # ---------- SWAP 管理 ----------
 manage_swap(){
 	while true; do
@@ -788,8 +713,7 @@ uninstall(){
 	has_cmd fail2ban-client && echo -e "  ${Y}2.${N} 卸载 Fail2ban"
 	echo -e "  ${Y}3.${N} 清理 BBR 参数"
 	echo -e "  ${Y}4.${N} 清理 SWAP"
-	echo -e "  ${Y}5.${N} 清理网络加固参数"
-	echo -e "  ${R}6.${N} 一键全部卸载"
+	echo -e "  ${R}5.${N} 一键全部卸载"
 	echo -e "  ${X}0. 返回主菜单${N}"
 	read -r -p "请选择: " c
 	case $c in
@@ -840,12 +764,7 @@ uninstall(){
 				echo -e "${R}清理失败或仍有残留${N}"
 			fi
 			pause ;;
-		5) confirm "清理网络加固参数?" || return
-			sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-			sysctl -p >/dev/null 2>&1
-			echo -e "${G}已清理本工具添加的网络硬化参数${N}"
-			pause ;;
-		6) echo -e "${R}即将执行: 卸载 UFW + Fail2ban + 清理 BBR + SWAP + 网络加固${N}"
+		5) echo -e "${R}即将执行: 卸载 UFW + Fail2ban + 清理 BBR + SWAP${N}"
 			confirm "确认?" || return
 			confirm "再次确认? (不可逆)" || return
 			# UFW
@@ -878,10 +797,6 @@ uninstall(){
 			sed -i '/vm.swappiness/d' /etc/sysctl.conf
 			sysctl -p >/dev/null 2>&1
 			$swok && ! swapon --show 2>/dev/null | grep -q '/swapfile' && echo -e "SWAP: ${G}已清理${N}" || echo -e "SWAP: ${R}清理失败${N}"
-			# 网络加固
-			sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-			sysctl -p >/dev/null 2>&1
-			echo -e "网络加固: ${G}已清理${N}"
 			# 清除状态文件
 			rm -f "$STATE_FILE"
 			echo -e "\n${G}全部完成${N}"; pause ;;
@@ -907,14 +822,13 @@ while true; do
 	echo -e "  ${Y}3.${N} Fail2ban 安全管理"
 	echo -e "  ${Y}4.${N} BBR 加速管理"
 	echo -e "  ${Y}5.${N} SWAP 虚拟内存管理"
-	echo -e "  ${Y}6.${N} 网络加固 (ICMP/SYN 防护)"
-	echo -e "  ${Y}7.${N} ${R}卸载与清理${N}"
+	echo -e "  ${Y}6.${N} ${R}卸载与清理${N}"
 	echo -e "  ${R}0. 退出${N}"
 	echo -e "${C}========================================${N}"
 	read -r -p "请选择: " c
 	case $c in
 		1) install_basics;; 2) manage_ufw;; 3) manage_fail2ban;;
-		4) manage_bbr;;    5) manage_swap;; 6) manage_hardening;; 7) uninstall;;
+		4) manage_bbr;;    5) manage_swap;; 6) uninstall;;
 		0) echo -e "\n${G}再见${N}"; exit 0;;
 		*) echo -e "\n${R}无效${N}"; sleep 1;;
 	esac
