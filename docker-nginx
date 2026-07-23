@@ -726,9 +726,8 @@ server {
     return 301 https://\$host:8443\$request_uri;
 }
 server {
-    listen 8443 ssl;
-    listen [::]:8443 ssl;
-    http2 on;
+    listen 8443 ssl http2;
+    listen [::]:8443 ssl http2;
     server_name ${domain};
 
     ssl_certificate     ${cert_path}/fullchain.pem;
@@ -926,17 +925,9 @@ gen_random_email(){
 
 # 首次签发证书时让用户配置一个真实的公开邮箱域名（QQ/163/Gmail 等），后续复用
 acme_set_email_domain(){
+  # 固定使用 gmail.com 作为账户邮箱域名（公开 TLD，LE 接受）
   [ -n "$ACME_EMAIL_DOMAIN" ] && return 0
-  ui_header "配置证书账户邮箱域名"
-  info "Let's Encrypt 要求账户邮箱使用公开 TLD（如 gmail.com / qq.com / 163.com）"
-  info "本地随机生成前缀，@ 后的域名需要你提供一个真实的公开邮箱域名"
-  local d
-  read -rp "  邮箱域名（默认 gmail.com）: " d
-  [ -z "$d" ] && d="gmail.com"
-  # 简单校验: 必须含点、只允许字母数字点
-  [[ "$d" =~ ^[A-Za-z0-9.]+$ ]] && [[ "$d" == *.* ]] || { err "域名格式无效"; return 1; }
-  ACME_EMAIL_DOMAIN="$d"; save_conf
-  ok "邮箱域名: $d"
+  ACME_EMAIL_DOMAIN="gmail.com"; save_conf
 }
 
 # 读取 / 保存 Cloudflare API Token（单份文件 600，覆盖式）
@@ -1084,14 +1075,12 @@ acme_toggle_cron(){
 }
 
 acme_reset_account(){
-  ui_header "重置 acme.sh 账户"
-  warn "将删除 ~/.acme.sh 下的账户与证书记录（已安装的 /etc/nginx/ssl 证书不动）"
-  warn "用于账户注册失败、邮箱被 LE 拒绝后重置"
-  ask_yn "确认重置？" "n" || return 0
-  # 保留 ca 设置，删除账户 key 与注册信息，强制下次重新注册
+  ui_header "清理 acme.sh 账户"
+  warn "删除 ~/.acme.sh 账户与证书记录，强制下次重新注册"
+  ask_yn "确认清理？" "y" || return 0
   "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" >/dev/null 2>&1 || true
   rm -rf "$ACME_HOME/ca" "$ACME_HOME/account.conf" 2>/dev/null
-  ok "账户已重置，下次申请证书将重新注册"
+  ok "账户已清理，下次申请证书将重新注册"
   pause
 }
 
@@ -1108,7 +1097,7 @@ acme_menu(){
     ui_section "续期"
     ui_item2 4 "测试续期" 5 "立即续期"
     ui_item 6 "续期 cron"; printf '\n'
-    ui_item 7 "重置账户"; printf '\n'
+    ui_item 7 "清理账户"; printf '\n'
     ui_return
     menu_prompt 7; c="$REPLY"
     case "$c" in
