@@ -45,7 +45,16 @@ svc_is_active(){ systemctl is-active --quiet "$1"; }
 # ---------- 状态显示 ----------
 ufw_st(){ has_cmd ufw || { echo -e "${X}未安装${N}"; return; }; local e; e=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2); [ "${e^^}" = "YES" ] && echo -e "${G}运行中${N}" || echo -e "${Y}已停止${N}"; }
 f2b_st(){ has_cmd fail2ban-client || { echo -e "${X}未安装${N}"; return; }; if fail2ban-client ping >/dev/null 2>&1; then local c; c=$(fail2ban-client status 2>/dev/null | awk -F: '/Number of jail/{gsub(/[ \t]/,"",$2);print $2}'); echo -e "${G}运行中${N} (Jail: ${c:-0})"; else echo -e "${Y}已停止${N}"; fi; }
-bbr_st(){ local cc qd; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null); qd=$(sysctl -n net.core.default_qdisc 2>/dev/null); [ "$cc" = "bbr" ] && [ "$qd" = "fq" ] && echo -e "${G}已开启${N}" || echo -e "${X}未开启${N}"; }
+bbr_st(){
+	local cc qd
+	cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+	qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+	if [ "$cc" = "bbr" ] && [ "$qd" = "fq" ]; then
+		echo -e "${G}已开启${N}"
+	else
+		echo -e "${X}未开启${N}"
+	fi
+}
 swap_st(){ local t s; t=$(free 2>/dev/null | awk '/Swap/{print $2}'); if [ -n "$t" ] && [ "$t" -gt 0 ] 2>/dev/null; then s=$(free -h 2>/dev/null | awk '/Swap/{print $2}'); echo -e "${G}已启用${N} (${s})"; else echo -e "${X}未启用${N}"; fi; }
 
 # ---------- 探测函数 ----------
@@ -611,26 +620,61 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 EOF
-					apply_bbr
+					apply_bbr advanced
 				}
 				pause ;;
-			3) echo -e "\n${C}=== 状态详情 ===${N}"
-				echo -e "拥塞控制: ${C}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${N}"
-				echo -e "队列调度: ${C}$(sysctl -n net.core.default_qdisc 2>/dev/null)${N}"
-				echo -e "可用算法: ${C}$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)${N}"
-				# qdisc 生效检查
-				local iface; iface=$(ip route show default 2>/dev/null | awk '{print $5;exit}')
-				[ -n "$iface" ] && echo -e "主网卡($iface) qdisc: ${C}$(tc qdisc show dev "$iface" 2>/dev/null | head -1)${N}"
-				lsmod 2>/dev/null | grep -q bbr && echo -e "内核模块: ${G}已加载${N}" || echo -e "内核模块: ${Y}未单独加载${N} (算法为 bbr 则已生效，bbr 可能内置编译)"
-				sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_fastopen 2>/dev/null | sed 's/^/  /'
-				echo -e "${X}提示: bbr 经 sysctl -p 写入内核立即生效，无需重启。default_qdisc=fq 对新连接的网卡生效；旧接口需 tc qdisc replace 才立即切换。${N}"
+			3) echo -e "\n${C}=== BBR 状态详情 ===${N}"
+				local cc qd avail
+				cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+				qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+				avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+				echo -e "拥塞控制: ${C}${cc}${N} $([ "$cc" = "bbr" ] && echo -e "${G}✓${N}" || echo -e "${R}✗${N}")"
+				echo -e "队列调度: ${C}${qd}${N} $([ "$qd" = "fq" ] && echo -e "${G}✓${N}" || echo -e "${R}✗${N}")"
+				echo -e "可用算法: ${C}${avail}${N}"
+				if echo "$avail" | grep -qw bbr; then
+					echo -e "BBR 支持: ${G}是${N}"
+				else
+					echo -e "BBR 支持: ${R}否（内核不支持 bbr，需升级到 ≥4.9）${N}"
+				fi
+				# 所有 UP 网卡的 qdisc 实际状态
+				echo -e "\n网卡 qdisc 实际状态:"
+				local iface
+				for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo' | grep -v '@'); do
+					local qdisc_line; qdisc_line=$(tc qdisc show dev "$iface" 2>/dev/null | head -1)
+					local qdisc_ok="✗"
+					echo "$qdisc_line" | grep -qw fq && qdisc_ok="✓"
+					echo -e "  ${iface}: ${C}${qdisc_line:-无}${N} ${G}${qdisc_ok}${N}"
+				done
+				# 内核模块
+				if lsmod 2>/dev/null | grep -q bbr; then
+					echo -e "\n内核模块: ${G}tcp_bbr 已加载${N}"
+				elif echo "$avail" | grep -qw bbr; then
+					echo -e "\n内核模块: ${G}bfr 内置编译（无需模块）${N}"
+				else
+					echo -e "\n内核模块: ${R}未加载且非内置${N}"
+				fi
+				# 进阶参数（如果启用过）
+				echo -e "\n进阶 TCP 参数:"
+				sysctl net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle 2>/dev/null | sed 's/^/  /'
+				if [ -n "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)" ] && [ "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)" != "0" ]; then
+					echo -e "  ${G}进阶调优已启用${N}"
+				else
+					echo -e "  ${X}进阶调优未启用${N}"
+				fi
 				pause ;;
 			4) confirm "恢复兼容默认 (cubic)?" && {
+				# 清理残留硬化参数（已废弃的网络加固写入的行）
+				sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
 				sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
 				echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-				sysctl -p >/tmp/bbr-apply.log 2>&1 || true
+				sysctl -w net.ipv4.tcp_congestion_control=cubic 2>/dev/null
+				sysctl -w net.core.default_qdisc=fq_codel 2>/dev/null
+				# 恢复网卡 qdisc
+				for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo' | grep -v '@'); do
+					tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
+				done
 				local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-				[ "$ncc" = "cubic" ] && { echo -e "${G}已恢复为 cubic${N}"; state_clear_bbr; } || { echo -e "${R}恢复失败${N}"; cat /tmp/bbr-apply.log; }
+				[ "$ncc" = "cubic" ] && { echo -e "${G}已恢复为 cubic${N}"; state_clear_bbr; } || echo -e "${R}恢复失败${N}"
 			}; pause ;;
 			0) break ;;
 			*) echo -e "${R}无效${N}"; sleep 1 ;;
@@ -638,26 +682,71 @@ EOF
 	done
 }
 
-# BBR 应用 + 真实验证（含 qdisc 即时切换）
+# BBR 应用 + 逐参数真实验证
+# 用 sysctl -w 精确写入每个参数并逐一验证，不用 sysctl -p 全量加载
+# $1=advanced 时写入进阶 TCP 调优参数
 apply_bbr(){
-	if ! sysctl -p >/tmp/bbr-apply.log 2>&1; then
-		echo -e "${R}sysctl -p 出错${N}"; cat /tmp/bbr-apply.log; return 1
-	fi
-	local ncc nqd; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null); nqd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-	if [ "$ncc" = "bbr" ] && [ "$nqd" = "fq" ]; then
-		echo -e "${G}BBR 已开启${N} (cc=$ncc qdisc=$nqd)"
-		# 即时把当前主网卡的 qdisc 切换为 fq（仅对新连接生效）
-		local iface; iface=$(ip route show default 2>/dev/null | awk '{print $5;exit}')
-		if [ -n "$iface" ]; then
-			tc qdisc replace dev "$iface" root fq 2>/dev/null && echo -e "${G}主网卡 $iface qdisc 已即时切换为 fq${N}" || echo -e "${Y}主网卡 $iface qdisc 即时切换失败（不影响 bbr 本身，重启后对新接口生效）${N}"
-		fi
-		state_set_bbr
-		echo -e "${X}bbr 经 sysctl 即时生效，无需重启。已建立 TCP 连接不受影响，新连接使用 bbr。${N}"
-	else
-		echo -e "${R}开启失败${N} (cc=$ncc qdisc=$nqd)"
-		cat /tmp/bbr-apply.log
+	local advanced="$1" err=0
+	# 逐个写入 + 逐个验证，任何一个失败都标记
+	sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || err=1
+	sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || err=1
+
+	# 读回验证核心两个参数
+	local ncc nqd
+	ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+	nqd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+	if [ "$ncc" != "bbr" ] || [ "$nqd" != "fq" ]; then
+		echo -e "${R}核心参数写入失败${N} cc=${ncc:-空} qdisc=${nqd:-空}"
+		[ "$err" -ne 0 ] && echo -e "${R}sysctl -w 返回错误，内核可能不支持 bbr${N}"
 		return 1
 	fi
+
+	# 进阶模式：写入额外 TCP 参数并逐个验证
+	if [ "$advanced" = "advanced" ]; then
+		local aerr=0
+		sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || aerr=1
+		sysctl -w "net.ipv4.tcp_rmem=4096 87380 67108864" >/dev/null 2>&1 || aerr=1
+		sysctl -w "net.ipv4.tcp_wmem=4096 65536 67108864" >/dev/null 2>&1 || aerr=1
+		sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || aerr=1
+		sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || aerr=1
+		if [ "$aerr" -ne 0 ]; then
+			echo -e "${Y}部分进阶参数写入失败，但 BBR 核心已生效${N}"
+		else
+			echo -e "${G}进阶 TCP 调优参数已全部生效${N}"
+		fi
+	fi
+
+	# qdisc 即时切换：遍历所有 UP 的物理网卡（不只是默认路由网卡）
+	local iface apply_ok=0 apply_fail=0
+	for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo' | grep -v '@'); do
+		if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
+			apply_ok=$((apply_ok+1))
+		else
+			apply_fail=$((apply_fail+1))
+		fi
+	done
+	if [ "$apply_ok" -gt 0 ]; then
+		echo -e "${G}qdisc=fq 已应用到 ${apply_ok} 个网卡${N}"
+	elif [ "$apply_fail" -gt 0 ]; then
+		echo -e "${Y}qdisc 即时切换失败（不影响 bbr 拥塞控制生效，重启后对新接口自动应用 fq）${N}"
+ fi
+
+	# 最终综合验证：确认 bbr 确实是当前活跃算法
+	local avail; avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+	if ! echo "$avail" | grep -qw bbr; then
+		echo -e "${R}警告: 内核可用算法列表中无 bbr，bbr 可能未真正生效${N}"
+		echo -e "${X}可用算法: $avail${N}"
+		return 1
+	fi
+
+	echo -e "${G}BBR 已确认开启并生效${N}"
+	echo -e "  拥塞控制: ${C}$ncc${N}  队列调度: ${C}$nqd${N}"
+	echo -e "  可用算法: ${C}$avail${N}"
+	local iface; iface=$(ip route show default 2>/dev/null | awk '{print $5;exit}')
+	[ -n "$iface" ] && echo -e "  主网卡 $iface: ${C}$(tc qdisc show dev "$iface" 2>/dev/null | head -1)${N}"
+	state_set_bbr
+	echo -e "${X}无需重启，新 TCP 连接即使用 bbr。${N}"
+	return 0
 }
 
 # ---------- SWAP 管理 ----------
@@ -693,7 +782,7 @@ manage_swap(){
 				if ! swapon /swapfile 2>/dev/null; then echo -e "${R}swapon 失败${N}"; rm -f /swapfile; pause; continue; fi
 				echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
 				sed -i '/vm.swappiness/d' /etc/sysctl.conf; echo "vm.swappiness=$sv" >> /etc/sysctl.conf
-				sysctl -p >/dev/null 2>&1
+				sysctl -w "vm.swappiness=$sv" >/dev/null 2>&1
 				# 验证
 				if [ "$(free 2>/dev/null | awk '/Swap/{print $2}')" -gt 0 ] 2>/dev/null; then
 					echo -e "${G}创建成功${N} $(free -h 2>/dev/null | awk '/Swap/{print "Swap: "$2}')"
@@ -711,7 +800,7 @@ manage_swap(){
 					fi
 					sed -i '/^\/swapfile\s/d' /etc/fstab
 					sed -i '/vm.swappiness/d' /etc/sysctl.conf
-					sysctl -p >/dev/null 2>&1
+					sysctl -w vm.swappiness=60 >/dev/null 2>&1
 					if $ok && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
 						echo -e "${G}已删除${N}"; state_clear_swap
 					else
@@ -762,9 +851,11 @@ uninstall(){
 			rm -f /var/log/fail2ban.log 2>/dev/null
 			pause ;;
 		3) confirm "清理所有 BBR/TCP 调优参数? (恢复 cubic 默认)" || return
+			# 先清理残留的硬化参数（已废弃的网络加固功能写入的行）
+			sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
 			sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
 			echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-			sysctl -p >/dev/null 2>&1
+			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
 			local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 			[ "$ncc" = "cubic" ] && { echo -e "${G}已清理 (cc=$ncc)${N}"; state_clear_bbr; } || echo -e "${R}清理后验证失败${N}"
 			pause ;;
@@ -775,7 +866,7 @@ uninstall(){
 			fi
 			sed -i '/^\/swapfile\s/d' /etc/fstab
 			sed -i '/vm.swappiness/d' /etc/sysctl.conf
-			sysctl -p >/dev/null 2>&1
+			sysctl -w vm.swappiness=60 >/dev/null 2>&1
 			if $ok && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
 				echo -e "${G}已清理${N}"; state_clear_swap
 			else
@@ -801,9 +892,10 @@ uninstall(){
 				TOOL_JAILS=""; TOOL_FILTERS=""
 			fi
 			# BBR
+			sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
 			sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
 			echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-			sysctl -p >/dev/null 2>&1
+			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
 			local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 			[ "$ncc" = "cubic" ] && echo -e "BBR: ${G}已清理${N}" || echo -e "BBR: ${R}清理失败${N}"
 			# SWAP
@@ -813,7 +905,7 @@ uninstall(){
 			fi
 			sed -i '/^\/swapfile\s/d' /etc/fstab
 			sed -i '/vm.swappiness/d' /etc/sysctl.conf
-			sysctl -p >/dev/null 2>&1
+			sysctl -w vm.swappiness=60 >/dev/null 2>&1
 			$swok && ! swapon --show 2>/dev/null | grep -q '/swapfile' && echo -e "SWAP: ${G}已清理${N}" || echo -e "SWAP: ${R}清理失败${N}"
 			# 清除状态文件
 			rm -f "$STATE_FILE"
