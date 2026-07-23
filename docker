@@ -230,6 +230,12 @@ singbox_listener_ok(){
   ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
 }
 
+port_owned_by(){
+  local port="$1" process="$2"
+  valid_port "$port" || return 1
+  ss -H -ltnp "sport = :$port" 2>/dev/null | grep -Fq "((\"$process\""
+}
+
 sni_conf_path(){
   if [ -f /etc/nginx/stream.conf ]; then echo /etc/nginx/stream.conf
   elif [ -f /etc/nginx/conf.d/stream.conf ]; then echo /etc/nginx/conf.d/stream.conf
@@ -246,6 +252,31 @@ nginx_reload_checked(){
   nginx -t >/dev/null 2>&1 || { err "Nginx 配置校验失败"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; return 1; }
   systemctl reload nginx >/dev/null 2>&1 || { err "Nginx 重载失败"; return 1; }
   systemctl is-active --quiet nginx || { err "Nginx 重载后未运行"; return 1; }
+}
+
+sni_values(){
+  local f; f=$(sni_conf_path)
+  SNI_WEB_PORT=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$f" 2>/dev/null | sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+  SNI_SB_PORT=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$f" 2>/dev/null | sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
+  SNI_DOMAINS=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$f" 2>/dev/null | sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
+}
+
+sni_runtime_ok(){
+  sni_values
+  sni_loaded && nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx &&
+    port_owned_by 443 nginx && port_owned_by "$SNI_WEB_PORT" nginx && port_owned_by "$SNI_SB_PORT" sing-box
+}
+
+sni_summary(){
+  sni_values
+  local entry="未监听" web="未监听" sb="未监听"
+  port_owned_by 443 nginx && entry="Nginx stream / 已监听"
+  port_owned_by "$SNI_WEB_PORT" nginx && web="Nginx HTTPS / 已监听"
+  port_owned_by "$SNI_SB_PORT" sing-box && sb="sing-box / 已监听"
+  printf '  %-14s %s\n' "公网入口" "443  ${entry}"
+  printf '  %-14s %s\n' "HTTPS 内部" "${SNI_WEB_PORT:-未识别}  ${web}"
+  printf '  %-14s %s\n' "反代域名" "${SNI_DOMAINS:-无}"
+  printf '  %-14s %s\n' "Reality 内部" "${SNI_SB_PORT:-未识别}  ${sb}"
 }
 
 collect_compose_files(){
@@ -1250,7 +1281,8 @@ EOF
   fi
   mv -f "$config_tmp" "$SINGBOX_CONF"
 
-  cat > "$SINGBOX_SECRETS" <<EOF
+  local secrets_tmp; secrets_tmp=$(mktemp /root/singbox-secrets.txt.tmp.XXXXXX) || { err "无法创建密钥资料临时文件"; return 1; }
+  cat > "$secrets_tmp" <<EOF
 UUID: ${uuid}
 PrivateKey: ${priv_key}
 PublicKey: ${pub_key}
@@ -1260,9 +1292,10 @@ ListenPort: ${sb_port}
 ClientPort: ${client_port}
 UseSNISplit: ${use_sni}
 EOF
-  chmod 600 "$SINGBOX_SECRETS"
+  chmod 600 "$secrets_tmp"
+  mv -f "$secrets_tmp" "$SINGBOX_SECRETS"
 
-  ok "配置已生成并通过校验"
+  ok "配置已生成 | 端口 ${sb_port} | SNI ${sni}"
 }
 
 create_singbox_service(){
@@ -1291,6 +1324,11 @@ setup_singbox(){
   local force_sni="${1:-}" use_sni="y" port
   ui_header "sing-box 安装 / 配置"
   install_singbox || { pause; return 1; }
+  if [ -f "$SINGBOX_CONF" ]; then
+    warn "将覆盖现有配置并更换 UUID、Reality 密钥和 Short ID"
+    info "只保留 $SINGBOX_CONF 和 $SINGBOX_SECRETS 各一份，不生成历史副本"
+    ask_yn "继续生成新配置？旧客户端将立即失效" "n" || { pause; return 0; }
+  fi
   generate_singbox_config "$force_sni" || { err "配置生成失败，未启动服务"; pause; return 1; }
   if ! sing-box check -c "$SINGBOX_CONF" >/dev/null 2>&1; then
     err "sing-box 配置校验失败，未启动服务"
@@ -1402,6 +1440,9 @@ singbox_show_client(){
   python3 - <<'PYEOF'
 import json
 import urllib.request
+import urllib.parse
+import subprocess
+import re
 import sys
 import os
 
@@ -1419,16 +1460,31 @@ except Exception as e:
     print(f"  {RED}[ERROR]{NC} 无法读取配置文件: {e}")
     sys.exit(1)
 
-# 获取保存的公钥，防止手动修改私钥后缺失反推
+# 公钥来自生成时的密钥资料；只有其私钥与当前 JSON 完全一致才可信。
 pub_key = ""
-use_sni_split = "y"
+saved_private_key = ""
 if os.path.exists(SECRETS_PATH):
     with open(SECRETS_PATH, 'r') as f:
         for line in f:
             if line.startswith("PublicKey:"):
                 pub_key = line.split(":", 1)[1].strip()
-            elif line.startswith("UseSNISplit:"):
-                use_sni_split = line.split(":", 1)[1].strip()
+            elif line.startswith("PrivateKey:"):
+                saved_private_key = line.split(":", 1)[1].strip()
+
+# 外部入口以当前 stream 配置和实际监听为准，不读取历史模式标记。
+sni_split_active = False
+stream_path = next((p for p in ("/etc/nginx/stream.conf", "/etc/nginx/conf.d/stream.conf") if os.path.isfile(p)), "")
+stream_sb_port = ""
+if stream_path:
+    try:
+        text = open(stream_path).read()
+        match = re.search(r'upstream\s+singbox\s*\{[^}]*127\.0\.0\.1:(\d+)', text, re.S)
+        stream_sb_port = match.group(1) if match else ""
+        listeners = subprocess.run(["ss", "-H", "-ltnp", "sport = :443"], capture_output=True, text=True).stdout
+        nginx_conf = open("/etc/nginx/nginx.conf").read()
+        sni_split_active = bool(stream_sb_port and 'nginx' in listeners and f"include {stream_path};" in nginx_conf)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 # 获取 VPS 公网 IP
 vps_ip = "你的VPS_IP"
@@ -1457,8 +1513,8 @@ for idx, inbound in enumerate(inbounds):
     listen_port = inbound.get("listen_port", 0)
     listen_ip = inbound.get("listen", "0.0.0.0")
 
-    # 确定客户端连接的实际外网端口
-    client_port = "443" if use_sni_split == "y" else str(listen_port)
+    # 只有当前 443 stream 已加载且指向本入站端口时，外部端口才是 443。
+    client_port = "443" if sni_split_active and stream_sb_port == str(listen_port) else str(listen_port)
 
     print(f"\n  {BOLD}📍 协议模块: {proto_type.upper()} ({tag}) {NC}")
     print(f"  ────────────────────────────────────────")
@@ -1468,6 +1524,8 @@ for idx, inbound in enumerate(inbounds):
         tls_conf = inbound.get("tls", {})
         reality_conf = tls_conf.get("reality", {})
         is_reality = reality_conf.get("enabled", False)
+        current_private_key = reality_conf.get("private_key", "")
+        key_material_ok = bool(current_private_key and saved_private_key and current_private_key == saved_private_key and pub_key)
         sni = tls_conf.get("server_name", "未配置")
         
         # 提取 short_id
@@ -1496,15 +1554,27 @@ for idx, inbound in enumerate(inbounds):
                 print(f"    SNI 伪装: {GREEN}{sni}{NC}")
                 print(f"    公钥 PBK: {GREEN}{pub_key}{NC}")
                 print(f"    Short ID: {GREEN}{short_id}{NC}")
-                print(f"    分流复用: {GREEN}{'启用 (通过443转发)' if use_sni_split == 'y' else '禁用 (直接连接端口)'}{NC}")
+                print(f"    分流入口: {GREEN}{'443 / Nginx stream（已验证）' if sni_split_active and stream_sb_port == str(listen_port) else '未验证，使用配置监听端口'}{NC}")
                 
-                # 拼接标准的 vless reality 链接
-                vless_link = f"vless://{uuid}@{vps_ip}:{client_port}?encryption=none"
-                if flow:
-                    vless_link += f"&flow={flow}"
-                vless_link += f"&security=reality&sni={sni}&pbk={pub_key}&sid={short_id}#VLESS-Reality-{name}"
-                
-                print(f"\n    {CYAN}👉 节点链接:{NC}")
+                # Reality 客户端必须携带指纹和传输类型；缺少 fp 时部分客户端会导入成无效握手。
+                if not key_material_ok:
+                    print(f"\n    {RED}[ERROR]{NC} 当前 config.json 与密钥资料不同步，拒绝生成节点链接。请重新生成配置，或同步正确的 PublicKey。\n")
+                    continue
+                params = {
+                    "encryption": "none",
+                    "flow": flow,
+                    "security": "reality",
+                    "sni": sni,
+                    "fp": "chrome",
+                    "pbk": pub_key,
+                    "sid": short_id,
+                    "type": "tcp",
+                }
+                query = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+                label = urllib.parse.quote(f"VLESS-Reality-{name}")
+                vless_link = f"vless://{uuid}@{vps_ip}:{client_port}?{query}#{label}"
+
+                print(f"\n    {CYAN}节点链接:{NC}")
                 print(f"    {CYAN}{vless_link}{NC}\n")
             else:
                 print(f"    安全传输: {GREEN}无安全防护/普通TLS{NC}")
@@ -1655,14 +1725,7 @@ ensure_stream_module(){
 }
 
 setup_sni_split(){
-  ui_header "配置 Nginx SNI 分流"
-  info "Nginx 接管 443，按 SNI 分流:"
-  echo "    匹配的域名 → Nginx Web 反代（内部端口）"
-  echo "    其他流量   → sing-box Reality（${SINGBOX_PORT}）"
-  echo
-  info "「Web 域名」= 哪些域名走网站（不写就都走 sing-box）"
-  info "这些域名必须和反代站点里的 server_name 一致"
-  echo
+  ui_header "配置 SNI 分流"
 
   if ! ensure_stream_module; then
     err "stream 模块不可用，无法配置 SNI 分流"
@@ -1691,24 +1754,9 @@ setup_sni_split(){
     info "已检测真实 HTTPS 上游: 127.0.0.1:${https_port}"
   fi
   if grep -q 'stream.conf' "$ng_conf" 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
-    ok "已有 SNI 分流配置"
-    echo
-    echo "  当前 Web 域名:"
-    local target_file="/etc/nginx/stream.conf"
-    [ -f "$target_file" ] || target_file="$ng_conf"
-    local current_domains
-    current_domains=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/^[[:space:]]*([A-Za-z0-9.-]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
-    printf '    %s\n' "${current_domains:-（无）}"
-    local cur_web_port cur_sb_port
-    cur_web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-    cur_sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$target_file" 2>/dev/null | sed -nE 's/.*server[[:space:]]+127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-    ui_section "当前分流状态"
-    printf '  %-16s %s\n' "公网入口" "443 (Nginx stream)"
-    printf '  %-16s %s\n' "Web 内部端口" "${cur_web_port:-未识别}"
-    printf '  %-16s %s\n' "sing-box 端口" "${cur_sb_port:-未识别}"
-    printf '  %-16s %s\n' "Web 域名" "${current_domains:-未识别}"
-    ui_hint "回车保持当前配置；输入 y 才会重新生成分流配置。"
-    ask_yn "是否重新配置 SNI 分流？" "n" || return 0
+    ui_status "$([ "$(sni_runtime_ok; echo $?)" -eq 0 ] && echo "已生效" || echo "配置存在 / 未完全生效")"
+    sni_summary
+    ask_yn "重新生成分流配置？" "n" || return 0
   fi
 
   local nginx_backup; nginx_backup=$(mktemp) || { err "无法创建临时回滚文件"; pause; return 1; }
@@ -1772,9 +1820,8 @@ SNIEOF
 
   if nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
     rm -f "$nginx_backup" "$sni_backup"
-    ok "SNI 配置已校验、加载并确认 443 正在监听"
-    info "对外 443 → Web ${https_port} / sing-box ${SINGBOX_PORT}"
-    info "Web 域名: ${web_domains:-（无，全部进入 sing-box）}"
+    ui_status "已生效"
+    sni_summary
   else
     err "SNI 配置未生效，恢复原 Nginx 配置"
     nginx -t 2>&1 | head -8 | sed 's/^/  /'
@@ -1785,38 +1832,26 @@ SNIEOF
     pause; return 1
   fi
   pause
-  pause
 }
 
 sni_status(){
   ui_header "SNI 分流状态"
-  local f web_port sb_port domains listener
-  f=$(sni_conf_path)
-  web_port=$(sed -n '/upstream web[[:space:]]*{/,/}/p' "$f" 2>/dev/null | sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-  sb_port=$(sed -n '/upstream singbox[[:space:]]*{/,/}/p' "$f" 2>/dev/null | sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' | head -1)
-  domains=$(sed -n '/map \$ssl_preread_server_name/,/}/p' "$f" 2>/dev/null | sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+web;.*/\1/p' | paste -sd ' ' -)
-  listener=$(ss -H -ltnp 'sport = :443' 2>/dev/null | head -1)
-  if sni_loaded && nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx && [ -n "$listener" ]; then
-    ui_status "已生效（配置已加载、Nginx active、443 正在监听）"
-  elif [ -f "$f" ]; then
-    ui_status "未确认生效（配置文件存在，但加载/服务/监听至少一项异常）"
-  else
-    ui_status "未配置"
-  fi
-  printf '  %-14s %s\n' "配置文件" "$([ -f "$f" ] && echo "$f" || echo 不存在)"
-  printf '  %-14s %s\n' "Web 上游" "${web_port:-未识别}"
-  printf '  %-14s %s\n' "sing-box 上游" "${sb_port:-未识别}"
-  printf '  %-14s %s\n' "Web 域名" "${domains:-无}"
-  printf '  %-14s %s\n' "443 监听" "${listener:-未监听}"
+  local f; f=$(sni_conf_path)
+  if sni_runtime_ok; then ui_status "已生效"; elif [ -f "$f" ]; then ui_status "配置存在 / 未完全生效"; else ui_status "未配置"; fi
+  sni_summary
   pause
 }
 
 sni_reload(){
-  if ! sni_loaded; then err "未检测到已加载的 SNI 配置"; pause; return 1; fi
-  if nginx_reload_checked && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
-    ok "SNI 配置已验证、重载并确认 443 监听"
+  ui_header "重载 SNI 分流"
+  if ! sni_loaded; then err "未检测到已加载的分流配置"; pause; return 1; fi
+  if nginx_reload_checked && sni_runtime_ok; then
+    ui_status "已生效"
+    sni_summary
   else
-    err "SNI 配置未确认生效"
+    ui_status "未完全生效"
+    sni_summary
+    pause; return 1
   fi
   pause
 }
@@ -1858,15 +1893,12 @@ sni_delete(){
 sni_menu(){
   while true; do
     ui_header "SNI 分流管理"
-    if sni_loaded && systemctl is-active --quiet nginx && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
-      ui_status "已生效"
-    elif [ -f /etc/nginx/stream.conf ]; then ui_status "配置存在 / 未确认生效"
-    else ui_status "未配置"; fi
-    ui_section "配置与验证"
-    ui_item2 1 "查看真实状态" 2 "配置 / 重建"
-    ui_item2 3 "验证并重载" 4 "删除分流"
+    if sni_runtime_ok; then ui_status "${GREEN}已生效${NC}"; elif [ -f "$(sni_conf_path)" ]; then ui_status "${YELLOW}未完全生效${NC}"; else ui_status "未配置"; fi
+    sni_summary
+    ui_section "操作"
+    ui_item2 1 "刷新状态" 2 "生成配置"
+    ui_item2 3 "重载验证" 4 "删除配置"
     ui_return
-    ui_hint "成功状态要求配置已加载、Nginx 运行且 443 实际监听。"
     menu_prompt 4; c="$REPLY"
     case "$c" in 1) sni_status ;; 2) setup_sni_split ;; 3) sni_reload ;; 4) sni_delete ;; 0) return ;; *) warn "请输入 0-4"; pause ;; esac
   done
