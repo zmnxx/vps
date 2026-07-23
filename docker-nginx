@@ -383,14 +383,12 @@ install_acme(){
   if [ -x "$ACME_BIN" ]; then ok "acme.sh 已安装"; return 0; fi
   info "安装 acme.sh..."
   apt-get install -y -qq curl socat >/dev/null 2>&1 || true
-  curl -fsSL https://get.acme.sh | sh -s email=$(gen_random_email "acme.local") >/dev/null 2>&1 \
+  # 安装时不注册账户（用 .local 这类非公开 TLD 会被 LE 拒绝）
+  # 账户在实际签发第一张证书时按证书主域名生成有效邮箱注册（acme_issue 传 -m）
+  curl -fsSL https://get.acme.sh | sh -s --nocron >/dev/null 2>&1 \
     || { err "acme.sh 安装失败"; return 1; }
-  # 安装目录 /root/.acme.sh/，acme.sh 自动注册并写入 ~/.bashrc alias
-  # 切换默认 CA 到 Let's Encrypt
   "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" >/dev/null 2>&1 || true
-  # 安装自动续期 cron（acme.sh 自身管理，续期后调用 reloadcmd）
-  "$ACME_BIN" --install-cronjob >/dev/null 2>&1 || true
-  ok "acme.sh 安装完成"
+  ok "acme.sh 安装完成（账户将在首次签发证书时注册）"
 }
 
 
@@ -978,17 +976,22 @@ acme_issue(){
   local certdir; certdir=$(acme_cert_dir "$domain")
   mkdir -p "$certdir"
 
+  # 账户邮箱: <8随机>@<证书主域名>（证书域名是公开 TLD，LE 接受）
+  # acme.sh 首次签发会据此注册账户，已有账户则复用
+  local acct_email; acct_email=$(gen_random_email "$domain")
   info "颁发机构: Let's Encrypt  |  验证: Cloudflare DNS-01"
-  info "邮箱: $(gen_random_email "$domain")（自动生成，LE 不验证）"
+  info "邮箱: $acct_email（自动生成，LE 不验证真实性）"
 
   # --issue 签发；--install-cert 安装到固定路径（覆盖式，无 archive 残留）
   # --reloadcmd 在续期后自动重载 nginx（acme.sh cron 续期会执行此命令）
-  if "$ACME_BIN" --issue -d "$domain" --dns dns_cf --dnssleep 30 \
+  if "$ACME_BIN" --issue -d "$domain" --dns dns_cf --dnssleep 30 -m "$acct_email" --nocron \
        --key-file "$certdir/privkey.pem" \
        --fullchain-file "$certdir/fullchain.pem" \
        --reloadcmd "nginx -t >/dev/null 2>&1 && systemctl reload nginx || true"; then
     ok "证书已签发并安装: $certdir"
     CERT_DOMAIN="$domain"
+    # 首次签发后确保续期 cron 已安装（若尚未开启）
+    acme_cron_active || "$ACME_BIN" --install-cronjob >/dev/null 2>&1 || true
     return 0
   else
     err "证书申请失败"
@@ -1318,9 +1321,8 @@ singbox_show_client(){
   # 使用 python3 动态、稳妥地解析配置。这不仅解决了字符串截取错误，
   # 还能完美支持多用户（多个 UUID）以及未来可能添加的其他入站协议（如 Hysteria2、TUIC、Trojan 等），彻底防范排版错乱。
   if ! cmd_exists python3; then
-    err "未安装 python3，无法实时解析复杂配置"
-    pause
-    return 1
+    info "解析客户端参数需要 python3，正在安装..."
+    apt-get install -y -qq python3 >/dev/null 2>&1 || { err "python3 安装失败，无法解析配置"; pause; return 1; }
   fi
 
   # 准备调用 python3 脚本输出
@@ -1721,8 +1723,6 @@ sni_menu(){
 
 install_all(){
   ui_header "一键安装"
-  info "顺序: 环境 → sing-box → SNI分流 → 日志 → Docker → 反代+证书"
-  echo
   local i_dp="" i_dir="" i_port="" i_site="" i_dom="" i_cert="未申请" i_sb="未安装"
 
   ui_header "[1/6] 基础环境"
