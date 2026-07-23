@@ -148,6 +148,7 @@ save_conf(){
 LAST_BASE=$LAST_BASE
 SINGBOX_PORT=$SINGBOX_PORT
 NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-}
+ACME_EMAIL_DOMAIN=${ACME_EMAIL_DOMAIN:-}
 EOF
 }
 
@@ -506,7 +507,7 @@ list_projects(){
 restart_project(){
   need_docker || return 1; select_compose_dir || return 1
   local name; name=$(basename "$SELECTED_DIR")
-  docker compose -f "$SELECTED_DIR/docker-compose.yml" up -d && ok "$name 已启动/更新" || err "$name 启动失败"
+  docker compose -f "$SELECTED_DIR/docker-compose.yml" up -d && ok "$name 已启动 / 应用配置" || err "$name 启动失败"
   pause
 }
 
@@ -528,12 +529,12 @@ project_logs(){
   else docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200; pause; fi
 }
 
-edit_project(){ select_compose_dir || return 1; edit_file "$SELECTED_DIR/docker-compose.yml"; }
+edit_project(){ select_compose_dir || return 1; edit_file "$SELECTED_DIR/docker-compose.yml"; ask_yn "应用配置 (up -d) 使修改生效？" "y" && docker compose -f "$SELECTED_DIR/docker-compose.yml" up -d && ok "已应用" || warn "未应用，记得稍后手动启动"; pause; }
 
 update_project(){
   need_docker || return 1; select_compose_dir || return 1
   local dir="$SELECTED_DIR" name; name=$(basename "$dir")
-  ask_yn "更新 $name 镜像并重启？" "y" || return 0
+  ask_yn "拉取 $name 最新镜像并重启？" "y" || return 0
   docker compose -f "$dir/docker-compose.yml" pull && docker compose -f "$dir/docker-compose.yml" up -d && ok "$name 已更新" || err "$name 更新失败"
   pause
 }
@@ -641,11 +642,11 @@ docker_menu(){
     if docker_ready; then ui_status "${GREEN}运行中${NC}  | 容器 $(docker ps -q 2>/dev/null | wc -l) 个  | 磁盘 $(df -h / | awk 'NR==2{print $5}')"; else ui_status "${RED}未运行${NC}"; fi
     ui_section "项目操作"
     ui_item2 1  "项目列表"     2  "创建项目"
-    ui_item2 3  "启动 / 更新"   4  "停止项目"
+    ui_item2 3  "启动项目"     4  "停止项目"
     ui_item2 5  "查看日志"     6  "编辑配置"
-    ui_item2 7  "更新镜像"     8  "容器状态"
+    ui_item2 7  "拉取更新镜像" 8  "容器状态"
     ui_item2 9  "重启项目"    10  "项目空间"
-    ui_item2 11 "删除项目"    12  "项目日志清理"
+    ui_item2 11 "删除项目"    12 "项目日志清理"
     ui_section "日志与维护"
     ui_item2 13 "清空全部日志" 14 "日志轮转"
     ui_item2 15 "定时空间清理" 16 "系统状态"
@@ -913,12 +914,29 @@ nginx_menu(){
 # ─── HTTPS 证书 (acme.sh + Cloudflare DNS-01) ──────────────
 
 gen_random_email(){
-  # <8位随机>@<证书主域名>
-  local domain="${1:-}" prefix
+  # <8位随机>@<公开邮箱域名> —— 公开 TLD，LE 接受
+  # 优先用用户已配置的真实邮箱域名（QQ/163/Gmail 等），其次回退证书主域名
+  local prefix domain="${1:-}"
   prefix=$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c8)
-  [ -z "$prefix" ] && prefix="cert$(date +%s | tail -c5)"
-  [ -z "$domain" ] && domain="$(hostname -f 2>/dev/null || echo localhost)"
+  [ -z "$prefix" ] && prefix="cert$(date +%s | tail -c3)"
+  if [ -n "$ACME_EMAIL_DOMAIN" ]; then : "${domain:=$ACME_EMAIL_DOMAIN}"
+  elif [ -z "$domain" ]; then domain="$(hostname -f 2>/dev/null || echo localhost)"; fi
   echo "${prefix}@${domain}"
+}
+
+# 首次签发证书时让用户配置一个真实的公开邮箱域名（QQ/163/Gmail 等），后续复用
+acme_set_email_domain(){
+  [ -n "$ACME_EMAIL_DOMAIN" ] && return 0
+  ui_header "配置证书账户邮箱域名"
+  info "Let's Encrypt 要求账户邮箱使用公开 TLD（如 gmail.com / qq.com / 163.com）"
+  info "本地随机生成前缀，@ 后的域名需要你提供一个真实的公开邮箱域名"
+  local d
+  read -rp "  邮箱域名（默认 gmail.com）: " d
+  [ -z "$d" ] && d="gmail.com"
+  # 简单校验: 必须含点、只允许字母数字点
+  [[ "$d" =~ ^[A-Za-z0-9.]+$ ]] && [[ "$d" == *.* ]] || { err "域名格式无效"; return 1; }
+  ACME_EMAIL_DOMAIN="$d"; save_conf
+  ok "邮箱域名: $d"
 }
 
 # 读取 / 保存 Cloudflare API Token（单份文件 600，覆盖式）
@@ -973,12 +991,14 @@ acme_issue(){
   fi
 
   acme_ensure || return 1
+  # 首次签发让用户配置一个真实公开邮箱域名（QQ/163/Gmail），后续复用
+  acme_set_email_domain || return 1
   local certdir; certdir=$(acme_cert_dir "$domain")
   mkdir -p "$certdir"
 
-  # 账户邮箱: <8随机>@<证书主域名>（证书域名是公开 TLD，LE 接受）
-  # acme.sh 首次签发会据此注册账户，已有账户则复用
-  local acct_email; acct_email=$(gen_random_email "$domain")
+  # 账户邮箱: <8随机>@<已配置公开邮箱域名>（QQ/163/Gmail 等，LE 接受）
+  # acme.sh 首次签发据此注册账户，已有账户则复用
+  local acct_email; acct_email=$(gen_random_email)
   info "颁发机构: Let's Encrypt  |  验证: Cloudflare DNS-01"
   info "邮箱: $acct_email（自动生成，LE 不验证真实性）"
 
@@ -1124,8 +1144,8 @@ generate_singbox_config(){
   else
     # 仅在 sing-box 独立安装时让用户选择
     echo "  请选择安装模式:"
-    echo "  [1] Nginx SNI 分流模式（将 443 端口流量分流转发给网站与 sing-box，最推荐且隐蔽）"
-    echo "  [2] 独立直连模式（不依赖 Nginx，直接使用公网 443 或自定义端口对外，极简快捷）"
+    echo "  [1] SNI 分流模式"
+    echo "  [2] 独立直连模式"
     local mode_choice
     read -rp "  请选择 [1/2]（默认 1）: " mode_choice
     [ -z "$mode_choice" ] && mode_choice="1"
@@ -1135,7 +1155,7 @@ generate_singbox_config(){
       listen_ip="127.0.0.1"
       client_port="443"
       echo
-      info "【分流模式】sing-box 监听内部端口（Nginx SNI 分流会转发到此端口）"
+      info "【分流模式】sing-box 监听内部端口（默认 8444）:"
       read -rp "  内部监听端口（默认 $SINGBOX_DEFAULT_PORT）: " sb_port
       [ -z "$sb_port" ] && sb_port="$SINGBOX_DEFAULT_PORT"
       valid_port "$sb_port" || sb_port="$SINGBOX_DEFAULT_PORT"
@@ -1143,7 +1163,7 @@ generate_singbox_config(){
       use_sni="n"
       listen_ip="::"
       echo
-      info "【独立直连模式】sing-box 外部监听端口（请确保防火墙放行该端口）"
+      info "【直连模式】sing-box 监听对外端口（默认 443）:"
       read -rp "  独立对外监听端口（默认 443，如被占用可改 8443）: " sb_port
       [ -z "$sb_port" ] && sb_port="443"
       valid_port "$sb_port" || sb_port="443"
@@ -1372,6 +1392,21 @@ except:
     except:
         pass
 
+# 获取 IP 对应地区名（中文），用作节点备注名（如：春川、东京、洛杉矶）
+node_region = "VPS"
+try:
+    req = urllib.request.Request(f"http://ip-api.com/json/{vps_ip}?lang=zh-CN&fields=city,regionName,country",
+                                headers={'User-Agent': 'curl/7.81.0'})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        geo = json.loads(r.read().decode('utf-8'))
+        # 优先城市，其次区域，最后国家
+        node_region = geo.get("city") or geo.get("regionName") or geo.get("country") or "VPS"
+except:
+    pass
+# URL 编码地区名（中文需 percent-encode 进 fragment）
+import urllib.parse as _up
+node_label = _up.quote(node_region)
+
 inbounds = config.get("inbounds", [])
 if not inbounds:
     print(f"  {YELLOW}[WARN]{NC} 配置文件中没有添加入站配置 (inbounds)")
@@ -1425,11 +1460,12 @@ for idx, inbound in enumerate(inbounds):
                 print(f"    Short ID: {GREEN}{short_id}{NC}")
                 print(f"    分流复用: {GREEN}{'启用 (通过443转发)' if use_sni_split == 'y' else '禁用 (直接连接端口)'}{NC}")
                 
-                # 拼接标准的 vless reality 链接
+                # 拼接标准的 vless reality 链接，备注为 VPS IP 地区名（如 #春川）
                 vless_link = f"vless://{uuid}@{vps_ip}:{client_port}?encryption=none"
                 if flow:
                     vless_link += f"&flow={flow}"
-                vless_link += f"&security=reality&sni={sni}&pbk={pub_key}&sid={short_id}#VLESS-Reality-{name}"
+                vless_link += f"&security=reality&sni={sni}&pbk={pub_key}&sid={short_id}#{node_label}"
+                print(f"    节点地区: {GREEN}{node_region}{NC}")
                 
                 print(f"\n    {CYAN}👉 节点链接:{NC}")
                 print(f"    {CYAN}{vless_link}{NC}\n")
