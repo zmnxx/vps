@@ -236,6 +236,24 @@ port_owned_by(){
   ss -H -ltnp "sport = :$port" 2>/dev/null | grep -Fq "((\"$process\""
 }
 
+singbox_wait_ready(){
+  local port="$1" i
+  valid_port "$port" || return 1
+  for i in {1..25}; do
+    systemctl is-active --quiet sing-box 2>/dev/null && port_owned_by "$port" sing-box && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+singbox_restart_checked(){
+  local port; port=$(singbox_config_port 2>/dev/null || true)
+  valid_port "$port" || { err "无法识别 sing-box 监听端口"; return 1; }
+  systemctl restart sing-box >/dev/null 2>&1 || { err "sing-box 重启命令失败"; return 1; }
+  singbox_wait_ready "$port" || { err "sing-box 未在等待时间内监听 ${port}"; return 1; }
+  return 0
+}
+
 sni_conf_path(){
   if [ -f /etc/nginx/stream.conf ]; then echo /etc/nginx/stream.conf
   elif [ -f /etc/nginx/conf.d/stream.conf ]; then echo /etc/nginx/conf.d/stream.conf
@@ -1352,8 +1370,8 @@ setup_singbox(){
     systemctl status sing-box --no-pager -l 2>&1 | tail -12
     pause; return 1
   fi
-  if ! systemctl is-active --quiet sing-box || ! singbox_listener_ok "$port"; then
-    err "sing-box 启动命令已返回，但服务或端口验证失败"
+  if ! singbox_wait_ready "$port"; then
+    err "sing-box 启动后未在等待时间内监听 ${port}"
     systemctl status sing-box --no-pager -l 2>&1 | tail -12
     pause; return 1
   fi
@@ -1400,6 +1418,11 @@ singbox_edit(){
   local edit_tmp; edit_tmp=$(mktemp /etc/sing-box/config.json.edit.XXXXXX) || { err "无法创建临时编辑文件"; pause; return 1; }
   cp -f "$SINGBOX_CONF" "$edit_tmp" || { err "无法准备编辑文件"; rm -f "$edit_tmp"; pause; return 1; }
   edit_file "$edit_tmp"
+  if cmp -s "$SINGBOX_CONF" "$edit_tmp"; then
+    rm -f "$edit_tmp"
+    info "配置未改变，无需重启"
+    pause; return 0
+  fi
   if ! sing-box check -c "$edit_tmp" >/dev/null 2>&1; then
     err "配置校验失败，正式配置未改变"
     sing-box check -c "$edit_tmp" 2>&1 | head -8 | sed 's/^/  /'
@@ -1407,21 +1430,113 @@ singbox_edit(){
     pause; return 1
   fi
   ok "配置校验通过"
+  local edit_old; edit_old=$(mktemp /etc/sing-box/config.rollback.XXXXXX) || { rm -f "$edit_tmp"; err "无法创建临时回滚文件"; pause; return 1; }
+  cp -f "$SINGBOX_CONF" "$edit_old"
   mv -f "$edit_tmp" "$SINGBOX_CONF"
   if ask_yn "重启并验证 sing-box？" "y"; then
     local port; port=$(singbox_config_port 2>/dev/null || true)
-    if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box && singbox_listener_ok "$port"; then
+    if singbox_restart_checked; then
+      rm -f "$edit_old"
       ok "sing-box 已重启并确认监听 ${port}"
     else
-      err "重启后验证失败，配置已通过但服务未确认可用"
+      cp -f "$edit_old" "$SINGBOX_CONF"
+      rm -f "$edit_old"
+      singbox_restart_checked >/dev/null 2>&1 || true
+      err "重启验证失败，已恢复编辑前配置"
       systemctl status sing-box --no-pager -l 2>&1 | tail -12
     fi
+  else
+    rm -f "$edit_old"
+    warn "配置已保存但尚未重启，当前进程仍使用旧配置"
+  fi
+  pause
+}
+
+singbox_users(){
+  ui_header "sing-box 用户列表"
+  [ -f "$SINGBOX_CONF" ] || { err "配置文件不存在"; pause; return 1; }
+  python3 - "$SINGBOX_CONF" <<'PY'
+import json, sys
+try:
+    c=json.load(open(sys.argv[1]))
+    users=c["inbounds"][0].get("users", [])
+    print(f"  用户数: {len(users)}")
+    for i,u in enumerate(users,1):
+        print(f"  [{i}] {u.get('name','未命名')}  UUID={u.get('uuid','未设置')}  Flow={u.get('flow','无')}")
+except Exception as e:
+    print(f"  [ERROR] 无法读取真实用户配置: {e}")
+    raise SystemExit(1)
+PY
+  pause
+}
+
+singbox_user_change(){
+  local action="$1" name uuid index tmp old
+  [ -f "$SINGBOX_CONF" ] || { err "配置文件不存在"; pause; return 1; }
+  if [ "$action" = add ]; then
+    read -rp "  用户名: " name
+    safe_name "$name" || { err "用户名只能包含字母、数字、点、下划线和短横线"; pause; return 1; }
+    uuid=$(sing-box generate uuid) || { err "UUID 生成失败"; pause; return 1; }
+    index="-1"
+  else
+    singbox_users
+    read -rp "  删除第几个用户: " index
+    [[ "$index" =~ ^[0-9]+$ ]] || { err "请输入用户编号"; pause; return 1; }
+    index=$((index-1))
+    local target_user
+    target_user=$(python3 - "$SINGBOX_CONF" "$index" <<'PY'
+import json,sys
+u=json.load(open(sys.argv[1]))["inbounds"][0].get("users",[])
+i=int(sys.argv[2])
+if i < 0 or i >= len(u): raise SystemExit(1)
+print(f"{u[i].get('name','未命名')} / {u[i].get('uuid','未设置')}")
+PY
+) || { err "用户编号不存在"; pause; return 1; }
+    ask_yn "删除用户 ${target_user}？" "n" || return 0
+  fi
+  tmp=$(mktemp /etc/sing-box/users.XXXXXX) || { err "无法创建临时配置"; pause; return 1; }
+  old=$(mktemp /etc/sing-box/config.rollback.XXXXXX) || { rm -f "$tmp"; err "无法创建临时回滚文件"; pause; return 1; }
+  cp -f "$SINGBOX_CONF" "$old"
+  if ! python3 - "$SINGBOX_CONF" "$tmp" "$action" "$name" "$uuid" "$index" <<'PY'
+import json,sys
+src,dst,action,name,uuid,index=sys.argv[1:]
+c=json.load(open(src)); ins=c.get("inbounds",[])
+if not ins or ins[0].get("type") != "vless": raise SystemExit("首个入站不是 VLESS")
+users=ins[0].setdefault("users",[])
+if action == "add":
+    if any(u.get("name") == name for u in users): raise SystemExit("用户名已存在")
+    users.append({"name":name,"uuid":uuid,"flow":"xtls-rprx-vision"})
+else:
+    i=int(index)
+    if i < 0 or i >= len(users): raise SystemExit("用户编号不存在")
+    if len(users) <= 1: raise SystemExit("至少保留一个用户")
+    users.pop(i)
+json.dump(c,open(dst,"w"),indent=2,ensure_ascii=False); open(dst,"a").write("\n")
+PY
+  then
+    err "用户配置未修改"
+    rm -f "$tmp" "$old"; pause; return 1
+  fi
+  chmod 600 "$tmp"
+  if ! sing-box check -c "$tmp" >/dev/null 2>&1; then
+    err "用户配置校验失败"
+    rm -f "$tmp" "$old"; pause; return 1
+  fi
+  mv -f "$tmp" "$SINGBOX_CONF"
+  if singbox_restart_checked; then
+    ok "用户配置已保存并确认服务监听"
+    rm -f "$old"
+  else
+    cp -f "$old" "$SINGBOX_CONF"
+    singbox_restart_checked >/dev/null 2>&1 || true
+    rm -f "$old"
+    err "服务重启失败，已恢复原用户配置"
   fi
   pause
 }
 
 singbox_show_client(){
-  ui_header "sing-box 客户端参数（动态实时提取自运行配置）"
+  ui_header "sing-box 真实客户端参数"
   if [ ! -f "$SINGBOX_CONF" ]; then
     err "未找到运行配置 $SINGBOX_CONF"
     pause
@@ -1607,7 +1722,7 @@ PYEOF
 
 singbox_restart(){
   local port; port=$(singbox_config_port 2>/dev/null || true)
-  if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box && singbox_listener_ok "$port"; then
+  if singbox_restart_checked; then
     ok "sing-box 已重启并确认监听 ${port}"
   else
     err "sing-box 重启后验证失败"
@@ -1651,17 +1766,17 @@ singbox_menu(){
     ui_section "服务与配置"
     ui_item2 1 "安装 / 配置" 2 "运行状态"
     ui_item2 3 "查看日志" 4 "编辑配置"
-    ui_item2 5 "重启服务" 6 "客户端参数"
-    ui_section "卸载"
-    ui_item 7 "卸载 sing-box"; printf '\n'
+    ui_item2 5 "重启服务" 6 "真实客户端参数"
+    ui_item2 7 "用户列表" 8 "添加用户"
+    ui_item2 9 "删除用户" 10 "卸载 sing-box"
     ui_return
-    ui_hint "修改配置后会先校验 JSON，再决定是否重启。"
-    menu_prompt 7; c="$REPLY"
+    menu_prompt 10; c="$REPLY"
     case "$c" in
       1) setup_singbox ;; 2) singbox_status ;; 3) singbox_logs ;; 4) singbox_edit ;;
-      5) singbox_restart ;; 6) singbox_show_client ;; 7) singbox_delete ;;
+      5) singbox_restart ;; 6) singbox_show_client ;; 7) singbox_users ;; 8) singbox_user_change add ;;
+      9) singbox_user_change delete ;; 10) singbox_delete ;;
       0) return ;;
-      *) warn "请输入 0-7"; pause ;;
+      *) warn "请输入 0-10"; pause ;;
     esac
   done
 }
