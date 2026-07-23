@@ -1,2595 +1,470 @@
-#!/bin/bash
-# Managed by vps-toolkit
-# VPS Toolkit - 从零重写的 VPS 运维管理脚本
-# 适用环境: Debian 10+, Ubuntu 20.04+ (Root 用户)
-
+#!/usr/bin/env bash
+# VPS Toolkit - Managed resources carry: # Managed by vps-toolkit
+# 适用于 Debian 10+、Ubuntu 20.04+。请以 root 身份运行。
 set -o pipefail
 
-# ==========================================
-# 1. 全局配置与常量
-# ==========================================
-STATE_DIR="/root/.vps-toolkit"
-STATE_FILE="${STATE_DIR}/state.json"
-STATE_TMP="${STATE_DIR}/state.json.tmp"
-CF_TOKEN_FILE="/etc/letsencrypt/cloudflare/cf.ini"
-SB_CONFIG_FILE="/etc/sing-box/config.json"
-SB_SERVICE_DIR="/etc/systemd/system/sing-box.service.d"
-SB_SERVICE_CONF="${SB_SERVICE_DIR}/vps-toolkit.conf"
-NGINX_STREAM_CONF="/etc/nginx/vps-toolkit-stream.conf"
-NGINX_WS_MAP_CONF="/etc/nginx/conf.d/vps-toolkit-ws-map.conf"
+readonly TOOL="vps-toolkit"
+readonly MARKER="# Managed by vps-toolkit"
+readonly STATE_DIR="/root/.vps-toolkit"
+readonly STATE="$STATE_DIR/state.json"
+readonly BACKUP="$STATE_DIR/transaction.restore.tar"
+readonly CF_DIR="/etc/letsencrypt/cloudflare"
+readonly CF_INI="$CF_DIR/cf.ini"
+readonly SB_CONFIG="/etc/sing-box/config.json"
+readonly SB_UNIT="/etc/systemd/system/sing-box.service"
+readonly NGINX_STREAM_CONF="/etc/nginx/vps-toolkit-stream.conf"
+readonly NGINX_STREAM_INCLUDE="/etc/nginx/vps-toolkit-stream.include"
+readonly NGINX_STREAM_LOADER="/etc/nginx/vps-toolkit-stream-loader.conf"
+readonly NGINX_MAP_CONF="/etc/nginx/conf.d/vps-toolkit-map.conf"
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_BLUE='\033[34m'; C_RESET='\033[0m'
+log() { printf '%b[信息]%b %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok() { printf '%b[完成]%b %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%b[警告]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err() { printf '%b[错误]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+need_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || { err "必须使用 root 执行。"; exit 1; }; }
+confirm() { local a; read -r -p "$1 [Y/n]: " a; [[ ! "$a" =~ ^[Nn]$ ]]; }
+pause() { read -r -p "按回车继续..." _; }
+command_ok() { command -v "$1" >/dev/null 2>&1; }
 
-# ==========================================
-# 2. 基础日志与辅助函数
-# ==========================================
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+require_cmd() { command_ok "$1" || { err "缺少命令：$1"; return 1; }; }
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_domain() { [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+valid_size() { [[ "$1" == "0" || "$1" =~ ^[0-9]+[KMGTP]?$ ]]; }
+valid_path() { [[ "$1" == /* && "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
+
+editor() { if [ -n "${EDITOR:-}" ] && command_ok "$EDITOR"; then "$EDITOR" "$1"; elif command_ok nano; then nano "$1"; else vi "$1"; fi; }
+run() { log "执行：$*"; "$@"; }
+apt_update() { DEBIAN_FRONTEND=noninteractive apt-get update; }
+apt_install() { DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"; }
+apt_purge() { DEBIAN_FRONTEND=noninteractive apt-get purge -y "$@"; }
+
+json_py() { python3 - "$@" <<'PY'
+import json, sys
+p=sys.argv[1]
+with open(p,encoding='utf-8') as f: d=json.load(f)
+print(json.dumps(d, ensure_ascii=False))
+PY
 }
-
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+state_init() {
+ mkdir -p -- "$STATE_DIR"; chmod 700 "$STATE_DIR"
+ [ -f "$STATE" ] && return 0
+ cat >"$STATE" <<'JSON'
+{"version":1,"network_mode":"standard","web_tls_port":443,"sing_box":{"mode":"none","port":0},"docker_projects":[],"nginx_sites":[],"certificates":[],"resources":[]}
+JSON
+ chmod 600 "$STATE"
 }
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+state_valid() { python3 - "$STATE" <<'PY' >/dev/null 2>&1
+import json,sys
+with open(sys.argv[1]) as f: d=json.load(f)
+assert isinstance(d,dict) and d.get('version')==1
+PY
 }
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-}
-
-# 端口占用检测
-check_port_occupied() {
-    local port="$1"
-    ss -tlnp | grep -q ":${port}\s"
-}
-
-# 获取占用端口的进程名
-get_port_process() {
-    local port="$1"
-    ss -tlnp | grep ":${port}\s" | awk '{print $6}' | cut -d'"' -f2 | sort -u | paste -sd, -
-}
-
-# 获取公网 IP (优先 IPv4)
-get_public_ip() {
-    local ip
-    ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org || curl -s --connect-timeout 5 https://ifconfig.me)
-    echo "$ip"
-}
-
-# 获取 IP 地理位置
-get_ip_location() {
-    local ip="$1"
-    local loc
-    loc=$(curl -s --connect-timeout 5 "http://ip-api.com/json/${ip}?fields=status,country,city" | python3 -c '
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    if d.get("status") == "success":
-        print(f"{d.get(\"country\")}_{d.get(\"city\")}")
-    else:
-        print("")
-except:
-    print("")
-')
-    if [ -z "$loc" ]; then
-        echo "$ip"
-    else
-        echo "$loc"
-    fi
-}
-
-# 确认交互函数 (默认 y)
-# 使用方法: confirm "确认执行吗?" && echo "执行" || echo "取消"
-confirm() {
-    local prompt="$1"
-    local resp
-    read -p "$(echo -e "${YELLOW}${prompt} [Y/n]: ${NC}")" resp
-    # 默认 y
-    if [ -z "$resp" ]; then
-        return 0
-    fi
-    case "$resp" in
-        [yY][eE][sS]|[yY])
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-# ==========================================
-# 3. JSON 状态管理与原子读写 (基于 Python 3)
-# ==========================================
-
-# 确保 Python3 安装 (首次运行必需)
-ensure_python3() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        log_info "正在安装 Python3 基础包以支持 JSON 状态管理..."
-        apt-get update && apt-get install -y python3-minimal
-    fi
-}
-
-# 获取状态文件中的某一级值
-# 例如: state_get "network_mode"
-state_get() {
-    python3 -c "
+# 使用 Python 标准库原子更新状态；参数为一段受控 Python 更新代码。
+state_update() {
+ local code="$1" tmp="$STATE.tmp"
+ python3 - "$STATE" "$tmp" "$code" <<'PY'
 import json, os, sys
-path = '${STATE_FILE}'
-if not os.path.exists(path):
-    sys.exit(1)
-try:
-    with open(path) as f:
-        data = json.load(f)
-    keys = '$1'.split('.')
-    val = data
-    for k in keys:
-        if isinstance(val, list):
-            val = val[int(k)]
-        else:
-            val = val[k]
-    if isinstance(val, (dict, list)):
-        print(json.dumps(val))
-    else:
-        print(val)
-except:
-    sys.exit(1)
-" 2>/dev/null
+src,tmp,code=sys.argv[1:]
+with open(src,encoding='utf-8') as f: data=json.load(f)
+ns={'d':data}
+exec(code, {'__builtins__':{}}, ns)
+data=ns['d']
+fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+ json.dump(data,f,ensure_ascii=False,indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
+os.replace(tmp,src)
+dfd=os.open(os.path.dirname(src),os.O_DIRECTORY); os.fsync(dfd); os.close(dfd)
+PY
+}
+state_get() { python3 - "$STATE" "$1" <<'PY'
+import json,sys
+with open(sys.argv[1]) as f:d=json.load(f)
+v=d
+for k in sys.argv[2].split('.'):
+ if k:v=v[int(k)] if k.isdigit() else v.get(k)
+print('' if v is None else (str(v).lower() if isinstance(v,bool) else v))
+PY
+}
+state_json() { python3 - "$STATE" "$1" <<'PY'
+import json,sys
+with open(sys.argv[1]) as f:d=json.load(f)
+v=d
+for k in sys.argv[2].split('.'):
+ if k:v=v[int(k)] if k.isdigit() else v.get(k)
+print(json.dumps(v,ensure_ascii=False))
+PY
 }
 
-# 写入状态文件某一级值 (原子写入)
-# 例如: state_set "network_mode" '"sni"'
-state_set() {
-    local key="$1"
-    local val="$2"
-    mkdir -p "$STATE_DIR"
-    python3 -c "
-import json, os, sys
-path = '${STATE_FILE}'
-tmp_path = '${STATE_TMP}'
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except:
-        data = {}
-else:
-    data = {}
-
-# 确保基础结构
-for k in ['version', 'network_mode', 'web_tls_port', 'sing_box_mode', 'sing_box_port', 'sing_box_internal_port', 'docker_projects', 'nginx_sites', 'certificates']:
-    if k not in data:
-        if k == 'docker_projects' or k == 'nginx_sites' or k == 'certificates':
-            data[k] = []
-        elif k == 'network_mode':
-            data[k] = 'standard'
-        elif k == 'web_tls_port':
-            data[k] = 443
-        elif k == 'sing_box_mode':
-            data[k] = 'standalone'
-        elif k == 'sing_box_port':
-            data[k] = 443
-        elif k == 'sing_box_internal_port':
-            data[k] = 8889
-        elif k == 'version':
-            data[k] = '1.0'
-
-key = '$key'
-val_str = '''$val'''
-try:
-    val = json.loads(val_str)
-except:
-    val = val_str
-
-data[key] = val
-
-with open(tmp_path, 'w') as f:
-    json.dump(data, f, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
-
-os.rename(tmp_path, path)
-dir_fd = os.open('${STATE_DIR}', os.O_RDONLY)
-os.fsync(dir_fd)
-os.close(dir_fd)
-"
-}
-
-# 添加 Docker 项目记录到状态
-state_add_project() {
-    local name="$1"
-    local dir="$2"
-    local compose="$3"
-    python3 -c "
-import json, os
-path = '${STATE_FILE}'
-if os.path.exists(path):
-    data = json.load(open(path))
-else:
-    data = {'version': '1.0', 'network_mode': 'standard', 'web_tls_port': 443, 'sing_box_mode': 'standalone', 'sing_box_port': 443, 'sing_box_internal_port': 8889, 'docker_projects': [], 'nginx_sites': [], 'certificates': []}
-
-data['docker_projects'] = [p for p in data.get('docker_projects', []) if p['name'] != '$name']
-data['docker_projects'].append({'name': '$name', 'dir': '$dir', 'compose_file': '$compose'})
-with open(path+'.tmp', 'w') as f:
-    json.dump(data, f, indent=2)
-os.rename(path+'.tmp', path)
-"
-}
-
-# 删除 Docker 项目记录
-state_remove_project() {
-    local name="$1"
-    python3 -c "
-import json, os
-path = '${STATE_FILE}'
-if os.path.exists(path):
-    data = json.load(open(path))
-    data['docker_projects'] = [p for p in data.get('docker_projects', []) if p['name'] != '$name']
-    with open(path+'.tmp', 'w') as f:
-        json.dump(data, f, indent=2)
-    os.rename(path+'.tmp', path)
-"
-}
-
-# 添加 Nginx 站点到状态
-state_add_site() {
-    local name="$1"
-    local domain="$2"
-    local upstream="$3"
-    local max_body="$4"
-    local cert_name="$5"
-    python3 -c "
-import json, os
-path = '${STATE_FILE}'
-if os.path.exists(path):
-    data = json.load(open(path))
-else:
-    data = {'version': '1.0', 'network_mode': 'standard', 'web_tls_port': 443, 'sing_box_mode': 'standalone', 'sing_box_port': 443, 'sing_box_internal_port': 8889, 'docker_projects': [], 'nginx_sites': [], 'certificates': []}
-
-data['nginx_sites'] = [s for s in data.get('nginx_sites', []) if s['name'] != '$name']
-data['nginx_sites'].append({
-    'name': '$name',
-    'domain': '$domain',
-    'upstream_port': int('$upstream'),
-    'max_body': '$max_body',
-    'cert_name': '$cert_name'
-})
-with open(path+'.tmp', 'w') as f:
-    json.dump(data, f, indent=2)
-os.rename(path+'.tmp', path)
-"
-}
-
-# 删除 Nginx 站点记录
-state_remove_site() {
-    local name="$1"
-    python3 -c "
-import json, os
-path = '${STATE_FILE}'
-if os.path.exists(path):
-    data = json.load(open(path))
-    data['nginx_sites'] = [s for s in data.get('nginx_sites', []) if s['name'] != '$name']
-    with open(path+'.tmp', 'w') as f:
-        json.dump(data, f, indent=2)
-    os.rename(path+'.tmp', path)
-"
-}
-
-# 添加证书到状态
-state_add_cert() {
-    local name="$1"
-    local domains="$2" # 逗号分隔
-    python3 -c "
-import json, os
-path = '${STATE_FILE}'
-if os.path.exists(path):
-    data = json.load(open(path))
-else:
-    data = {'version': '1.0', 'network_mode': 'standard', 'web_tls_port': 443, 'sing_box_mode': 'standalone', 'sing_box_port': 443, 'sing_box_internal_port': 8889, 'docker_projects': [], 'nginx_sites': [], 'certificates': []}
-
-data['certificates'] = [c for c in data.get('certificates', []) if c['name'] != '$name']
-data['certificates'].append({
-    'name': '$name',
-    'domains': [d.strip() for d in '$domains'.split(',') if d.strip()],
-    'key_path': f'/etc/letsencrypt/live/{name}/privkey.pem',
-    'cert_path': f'/etc/letsencrypt/live/{name}/fullchain.pem'
-})
-with open(path+'.tmp', 'w') as f:
-    json.dump(data, f, indent=2)
-os.rename(path+'.tmp', path)
-"
-}
-
-# 删除证书记录
-state_remove_cert() {
-    local name="$1"
-    python3 -c "
-import json, os
-path = '${STATE_FILE}'
-if os.path.exists(path):
-    data = json.load(open(path))
-    data['certificates'] = [c for c in data.get('certificates', []) if c['name'] != '$name']
-    with open(path+'.tmp', 'w') as f:
-        json.dump(data, f, indent=2)
-    os.rename(path+'.tmp', path)
-"
-}
-
-# ==========================================
-# 4. 资源扫描与状态漂移检测
-# ==========================================
-
-# 扫描受管资源，重构状态
 scan_resources() {
-    log_info "正在扫描本系统受管资源并重构状态文件..."
-    local docker_projects="[]"
-    local nginx_sites="[]"
-    local certificates="[]"
-    local network_mode="standard"
-    local web_tls_port=443
-    local sing_box_mode="standalone"
-    local sing_box_port=443
-    local sing_box_internal_port=8889
-
-    # 1. 扫描 Docker 项目
-    # 查找 /docker 下所有包含 Managed by vps-toolkit 标记的 compose 文件
-    if [ -d "/docker" ]; then
-        local p_list=""
-        while IFS= read -r -d '' comp; do
-            if head -n 5 "$comp" | grep -q "Managed by vps-toolkit"; then
-                local p_dir
-                p_dir=$(dirname "$comp")
-                local p_name
-                p_name=$(basename "$p_dir")
-                p_list="${p_list}{\"name\":\"${p_name}\",\"dir\":\"${p_dir}\",\"compose_file\":\"${comp}\"},"
-            fi
-        done < <(find /docker -type f \( -name "compose.yaml" -o -name "compose.yml" -o -name "docker-compose.yaml" -o -name "docker-compose.yml" \) -print0)
-        if [ -n "$p_list" ]; then
-            docker_projects="[${p_list%,}]"
-        fi
-    fi
-
-    # 2. 扫描 Nginx 站点
-    if [ -d "/etc/nginx/sites-available" ]; then
-        local s_list=""
-        for conf in /etc/nginx/sites-available/*; do
-            [ -f "$conf" ] || continue
-            if grep -q "Managed by vps-toolkit" "$conf"; then
-                local s_name
-                s_name=$(basename "$conf" .conf)
-                # 尝试解析域名、上游端口、最大体量、证书
-                local domain
-                domain=$(grep -oE "server_name\s+[^;]+" "$conf" | head -n 1 | awk '{print $2}')
-                local upstream
-                upstream=$(grep -oE "proxy_pass\s+http://127.0.0.1:[0-9]+" "$conf" | head -n 1 | grep -oE "[0-9]+")
-                [ -z "$upstream" ] && upstream=80
-                local max_body
-                max_body=$(grep -oE "client_max_body_size\s+[^;]+" "$conf" | head -n 1 | awk '{print $2}')
-                [ -z "$max_body" ] && max_body="20G"
-                local cert_name
-                cert_name=$(grep -oE "ssl_certificate\s+[^;]+" "$conf" | head -n 1 | awk '{print $2}' | cut -d'/' -f 5)
-                [ -z "$cert_name" ] && cert_name="$domain"
-                s_list="${s_list}{\"name\":\"${s_name}\",\"domain\":\"${domain}\",\"upstream_port\":${upstream},\"max_body\":\"${max_body}\",\"cert_name\":\"${cert_name}\"},"
-            fi
-        done
-        if [ -n "$s_list" ]; then
-            nginx_sites="[${s_list%,}]"
-        fi
-    fi
-
-    # 3. 扫描 Certbot 证书
-    if [ -d "/etc/letsencrypt/live" ]; then
-        local c_list=""
-        for cert_dir in /etc/letsencrypt/live/*; do
-            [ -d "$cert_dir" ] || continue
-            local cert_name
-            cert_name=$(basename "$cert_dir")
-            [ "$cert_name" = "README" ] && continue
-            if [ -f "${cert_dir}/fullchain.pem" ] && [ -f "${cert_dir}/privkey.pem" ]; then
-                # 读取证书包含的域名 (使用 openssl)
-                local domains
-                domains=$(openssl x509 -in "${cert_dir}/fullchain.pem" -noout -ext subjectAltName 2>/dev/null | grep -oE "DNS:[^,]+" | sed 's/DNS://g' | paste -sd, -)
-                if [ -z "$domains" ]; then
-                    domains="$cert_name"
-                fi
-                # 将域名转换成 JSON 数组字符串，这里注意多层转义
-                local dom_json
-                dom_json=$(python3 -c 'import json, sys; print(json.dumps([d.strip() for d in sys.argv[1].split(",") if d.strip()]))' "$domains")
-                c_list="${c_list}{\"name\":\"${cert_name}\",\"domains\":${dom_json},\"key_path\":\"${cert_dir}/privkey.pem\",\"cert_path\":\"${cert_dir}/fullchain.pem\"},"
-            fi
-        done
-        if [ -n "$c_list" ]; then
-            certificates="[${c_list%,}]"
-        fi
-    fi
-
-    # 4. 判断网络模式
-    if [ -f "$NGINX_STREAM_CONF" ] && grep -q "Managed by vps-toolkit" "$NGINX_STREAM_CONF"; then
-        network_mode="sni"
-        web_tls_port=8443
-    else
-        network_mode="standard"
-        web_tls_port=443
-    fi
-
-    # 5. 扫描 sing-box
-    if [ -f "$SB_CONFIG_FILE" ]; then
-        # 解析 sing-box 监听配置
-        local sb_listen
-        sb_listen=$(python3 -c "
-import json
+ state_init
+ local sites='[]' projects='[]' certs='[]' resources='[]' mode=standard webport=443 sbmode=none sbport=0
+ [ -f "$NGINX_STREAM_CONF" ] && grep -qF "$MARKER" "$NGINX_STREAM_CONF" && { mode=sni; webport=8443; }
+ [ -f "$SB_CONFIG" ] && grep -qF "$MARKER" "$SB_CONFIG" && {
+  sbmode=$(python3 - "$SB_CONFIG" <<'PY'
+import json,sys
 try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    for ib in d.get('inbounds', []):
-        if ib.get('type') == 'vless':
-            print(f\"{ib.get('listen')}:{ib.get('listen_port')}\")
-except:
-    pass
-" 2>/dev/null)
-        if [ -n "$sb_listen" ]; then
-            local listen_host
-            listen_host=$(echo "$sb_listen" | cut -d':' -f1)
-            local listen_port
-            listen_port=$(echo "$sb_listen" | cut -d':' -f2)
-            if [ "$listen_host" = "127.0.0.1" ] || [ "$listen_host" = "::1" ]; then
-                sing_box_mode="sni"
-                sing_box_internal_port="$listen_port"
-                sing_box_port=443
-            else
-                sing_box_mode="standalone"
-                sing_box_port="$listen_port"
-            fi
-        fi
-    fi
-
-    # 组装完整的 JSON
-    local final_json
-    final_json=$(python3 -c "
-import json
-d = {
-    'version': '1.0',
-    'network_mode': '$network_mode',
-    'web_tls_port': int('$web_tls_port'),
-    'sing_box_mode': '$sing_box_mode',
-    'sing_box_port': int('$sing_box_port'),
-    'sing_box_internal_port': int('$sing_box_internal_port'),
-    'docker_projects': json.loads('''$docker_projects'''),
-    'nginx_sites': json.loads('''$nginx_sites'''),
-    'certificates': json.loads('''$certificates''')
+ d=json.load(open(sys.argv[1])); print(d.get('metadata',{}).get('vps_toolkit_mode','independent'))
+except: print('none')
+PY
+)
+  sbport=$(python3 - "$SB_CONFIG" <<'PY'
+import json,sys
+try: print(json.load(open(sys.argv[1]))['inbounds'][0]['listen_port'])
+except: print(0)
+PY
+)
+ }
+ local f n d u c
+ while IFS= read -r -d '' f; do
+  n=$(basename "$f" .conf); d=$(awk '/^[[:space:]]*server_name[[:space:]]/{print $2;exit}' "$f" | tr -d ';')
+  u=$(awk '/^[[:space:]]*proxy_pass http:\/\/127\.0\.0\.1:/{sub(/.*127.0.0.1:/,"");sub(/;.*/,"");print;exit}' "$f")
+  c=$(awk '/ssl_certificate[[:space:]]/{print $2;exit}' "$f" | sed 's|/fullchain.pem;||;s|/etc/letsencrypt/live/||')
+  sites=$(python3 - "$sites" "$n" "$d" "$u" "$c" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]);x.append({'name':sys.argv[2],'domain':sys.argv[3],'upstream_port':int(sys.argv[4] or 0),'certificate':sys.argv[5]});print(json.dumps(x))
+PY
+)
+ done < <(find /etc/nginx/sites-available -maxdepth 1 -type f -name '*.conf' -print0 2>/dev/null | while IFS= read -r -d '' x; do grep -qF "$MARKER" "$x" && printf '%s\0' "$x"; done)
+ if [ -d /docker ]; then
+  while IFS= read -r -d '' f; do
+   d=$(dirname "$f"); n=$(basename "$d")
+   valid_name "$n" || continue
+   projects=$(python3 - "$projects" "$n" "$d" "$f" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]);x.append({'name':sys.argv[2],'directory':sys.argv[3],'compose':sys.argv[4]});print(json.dumps(x))
+PY
+)
+  done < <(find /docker -mindepth 2 -maxdepth 2 -type f \( -name compose.yaml -o -name compose.yml -o -name docker-compose.yaml -o -name docker-compose.yml \) -print0 2>/dev/null)
+ fi
+ cat >"$STATE.tmp" <<JSON
+{"version":1,"network_mode":"$mode","web_tls_port":$webport,"sing_box":{"mode":"$sbmode","port":$sbport},"docker_projects":$projects,"nginx_sites":$sites,"certificates":$certs,"resources":$resources}
+JSON
+ python3 -m json.tool "$STATE.tmp" >/dev/null && mv -f -- "$STATE.tmp" "$STATE" && chmod 600 "$STATE"
 }
-print(json.dumps(d, indent=2))
-")
-    
-    mkdir -p "$STATE_DIR"
-    echo "$final_json" > "$STATE_TMP"
-    mv "$STATE_TMP" "$STATE_FILE"
-    sync "$STATE_DIR"
-    log_success "状态已成功重构！"
+state_drift() {
+ [ -f "$STATE" ] || return 0
+ local indexed actual
+ indexed=$(state_json nginx_sites); actual=$(find /etc/nginx/sites-available -maxdepth 1 -type f -name '*.conf' -exec grep -lF "$MARKER" {} + 2>/dev/null | wc -l)
+ [ "$(python3 - "$indexed" <<'PY'
+import json,sys; print(len(json.loads(sys.argv[1])))
+PY
+)" -eq "$actual" ] || return 0
+ local p; while IFS= read -r p; do [ -f "$p" ] || return 0; done < <(python3 - "$STATE" <<'PY'
+import json,sys
+for x in json.load(open(sys.argv[1])).get('docker_projects',[]): print(x['compose'])
+PY
+)
+ return 1
 }
-
-# 检测状态漂移
-check_state_drift() {
-    local drift=0
-    
-    # 若状态文件不存在，自动扫描重建
-    if [ ! -f "$STATE_FILE" ]; then
-        log_warn "未检测到状态文件，执行自动初始化扫描..."
-        scan_resources
-        return 0
-    fi
-    
-    # 状态文件临时残留清理
-    if [ -f "$STATE_TMP" ]; then
-        rm -f "$STATE_TMP"
-    fi
-
-    # 1. 检查 Docker 项目是否存在
-    local projects
-    projects=$(state_get "docker_projects")
-    if [ -n "$projects" ] && [ "$projects" != "null" ]; then
-        # 读取每个项目的 compose_file
-        local p_count
-        p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-        for ((i=0; i<p_count; i++)); do
-            local comp
-            comp=$(state_get "docker_projects.${i}.compose_file")
-            if [ ! -f "$comp" ]; then
-                log_warn "漂移：受管 Docker 项目 compose 文件不存在: $comp"
-                drift=1
-            fi
-        done
-    fi
-
-    # 2. 检查 Nginx 站点是否存在
-    local sites
-    sites=$(state_get "nginx_sites")
-    if [ -n "$sites" ] && [ "$sites" != "null" ]; then
-        local s_count
-        s_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('nginx_sites', [])))")
-        for ((i=0; i<s_count; i++)); do
-            local s_name
-            s_name=$(state_get "nginx_sites.${i}.name")
-            if [ ! -f "/etc/nginx/sites-available/${s_name}.conf" ]; then
-                log_warn "漂移：受管 Nginx 站点配置文件不存在: /etc/nginx/sites-available/${s_name}.conf"
-                drift=1
-            fi
-        done
-    fi
-
-    # 3. 检查证书文件是否存在
-    local certs
-    certs=$(state_get "certificates")
-    if [ -n "$certs" ] && [ "$certs" != "null" ]; then
-        local c_count
-        c_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('certificates', [])))")
-        for ((i=0; i<c_count; i++)); do
-            local c_name
-            c_name=$(state_get "certificates.${i}.name")
-            if [ ! -d "/etc/letsencrypt/live/${c_name}" ]; then
-                log_warn "漂移：受管证书 live 目录不存在: /etc/letsencrypt/live/${c_name}"
-                drift=1
-            fi
-        done
-    fi
-
-    # 4. 检查模式设置与实际运行是否匹配
-    local current_mode
-    current_mode=$(state_get "network_mode")
-    if [ "$current_mode" = "sni" ]; then
-        if [ ! -f "$NGINX_STREAM_CONF" ]; then
-            log_warn "漂移：状态为 SNI 分流，但未检测到 stream 配置文件: $NGINX_STREAM_CONF"
-            drift=1
-        fi
-    else
-        if [ -f "$NGINX_STREAM_CONF" ]; then
-            log_warn "漂移：状态为标准模式，但检测到残留的 stream 配置文件: $NGINX_STREAM_CONF"
-            drift=1
-        fi
-    fi
-
-    if [ $drift -eq 1 ]; then
-        log_error "检测到系统状态漂移！状态文件与物理资源不符。"
-        if confirm "是否立即重新扫描并修复状态索引？"; then
-            scan_resources
-        fi
-    fi
+startup_state() {
+ mkdir -p -- "$STATE_DIR"; chmod 700 "$STATE_DIR"
+ if [ -e "$STATE.tmp" ] && [ -f "$STATE" ] && state_valid; then rm -f -- "$STATE.tmp"; fi
+ if [ ! -f "$STATE" ] || ! state_valid; then warn "状态文件不存在或无效，正在扫描受管资源建立索引。"; scan_resources; fi
+ if state_drift; then warn "检测到状态漂移：索引与实际受管资源不一致。"; fi
 }
 
-# ==========================================
-# 5. 基础环境校验与组件安装
-# ==========================================
-check_base_env() {
-    log_info "检查基础系统环境..."
-    
-    # 必须以 root 运行
-    if [ "$EUID" -ne 0 ]; then
-        log_error "请使用 root 用户运行此脚本！"
-        exit 1
-    fi
-
-    # 仅支持 Debian/Ubuntu
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_NAME="$ID"
-        OS_VER="$VERSION_ID"
-    else
-        log_error "无法获取发行版信息，脚本仅支持 Debian 10+ 与 Ubuntu 20.04+"
-        exit 1
-    fi
-
-    if [ "$OS_NAME" != "debian" ] && [ "$OS_NAME" != "ubuntu" ]; then
-        log_error "本脚本仅支持 Debian / Ubuntu 系统。当前检测为: $OS_NAME"
-        exit 1
-    fi
-
-    # 检测 Debian 10+ 或 Ubuntu 20.04+
-    if [ "$OS_NAME" = "debian" ] && [ "${OS_VER%%.*}" -lt 10 ]; then
-        log_error "Debian 版本必须为 10 或以上。当前版本: $OS_VER"
-        exit 1
-    fi
-    if [ "$OS_NAME" = "ubuntu" ] && [ "${OS_VER%%.*}" -lt 20 ]; then
-        log_error "Ubuntu 版本必须为 20.04 或以上。当前版本: $OS_VER"
-        exit 1
-    fi
-
-    # 检查 systemd 是否可用
-    if ! pidof systemd >/dev/null 2>&1 && ! systemctl >/dev/null 2>&1; then
-        log_error "系统未使用 systemd 管理器，脚本无法继续运行。"
-        exit 1
-    fi
-
-    # 检查磁盘空间 (主目录所在挂载点)
-    local free_space
-    free_space=$(df -k / | awk 'NR==2 {print $4}')
-    if [ "$free_space" -lt 512000 ]; then # 小于 500M
-        log_error "根目录可用空间少于 500MB，请清理后再试。"
-        exit 1
-    fi
-
-    # 检查 APT 锁状态
-    if lsof /var/lib/apt/lists/lock >/dev/null 2>&1 || lsof /var/lib/dpkg/lock-fronted >/dev/null 2>&1; then
-        log_warn "检测到 APT 进程被占用锁，尝试等待 5 秒..."
-        sleep 5
-    fi
-
-    log_success "基础系统检查通过 ($OS_NAME $OS_VER)"
+check_host() {
+ need_root
+ [ -r /etc/os-release ] || { err "无法识别发行版。"; exit 1; }; . /etc/os-release
+ case "$ID" in debian|ubuntu) ;; *) err "仅支持 Debian/Ubuntu。"; exit 1;; esac
+ local major="${VERSION_ID%%.*}" min=0; [ "$ID" = debian ] && min=10 || min=20
+ [ "$major" -ge "$min" ] 2>/dev/null || { err "系统版本不受支持：$PRETTY_NAME"; exit 1; }
+ command_ok systemctl && [ -d /run/systemd/system ] || { err "需要 systemd 环境。"; exit 1; }
+ command_ok apt-get || { err "未找到 apt-get。"; exit 1; }
+ [ "$(df -Pm / | awk 'NR==2{print $4}')" -ge 1024 ] || { err "根分区可用空间不足 1GB。"; exit 1; }
+ getent hosts deb.debian.org >/dev/null 2>&1 || warn "网络/DNS 可能不可用，后续安装可能失败。"
 }
+
+service_ok() { systemctl is-active --quiet "$1" && systemctl is-enabled --quiet "$1"; }
+port_owner() { ss -ltnp "sport = :$1" 2>/dev/null || true; }
+port_free() { ss -ltn "sport = :$1" 2>/dev/null | awk 'NR>1 { found=1 } END { exit found ? 1 : 0 }'; }
+ensure_stream_loader() {
+ python3 - /etc/nginx/nginx.conf "$NGINX_STREAM_CONF" <<'PY'
+import sys
+p,stream=sys.argv[1:]
+s=open(p).read(); line='include '+stream+'; # Managed by vps-toolkit\n'
+if s.count('Managed by vps-toolkit') and line not in s:
+ raise SystemExit('nginx.conf 存在未知的本工具标记，拒绝修改')
+if line not in s:
+ i=s.find('events {')
+ if i < 0: raise SystemExit('未找到 nginx events 块，拒绝插入 stream include')
+ s=s[:i]+line+s[i:]
+ open(p,'w').write(s)
+PY
+}
+remove_stream_loader() {
+ rm -f -- "$NGINX_STREAM_CONF" "$NGINX_STREAM_INCLUDE" "$NGINX_STREAM_LOADER"
+ python3 - /etc/nginx/nginx.conf <<'PY'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('include /etc/nginx/vps-toolkit-stream.conf; # Managed by vps-toolkit\n','')
+open(p,'w').write(s)
+PY
+}
+
+backup_begin() {
+ rm -f -- "$BACKUP"; tar -cf "$BACKUP" --ignore-failed-read \
+  /etc/nginx/nginx.conf /etc/nginx/sites-available /etc/nginx/sites-enabled \
+  "$NGINX_STREAM_CONF" "$NGINX_STREAM_INCLUDE" "$NGINX_STREAM_LOADER" "$NGINX_MAP_CONF" "$STATE" 2>/dev/null || true
+}
+backup_restore() { [ -f "$BACKUP" ] || return 1; tar -xf "$BACKUP" -C / 2>/dev/null && systemctl reload nginx 2>/dev/null || true; rm -f -- "$BACKUP"; }
+backup_commit() { rm -f -- "$BACKUP"; }
+nginx_test_reload() { nginx -t && systemctl reload nginx && systemctl is-active --quiet nginx; }
 
 install_docker() {
-    log_info "准备安装/检查 Docker..."
-    if command -v docker >/dev/null 2>&1; then
-        log_info "检测到 Docker 已安装，开始检查配置与更新源..."
-    fi
+ check_host; apt_install ca-certificates curl gnupg python3 || return
+ install -m 0755 -d /etc/apt/keyrings
+ if [ ! -f /etc/apt/keyrings/docker.asc ]; then curl -fsSL https://download.docker.com/linux/"$(. /etc/os-release; echo "$ID")"/gpg -o /etc/apt/keyrings/docker.asc || return; chmod a+r /etc/apt/keyrings/docker.asc; fi
+ local os; . /etc/os-release; os=$ID
+ printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' "$(dpkg --print-architecture)" "$os" "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list
+ apt_update && apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return
+ mkdir -p /etc/docker
+ python3 - <<'PY'
+import json,os,tempfile
+p='/etc/docker/daemon.json'; d={}
+if os.path.exists(p):
+ try:
+  with open(p) as f:d=json.load(f)
+ except Exception as e: raise SystemExit('现有 /etc/docker/daemon.json 不是有效 JSON，拒绝覆盖：'+str(e))
+d.setdefault('log-driver','json-file'); d.setdefault('log-opts',{})
+d['log-opts'].update({'max-size':'100m','max-file':'3'})
+fd,t=tempfile.mkstemp(dir='/etc/docker');
+with os.fdopen(fd,'w') as f: json.dump(d,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+os.replace(t,p)
+PY
+ systemctl daemon-reload && systemctl enable --now docker && docker info >/dev/null && service_ok docker || { err "Docker 验证失败。"; return 1; }
+ ok "Docker 已安装并启用。日志轮转仅对重新创建后的容器生效。"
+}
+compose_of() { find "/docker/$1" -maxdepth 1 -type f \( -name compose.yaml -o -name compose.yml -o -name docker-compose.yaml -o -name docker-compose.yml \) -print -quit; }
+project_exists() { [ -n "$(compose_of "$1")" ]; }
+new_project() {
+ local n f; read -r -p "项目名称：" n; valid_name "$n" || { err "项目名仅允许字母、数字、点、下划线、短横线，且首字符为字母或数字。"; return; }
+ [ -e "/docker/$n" ] && { err "项目目录已存在。"; return; }
+ mkdir -p -- "/docker/$n" || return; f="/docker/$n/compose.yaml"; : > "$f"; editor "$f"
+ docker compose -f "$f" config -q || { err "Compose 配置无效，文件已保留供修正。"; return 1; }
+ state_update "d['docker_projects'].append({'name':'$n','directory':'/docker/$n','compose':'$f'})" || return
+ ok "项目已创建。请在 Compose 中自行设置 restart: unless-stopped 或 restart: always，之后用启动/更新应用配置。"
+}
+project_status() {
+ local n="$1" f; f=$(compose_of "$n"); [ -n "$f" ] || { err "找不到项目。"; return 1; }
+ printf '项目目录：%s\n配置文件：%s\n目录大小：%s\n' "/docker/$n" "$f" "$(du -sh -- "/docker/$n" 2>/dev/null|awk '{print $1}')"
+ docker compose -f "$f" ps --format 'table {{.Name}}\t{{.State}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null
+ local ids; ids=$(docker compose -f "$f" ps -aq 2>/dev/null)
+ [ -z "$ids" ] || docker inspect --format '{{.Name}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}无{{end}} restarts={{.RestartCount}} restart={{.HostConfig.RestartPolicy.Name}} image={{.Config.Image}}' $ids
+ printf '日志驱动：%s\n' "$(docker info --format '{{.LoggingDriver}}' 2>/dev/null)"
+}
+start_project() { local f; f=$(compose_of "$1"); [ -n "$f" ] || return 1; docker compose -f "$f" up -d || { err "启动失败，最近日志："; docker compose -f "$f" logs --tail 30; return 1; }; project_status "$1"; }
+clear_project_logs() {
+ local n="$1" f ids id logf driver; f=$(compose_of "$n"); ids=$(docker compose -f "$f" ps -aq)
+ [ -n "$ids" ] || { warn "没有容器日志可清空。"; return; }; confirm "日志清空不可恢复，确认继续？" || return
+ for id in $ids; do driver=$(docker inspect -f '{{.HostConfig.LogConfig.Type}}' "$id"); [ -n "$driver" ] && [ "$driver" != "json-file" ] && { warn "$(docker inspect -f '{{.Name}}' "$id") 使用 $driver，无法清空。"; continue; }; logf=$(docker inspect -f '{{.LogPath}}' "$id"); [ -n "$logf" ] && [ -f "$logf" ] && truncate -s 0 -- "$logf"; done
+ ok "已清空支持的 json-file 容器日志。"
+}
+external_volumes() { docker compose -f "$1" config --format json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); [print(k) for k,v in d.get('volumes',{}).items() if v.get('external') is True]"; }
+delete_project() {
+ local n="$1" f outside images vols p; f=$(compose_of "$n"); [ -n "$f" ] || return 1; confirm "将停止并删除项目 $n、非 external 卷和项目目录，确认？" || return
+ mapfile -t outside < <(docker compose -f "$f" config --format json 2>/dev/null | python3 -c "import json,sys,os; d=json.load(sys.stdin); [print(v.get('source','')) for s in d.get('services',{}).values() for v in s.get('volumes',[]) if isinstance(v,dict) and v.get('type')=='bind' and v.get('source','') and not os.path.realpath(v['source']).startswith('/docker/$n/')]")
+ if ((${#outside[@]})); then printf '项目外 bind mount：\n%s\n' "${outside[*]}"; if confirm "同时删除以上项目外 bind mount 路径？"; then for p in "${outside[@]}"; do valid_path "$p" && [ "$p" != / ] && rm -rf -- "$p"; done; fi; fi
+ mapfile -t images < <(docker compose -f "$f" config --images 2>/dev/null | sort -u)
+ mapfile -t vols < <(external_volumes "$f")
+ ((${#vols[@]})) && warn "external 卷将保留：${vols[*]}"
+ docker compose -f "$f" down -v || { err "项目停止/删除失败。"; return 1; }
+ rm -rf -- "/docker/$n"
+ for p in "${images[@]}"; do docker image rm "$p" 2>/dev/null || warn "镜像 $p 仍被其他容器使用或无法删除，已保留。"; done
+ state_update "d['docker_projects']=[x for x in d['docker_projects'] if x.get('name')!='$n']"; ok "项目已删除。"
+}
+docker_module() { local a n; while :; do clear; echo 'Docker 项目管理'; echo '1. 当前状态  2. 新建项目  3. 启动/更新项目  4. 项目详情'; echo '5. 清空项目日志  6. 删除项目  7. 查看日志  8. 健康检查'; echo '9. 卸载全部  0. 返回主菜单'; read -r -p '选择：' a; case "$a" in 1) docker info >/dev/null 2>&1 && { systemctl status docker --no-pager -n 4; docker ps -a; } || warn 'Docker 未安装或未运行。'; pause;; 2) install_docker && new_project; pause;; 3|4|5|6) read -r -p '项目名称：' n; valid_name "$n" || { err '无效项目名。'; pause; continue; }; case "$a" in 3) start_project "$n";;4) project_status "$n";;5) clear_project_logs "$n";;6) delete_project "$n";;esac; pause;; 7) journalctl -u docker -n 50 --no-pager; pause;; 8) health_check; pause;; 9) uninstall_docker;; 0) return;; *) err '无效选择。'; pause;; esac; done; }
 
-    # 1. 自动准备依赖
-    apt-get update && apt-get install -y ca-certificates curl gnupg lsb-release
-
-    # 2. 配置官方 APT 稳定源
-    mkdir -p /etc/apt/keyrings
-    rm -f /etc/apt/keyrings/docker.gpg
-    curl -fsSL "https://download.docker.com/linux/${OS_NAME}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_NAME} \
-      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    apt-get update
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-    # 3. 启用并启动 Docker
-    systemctl enable docker
-    systemctl start docker
-
-    # 验证
-    if ! systemctl is-active --quiet docker; then
-        log_error "Docker 服务未成功启动！"
-        return 1
-    fi
-    if ! docker info >/dev/null 2>&1; then
-        log_error "Docker 命令行检测失败，无法通信！"
-        return 1
-    fi
-
-    # 4. 配置日志轮转 (合并 daemon.json)
-    local daemon_conf="/etc/docker/daemon.json"
-    if [ -f "$daemon_conf" ]; then
-        # 备份一份
-        cp "$daemon_conf" "${daemon_conf}.bak"
-        # 合并 log-driver 与 log-opts
-        python3 -c "
-import json, os
-path = '$daemon_conf'
-try:
-    with open(path) as f:
-        data = json.load(f)
-except:
-    data = {}
-
-data['log-driver'] = 'json-file'
-if 'log-opts' not in data:
-    data['log-opts'] = {}
-data['log-opts']['max-size'] = '100m'
-data['log-opts']['max-file'] = '3'
-
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
-"
-    else:
-        mkdir -p /etc/docker
-        cat <<EOF > "$daemon_conf"
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m",
-    "max-file": "3"
-  }
+install_nginx() { apt_update && apt_install nginx-full libnginx-mod-stream || return; systemctl enable --now nginx && nginx -t && service_ok nginx || { err 'Nginx 验证失败。'; return 1; }; ok 'Nginx 已安装。'; }
+nginx_site_path() { printf '/etc/nginx/sites-available/%s.conf' "$1"; }
+write_site() {
+ local n="$1" d="$2" u="$3" size="$4" cert="$5" port; port=$(state_get web_tls_port)
+ local tmp; tmp=$(mktemp)
+ cat >"$tmp" <<EOF
+$MARKER
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $d;
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen $port ssl http2;
+    server_name $d;
+    client_max_body_size $size;
+    server_tokens off;
+    ssl_certificate /etc/letsencrypt/live/$cert/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$cert/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    location / {
+        proxy_pass http://127.0.0.1:$u;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_connect_timeout 15s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
+        send_timeout 3600s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+    }
 }
 EOF
-    fi
-
-    # 重载 Docker 使配置生效
-    systemctl daemon-reload
-    systemctl restart docker
-
-    log_success "Docker 安装与日志轮换配置成功！"
-    log_info "注意：新日志轮转限制仅对重新创建后的容器生效。"
+ mv -f -- "$tmp" "$(nginx_site_path "$n")"; ln -sfn "$(nginx_site_path "$n")" "/etc/nginx/sites-enabled/$n.conf"
 }
-
-install_nginx() {
-    log_info "准备安装/检查 Nginx..."
-    apt-get update
-    apt-get install -y nginx-full libnginx-mod-stream
-
-    # 启用并开启
-    systemctl enable nginx
-    systemctl start nginx
-
-    # 验证
-    if ! nginx -t >/dev/null 2>&1; then
-        log_error "Nginx 配置文件验证失败！"
-        return 1
-    fi
-    if ! systemctl is-active --quiet nginx; then
-        log_error "Nginx 服务未能成功启动！"
-        return 1
-    fi
-
-    # 初始化配置目录与 WebSocket 优化 Map (Managed by vps-toolkit)
-    if [ ! -f "$NGINX_WS_MAP_CONF" ]; then
-        mkdir -p /etc/nginx/conf.d
-        cat <<'EOF' > "$NGINX_WS_MAP_CONF"
-# Managed by vps-toolkit
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
+ensure_map() { cat >"$NGINX_MAP_CONF" <<EOF
+$MARKER
+map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+EOF
+ nginx -t || return 1; }
+cert_install() { apt_update && apt_install certbot python3-certbot-dns-cloudflare || return; cat > /etc/letsencrypt/renewal-hooks/deploy/vps-toolkit-nginx-reload <<EOF
+#!/bin/sh
+$MARKER
+nginx -t && systemctl reload nginx
+EOF
+ chmod 755 /etc/letsencrypt/renewal-hooks/deploy/vps-toolkit-nginx-reload
+ systemctl enable --now certbot.timer && systemctl is-enabled --quiet certbot.timer && systemctl is-active --quiet certbot.timer; }
+cf_token_menu() { local a t; while :; do echo '1. 是否存在 2. 更新 Token 3. 删除 Token 0. 返回'; read -r -p '选择：' a; case "$a" in 1) [ -f "$CF_INI" ] && echo 'Token 文件存在。' || echo 'Token 文件不存在。';;2) read -r -p 'Cloudflare API Token（输入时会回显）：' t; [ -n "$t" ] || { err 'Token 不能为空。'; continue; }; mkdir -p "$CF_DIR"; printf 'dns_cloudflare_api_token = %s\n' "$t" > "$CF_INI"; chmod 600 "$CF_INI";;3) confirm '删除 Cloudflare Token？' && rm -f -- "$CF_INI";;0) return;;esac; done; }
+request_cert() {
+ local cert="$1" domain mail; shift; domain="$1"
+ [ -f "$CF_INI" ] || { warn '尚未配置 Cloudflare Token。'; cf_token_menu; }; [ -f "$CF_INI" ] || return 1
+ mail="$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)@${domain#*.}"
+ local -a args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_INI" --non-interactive --agree-tos --email "$mail" --cert-name "$cert")
+ for domain in "$@"; do args+=(-d "$domain"); done
+ certbot "${args[@]}"
+}
+new_site() {
+ install_nginx || return; cert_install || return
+ local n d u size cert; read -r -p '站点名称：' n; valid_name "$n" || { err '无效站点名称。'; return; }; [ ! -e "$(nginx_site_path "$n")" ] || { err '站点已存在。'; return; }
+ read -r -p '域名：' d; valid_domain "$d" || { err '无效域名。'; return; }; read -r -p '本机 HTTP 上游端口：' u; valid_port "$u" || { err '无效端口。'; return; }; read -r -p '上传上限（默认 20G）：' size; size=${size:-20G}; valid_size "$size" || { err '无效上传上限。'; return; }; cert="$n"
+ request_cert "$cert" "$d" || { err '证书申请失败，未写入站点配置。请确认 DNS Token 权限、域名解析和网络。'; return; }
+ backup_begin; ensure_map && write_site "$n" "$d" "$u" "$size" "$cert" && nginx_test_reload || { err 'Nginx 配置失败，正在回滚。'; backup_restore; return 1; }; backup_commit
+ state_update "d['nginx_sites'].append({'name':'$n','domain':'$d','upstream_port':$u,'certificate':'$cert'}); d['certificates']=list(set(d['certificates']+['$cert']))"; ok "站点已创建。standard 模式需开放 TCP 80、443；SNI 模式仍需开放 TCP 80、443。"
+}
+edit_site() { local n="$1" p; p=$(nginx_site_path "$n"); [ -f "$p" ] && grep -qF "$MARKER" "$p" || { err '只能编辑本工具管理的站点。'; return 1; }; backup_begin; editor "$p"; nginx -t && systemctl reload nginx || { err '编辑后的配置无效，正在恢复。'; backup_restore; return 1; }; backup_commit; ok '站点配置已应用。'; }
+delete_site() { local n="$1" p cert refs; p=$(nginx_site_path "$n"); [ -f "$p" ] && grep -qF "$MARKER" "$p" || return 1; cert=$(awk '/ssl_certificate[[:space:]]/{print $2;exit}' "$p"|sed 's|/fullchain.pem;||;s|/etc/letsencrypt/live/||'); confirm "删除受管站点 $n？" || return; backup_begin; rm -f -- "$p" "/etc/nginx/sites-enabled/$n.conf"; nginx_test_reload || { err '删除后验证失败，正在恢复。'; backup_restore; return 1; }; backup_commit; state_update "d['nginx_sites']=[x for x in d['nginx_sites'] if x.get('name')!='$n']"; refs=$(grep -rlF "/etc/letsencrypt/live/$cert/" /etc/nginx/sites-available 2>/dev/null|wc -l); [ "$refs" -gt 0 ] && warn "证书 $cert 仍被其他站点引用，未删除。" || warn "证书 $cert 未自动删除，请在证书管理中处理。"; ok '站点已删除。'; }
+set_sni_mode() {
+ install_nginx || return; local target="$1" intp mode; mode=$(state_get network_mode); [ "$target" = "$mode" ] && { warn '已是该网络模式。'; return; }
+ if [ "$target" = sni ]; then read -r -p 'sing-box 内部端口（默认 8889）：' intp; intp=${intp:-8889}; valid_port "$intp" || { err '端口无效。'; return; }; port_free 443 || { err "TCP 443 被占用："; port_owner 443; return 1; }; [ "$(state_get sing_box.mode)" != independent ] || { err '独立公网 sing-box 与 SNI 模式冲突，请先停止或切换 sing-box。'; return; }; else confirm '将受管站点迁回公网 443，确认？' || return; fi
+ backup_begin
+ if [ "$target" = sni ]; then
+  cat >"$NGINX_STREAM_CONF" <<EOF
+$MARKER
+stream {
+    map \$ssl_preread_server_name \$vps_toolkit_upstream { include $NGINX_STREAM_INCLUDE; default 127.0.0.1:$intp; }
+    server { listen 443 reuseport; ssl_preread on; proxy_pass \$vps_toolkit_upstream; }
 }
 EOF
-        nginx -t && systemctl reload nginx
-    fi
-
-    log_success "Nginx 安装并启动成功！"
+  ensure_stream_loader || { err '无法安全写入 Nginx stream 加载配置。'; backup_restore; return 1; }
+  : >"$NGINX_STREAM_INCLUDE"; while IFS=$'\t' read -r d n; do printf '%s 127.0.0.1:8443;\n' "$d" >> "$NGINX_STREAM_INCLUDE"; sed -i -E 's/listen (\[::\]:)?443 ssl/listen 127.0.0.1:8443 ssl/' "$(nginx_site_path "$n")"; done < <(python3 - "$STATE" <<'PY'
+import json,sys
+for x in json.load(open(sys.argv[1]))['nginx_sites']: print(x['domain']+'\t'+x['name'])
+PY
+)
+ else
+  remove_stream_loader; find /etc/nginx/sites-available -maxdepth 1 -type f -exec grep -lF '# Managed by vps-toolkit' {} + | while read -r f; do sed -i 's/listen 127.0.0.1:8443 ssl/listen 443 ssl/' "$f"; done
+ fi
+ nginx -t && systemctl restart nginx && systemctl is-active --quiet nginx || { err '模式切换失败，正在完整回滚。'; backup_restore; return 1; }
+ if [ "$target" = sni ]; then state_update "d['network_mode']='sni'; d['web_tls_port']=8443; d['sing_box']['port']=$intp"; else state_update "d['network_mode']='standard'; d['web_tls_port']=443"; fi; backup_commit; ok "网络模式已切换为 $target。"
 }
-
-install_certbot() {
-    log_info "准备安装/检查 Certbot..."
-    apt-get update
-    apt-get install -y certbot python3-certbot-dns-cloudflare
-
-    # 启用 Certbot 续期定时器
-    systemctl enable certbot.timer
-    systemctl start certbot.timer
-
-    if ! systemctl is-active --quiet certbot.timer; then
-        log_warn "Certbot timer 定时器未启动，请稍后检查。"
-    else
-        local next_run
-        next_run=$(systemctl list-timers certbot.timer | tail -n +2 | head -n 1 | awk '{print $1,$2,$3}')
-        log_info "Certbot.timer 状态: active | 下次执行时间: $next_run"
-    fi
-
-    # 写入部署 hook 脚本 (仅当 nginx 验证通过时重载)
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    local hook_file="/etc/letsencrypt/renewal-hooks/deploy/vps-toolkit-reload-nginx.sh"
-    cat <<'EOF' > "$hook_file"
-#!/bin/bash
-# Managed by vps-toolkit
-if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx
-fi
-EOF
-    chmod +x "$hook_file"
-    log_success "Certbot 及其 Cloudflare DNS 插件配置成功！"
-}
+cert_menu() { local a n; while :; do clear; echo '证书与 Cloudflare 管理'; echo '1. Token 管理 2. 列表 3. 详情 4. dry-run 5. 立即续期 6. 删除证书 0. 返回'; read -r -p '选择：' a; case "$a" in 1) cf_token_menu;;2) certbot certificates;;3) read -r -p '证书名称：' n; certbot certificates --cert-name "$n";;4) certbot renew --dry-run;;5) certbot renew;;6) read -r -p '证书名称：' n; grep -rlF "/etc/letsencrypt/live/$n/" /etc/nginx/sites-available 2>/dev/null && { err '仍有受管站点引用该证书，拒绝删除。'; } || { confirm "删除证书 $n？" && certbot delete --cert-name "$n"; };;0) return;;esac; pause; done; }
+nginx_module() { local a n; while :; do clear; echo 'Nginx 反向代理管理'; echo '1. 当前状态 2. 新建站点 3. 编辑站点 4. 删除站点'; echo '5. 切换 standard 6. 切换 SNI 7. 证书/Cloudflare 8. 查看日志 9. 健康检查'; echo '10. 卸载全部 0. 返回主菜单'; read -r -p '选择：' a; case "$a" in 1) systemctl status nginx --no-pager -n 5; ss -ltnp | grep -E ':(80|443|8443)\b' || true; pause;;2) new_site; pause;;3) read -r -p '站点名称：' n; valid_name "$n" && edit_site "$n"; pause;;4) read -r -p '站点名称：' n; valid_name "$n" && delete_site "$n"; pause;;5) set_sni_mode standard; pause;;6) set_sni_mode sni; pause;;7) cert_menu;;8) journalctl -u nginx -n 50 --no-pager; pause;;9) health_check; pause;;10) uninstall_nginx;;0) return;;*) err '无效选择。'; pause;;esac; done; }
 
 install_singbox() {
-    log_info "准备安装/检查 sing-box..."
-    
-    # 导入官方 GPG Key 并配置 APT 官方源
-    mkdir -p /etc/apt/keyrings
-    rm -f /etc/apt/keyrings/sing-box.gpg
-    curl -fsSL https://sing-box.files.fedoraproject.org/apt/gpg | gpg --dearmor -o /etc/apt/keyrings/sing-box.gpg
-    chmod a+r /etc/apt/keyrings/sing-box.gpg
-
-    echo "deb [signed-by=/etc/apt/keyrings/sing-box.gpg] https://sing-box.files.fedoraproject.org/apt/ stable main" | tee /etc/apt/sources.list.d/sing-box.list > /dev/null
-
-    apt-get update
-    apt-get install -y sing-box
-
-    # 检查 sing-box 是否可用
-    if ! command -v sing-box >/dev/null 2>&1; then
-        log_error "sing-box 官方源安装失败，请手动确认依赖环境。"
-        return 1
-    fi
-
-    # 配置 systemd 额外限制参数
-    mkdir -p "$SB_SERVICE_DIR"
-    cat <<EOF > "$SB_SERVICE_CONF"
-# Managed by vps-toolkit
+ apt_install curl ca-certificates gnupg || return; install -m 0755 -d /etc/apt/keyrings
+ if [ ! -f /etc/apt/keyrings/sagernet.asc ]; then curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc || return; chmod a+r /etc/apt/keyrings/sagernet.asc; fi
+ printf 'deb [signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *\n' >/etc/apt/sources.list.d/sagernet.list
+ apt_update && apt_install sing-box || return
+}
+geo_name() { local ip city; ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null) || true; city=$(curl -fsS --max-time 5 "https://ipapi.co/${ip}/city/" 2>/dev/null|tr -d '\n') || true; printf '%s' "${city:-${ip:-VPS}}"; }
+write_singbox() {
+ local mode="$1" port="$2" sni="$3" uuid="$4" priv="$5" pub="$6" sid="$7" listen; [ "$mode" = sni ] && listen=127.0.0.1 || listen=::
+ cat >"$SB_CONFIG.tmp" <<EOF
+{
+  "$MARKER": true,
+  "metadata": {"vps_toolkit_mode":"$mode"},
+  "log": {"level":"info","output":"/var/log/sing-box/sing-box.log","timestamp":true},
+  "inbounds": [{"type":"vless","tag":"vless-reality","listen":"$listen","listen_port":$port,"users":[{"name":"default","uuid":"$uuid","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"$sni","reality":{"enabled":true,"handshake":{"server":"$sni","server_port":443},"private_key":"$priv","short_id":["$sid"]}}}]
+}
+EOF
+ install -d -m 700 /etc/sing-box /var/log/sing-box; install -m 600 "$SB_CONFIG.tmp" "$SB_CONFIG"; rm -f -- "$SB_CONFIG.tmp"
+ cat >"$SB_UNIT" <<EOF
+[Unit]
+Description=sing-box service ($TOOL)
+After=network-online.target
+Wants=network-online.target
+$MARKER
 [Service]
+Type=simple
+ExecStart=/usr/bin/sing-box run -c $SB_CONFIG
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    log_success "sing-box 环境配置成功！"
+ chmod 644 "$SB_UNIT"; systemctl daemon-reload
+}
+create_singbox() {
+ install_singbox || return; local mode port sni uuid keys priv pub sid; echo '1. 独立公网模式 2. SNI 分流模式'; read -r -p '选择：' mode; [ "$mode" = 1 ] && mode=independent || [ "$mode" = 2 ] && mode=sni || { err '无效选择。'; return; }
+ if [ "$mode" = sni ]; then [ "$(state_get network_mode)" = sni ] || { err '请先在 Nginx 模块启用 SNI 分流。'; return; }; port=$(state_get sing_box.port); else read -r -p '公网监听端口（默认 443）：' port; port=${port:-443}; valid_port "$port" || { err '端口无效。'; return; }; port_free "$port" || { err "端口被占用："; port_owner "$port"; return; }; fi
+ read -r -p 'Reality SNI（默认 www.bing.com）：' sni; sni=${sni:-www.bing.com}; valid_domain "$sni" || { err 'SNI 域名无效。'; return; }; uuid=$(sing-box generate uuid) || return; keys=$(sing-box generate reality-keypair) || return; priv=$(awk '/PrivateKey/{print $2}' <<<"$keys"); pub=$(awk '/PublicKey/{print $2}' <<<"$keys"); sid=$(openssl rand -hex 8)
+ write_singbox "$mode" "$port" "$sni" "$uuid" "$priv" "$pub" "$sid" || return; sing-box check -c "$SB_CONFIG" || { err 'sing-box 配置校验失败。'; return; }; systemctl enable --now sing-box && service_ok sing-box || { err '启动失败：'; journalctl -u sing-box -n 30 --no-pager; return 1; }; ss -ltn | grep -q ":$port " || { err '未检测到监听端口。'; return 1; }
+ state_update "d['sing_box']={'mode':'$mode','port':$port,'sni':'$sni','public_key':'$pub','short_id':'$sid','users':[{'name':'default','uuid':'$uuid'}]}"; ok "sing-box 已启动。请自行在防火墙/安全组开放 TCP $([ "$mode" = independent ] && echo "$port" || echo 443)。"
+}
+sb_users() { state_json sing_box.users | python3 -c "import json,sys; [print(x['name']) for x in json.load(sys.stdin)]"; }
+sb_link() { local name="$1"; python3 - "$STATE" "$name" <<'PY'
+import json,sys,urllib.parse
+s=json.load(open(sys.argv[1]))['sing_box']; u=next((x for x in s.get('users',[]) if x['name']==sys.argv[2]),None)
+if not u: raise SystemExit(1)
+host=__import__('subprocess').getoutput('curl -4fsS --max-time 5 https://api.ipify.org') or '服务器IP'
+label=__import__('subprocess').getoutput('curl -fsS --max-time 5 https://ipapi.co/'+host+'/city/') or host
+q={'encryption':'none','flow':'xtls-rprx-vision','security':'reality','sni':s['sni'],'pbk':s['public_key'],'sid':s['short_id'],'type':'tcp','headerType':'none','fp':'chrome'}
+print('vless://'+u['uuid']+'@'+host+':'+str(s['port'])+'?'+urllib.parse.urlencode(q,safe='')+'#'+urllib.parse.quote(label.strip()))
+PY
+}
+sb_modify_user() {
+ local action="$1" name uuid; read -r -p '用户名：' name; valid_name "$name" || { err '无效用户名。'; return; }; case "$action" in add) uuid=$(sing-box generate uuid); state_update "d['sing_box']['users'].append({'name':'$name','uuid':'$uuid'})";;reset) uuid=$(sing-box generate uuid); state_update "[x.update({'uuid':'$uuid'}) for x in d['sing_box']['users'] if x['name']=='$name']";;del) local count; count=$(state_json sing_box.users | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))'); [ "$count" -gt 1 ] || confirm '这是最后一个用户，删除会令入站没有可用用户，确认？' || return; confirm "删除用户 $name？" || return; state_update "d['sing_box']['users']=[x for x in d['sing_box']['users'] if x['name']!='$name']";;esac
+ # 将状态中全部用户安全写回配置，私钥不进入状态，仍从现有配置读取。
+ python3 - "$STATE" "$SB_CONFIG" <<'PY'
+import json,sys,os,tempfile
+s=json.load(open(sys.argv[1]))['sing_box']; p=sys.argv[2]; d=json.load(open(p)); d['inbounds'][0]['users']=[{'name':x['name'],'uuid':x['uuid'],'flow':'xtls-rprx-vision'} for x in s['users']]
+fd,t=tempfile.mkstemp(dir=os.path.dirname(p));
+with os.fdopen(fd,'w') as f:json.dump(d,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+os.chmod(t,0o600);os.replace(t,p)
+PY
+ sing-box check -c "$SB_CONFIG" && systemctl restart sing-box && systemctl is-active --quiet sing-box || { err '用户变更未能启动服务，请检查 journal。'; journalctl -u sing-box -n 30 --no-pager; return 1; }; ok '用户已更新。'
+}
+singbox_module() { local a n; while :; do clear; echo 'sing-box VLESS Reality 管理'; echo '1. 当前状态 2. 创建/重建入站 3. 列出用户 4. 新增用户'; echo '5. 查看节点链接 6. 重置 UUID 7. 删除用户 8. 查看日志 9. 健康检查'; echo '10. 卸载全部 0. 返回主菜单'; read -r -p '选择：' a; case "$a" in 1) systemctl status sing-box --no-pager -n 10; [ -f "$SB_CONFIG" ] && sing-box check -c "$SB_CONFIG"; pause;;2) create_singbox; pause;;3) sb_users; pause;;4) sb_modify_user add; pause;;5) read -r -p '用户名：' n; sb_link "$n" || err '用户不存在。'; pause;;6) sb_modify_user reset; pause;;7) sb_modify_user del; pause;;8) journalctl -u sing-box -n 50 --no-pager; pause;;9) health_check; pause;;10) uninstall_singbox;;0) return;;*) err '无效选择。'; pause;;esac; done; }
+
+health_check() {
+ echo '========== VPS Toolkit 健康检查 =========='
+ printf '系统：%s\n磁盘：%s\n内存：%s\n负载：%s\n' "$(. /etc/os-release;echo "$PRETTY_NAME")" "$(df -h /|awk 'NR==2{print $3"/"$2" ("$5")"}')" "$(free -h|awk '/Mem:/{print $3"/"$2}')" "$(uptime|sed 's/.*load average: //')"
+ printf '\nDocker：active=%s enabled=%s 容器=%s 用量=%s 日志轮转=%s\n' "$(systemctl is-active docker 2>/dev/null)" "$(systemctl is-enabled docker 2>/dev/null)" "$(docker ps -aq 2>/dev/null|wc -l)" "$(docker system df --format '{{.Size}}' 2>/dev/null|tr '\n' ' ')" "$(python3 -c "import json;print(json.load(open('/etc/docker/daemon.json')).get('log-opts',{}))" 2>/dev/null)"
+ python3 - "$STATE" <<'PY'
+import json,sys
+for x in json.load(open(sys.argv[1])).get('docker_projects',[]): print('受管项目：'+x['name']+'（请核查 restart policy；非 always/unless-stopped 有重启风险）')
+PY
+ printf '\nNginx：active=%s enabled=%s 测试=' "$(systemctl is-active nginx 2>/dev/null)" "$(systemctl is-enabled nginx 2>/dev/null)"; nginx -t >/dev/null 2>&1 && echo '通过' || echo '失败'; ss -ltnp | grep -E ':(80|443|8443|8889)\b' || true
+ printf '网络模式：%s；Web TLS 内部/公网端口：%s；真实路径：%s\n' "$(state_get network_mode)" "$(state_get web_tls_port)" "$([ "$(state_get network_mode)" = sni ] && echo '443 -> stream -> 网站 127.0.0.1:8443，其他 SNI -> sing-box' || echo 'Nginx 直接监听 80/443')"
+ printf '\nCertbot：timer active=%s enabled=%s\n' "$(systemctl is-active certbot.timer 2>/dev/null)" "$(systemctl is-enabled certbot.timer 2>/dev/null)"; systemctl list-timers certbot.timer --no-pager 2>/dev/null|tail -1; certbot certificates 2>/dev/null|grep -E 'Expiry Date|Certificate Name' || true
+ printf '\nsing-box：active=%s enabled=%s 配置=' "$(systemctl is-active sing-box 2>/dev/null)" "$(systemctl is-enabled sing-box 2>/dev/null)"; [ -f "$SB_CONFIG" ] && sing-box check -c "$SB_CONFIG" >/dev/null 2>&1 && echo '通过' || echo '未安装或失败'; printf '监听：'; ss -ltnp | grep sing-box || true
+ if state_drift; then echo '状态文件：检测到漂移，可在主菜单重新扫描。'; else echo '状态文件：索引与已知受管资源一致。'; fi
 }
 
-# ==========================================
-# 6. Docker 项目管理模块
-# ==========================================
-docker_project_menu() {
-    while true; do
-        echo -e "\n${CYAN}====== Docker 项目管理 ======${NC}"
-        echo -e "1. 新建 Docker 项目"
-        echo -e "2. 管理现有项目"
-        echo -e "3. 查看所有项目健康状况"
-        echo -e "4. 卸载 Docker 模块"
-        echo -e "0. 返回主菜单"
-        read -p "请选择操作 [0-4]: " opt
-        case "$opt" in
-            1) docker_project_create ;;
-            2) docker_project_manage_list ;;
-            3) docker_project_health_all ;;
-            4) docker_uninstall_confirm ;;
-            0) break ;;
-            *) log_warn "无效选项！" ;;
-        esac
-    done
-}
-
-docker_project_create() {
-    log_info "新建 Docker 项目"
-    local name
-    read -p "请输入项目名称 (限英文/数字/./_/-, 字母/数字开头): " name
-    # 校验命名规范
-    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-        log_error "项目名格式不正确！"
-        return 1
-    fi
-
-    local proj_dir="/docker/${name}"
-    if [ -d "$proj_dir" ]; then
-        log_warn "该项目目录已存在 ($proj_dir)"
-        if ! confirm "是否继续覆盖/编辑该目录下的 compose 配置文件?"; then
-            return 0
-        fi
-    fi
-
-    mkdir -p "$proj_dir"
-    local compose_file="${proj_dir}/compose.yaml"
-
-    # 如果文件不存在，写入默认框架注释
-    if [ ! -f "$compose_file" ]; then
-        cat <<EOF > "$compose_file"
-# Managed by vps-toolkit
-# Project: ${name}
-# 请在下方输入你的 docker-compose 配置。提示：要随系统自启，请确保添加 "restart: unless-stopped"
-
-services:
-
-EOF
-    fi
-
-    # 编辑配置
-    local editor="nano"
-    if [ -n "$EDITOR" ]; then
-        editor="$EDITOR"
-    elif command -v vi >/dev/null 2>&1; then
-        editor="vi"
-    fi
-
-    $editor "$compose_file"
-
-    # 校验 compose 配置
-    log_info "正在验证 Compose 配置文件有效性..."
-    if ! docker compose -f "$compose_file" config -q; then
-        log_error "Compose 格式错误！请重新编辑。"
-        return 1
-    fi
-
-    log_success "配置文件验证通过！"
-    state_add_project "$name" "$proj_dir" "$compose_file"
-
-    if confirm "是否立即启动/更新此项目？"; then
-        docker_project_up "$name" "$compose_file"
-    fi
-}
-
-docker_project_up() {
-    local name="$1"
-    local compose="$2"
-    log_info "正在启动项目 [${name}]..."
-    if docker compose -f "$compose" up -d; then
-        log_success "项目 [${name}] 启动成功！"
-    else
-        log_error "项目启动失败！输出最后 30 行容器日志："
-        docker compose -f "$compose" logs --tail=30
-        return 1
-    fi
-}
-
-docker_project_manage_list() {
-    local projects
-    projects=$(state_get "docker_projects")
-    if [ -z "$projects" ] || [ "$projects" = "[]" ] || [ "$projects" = "null" ]; then
-        log_info "当前没有受管 Docker 项目。"
-        return 0
-    fi
-
-    local p_count
-    p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-
-    while true; do
-        echo -e "\n${CYAN}--- 选择要管理的 Docker 项目 ---${NC}"
-        for ((i=0; i<p_count; i++)); do
-            local p_name
-            p_name=$(state_get "docker_projects.${i}.name")
-            echo -e "$((i+1)). ${p_name}"
-        done
-        echo -e "0. 返回"
-        read -p "请选择项目编号 [0-${p_count}]: " idx
-        if [ "$idx" = "0" ] || [ -z "$idx" ]; then
-            break
-        fi
-
-        if (( idx > 0 && idx <= p_count )); then
-            local target_name
-            local target_compose
-            target_name=$(state_get "docker_projects.$((idx-1)).name")
-            target_compose=$(state_get "docker_projects.$((idx-1)).compose_file")
-            docker_project_operations "$target_name" "$target_compose"
-            # 刷新列表，以防有删除操作
-            p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-            [ "$p_count" -eq 0 ] && break
-        else
-            log_warn "输入无效！"
-        fi
-    done
-}
-
-docker_project_operations() {
-    local name="$1"
-    local compose="$2"
-    while true; do
-        echo -e "\n${CYAN}=== 项目 [${name}] 操作菜单 ===${NC}"
-        echo -e "1. 启动/更新项目 (up -d)"
-        echo -e "2. 停止项目 (stop)"
-        echo -e "3. 重启项目 (restart)"
-        echo -e "4. 查看运行状态"
-        echo -e "5. 清空容器日志 (Truncate)"
-        echo -e "6. 修改 Compose 配置文件"
-        echo -e "7. 删除项目并清理数据 (down & clean)"
-        echo -e "0. 返回"
-        read -p "选择操作 [0-7]: " opt
-        case "$opt" in
-            1) docker_project_up "$name" "$compose" ;;
-            2) 
-                log_info "停止项目..."
-                docker compose -f "$compose" stop 
-                ;;
-            3) 
-                log_info "重启项目..."
-                docker compose -f "$compose" restart 
-                ;;
-            4) docker_project_status "$name" "$compose" ;;
-            5) docker_project_logs_truncate "$name" "$compose" ;;
-            6) 
-                local editor="nano"
-                [ -n "$EDITOR" ] && editor="$EDITOR" || (command -v vi >/dev/null 2>&1 && editor="vi")
-                $editor "$compose"
-                if docker compose -f "$compose" config -q; then
-                    log_success "配置修改成功并验证通过！"
-                    if confirm "是否立即应用新配置以启动/更新服务?"; then
-                        docker_project_up "$name" "$compose"
-                    fi
-                else
-                    log_error "语法有误，请重新检查！"
-                fi
-                ;;
-            7) 
-                if docker_project_delete "$name" "$compose"; then
-                    break
-                fi
-                ;;
-            0) break ;;
-        esac
-    done
-}
-
-docker_project_status() {
-    local name="$1"
-    local compose="$2"
-    echo -e "\n${GREEN}=== 项目 [${name}] 状态详情 ===${NC}"
-    # 项目大小
-    local proj_dir
-    proj_dir=$(dirname "$compose")
-    local size_info
-    size_info=$(du -sh "$proj_dir" 2>/dev/null | awk '{print $1}')
-    echo -e "项目目录大小: ${size_info}"
-
-    # 容器详情
-    docker compose -f "$compose" ps -a --format "table {{.Name}}\t{{.State}}\t{{.Status}}\t{{.Ports}}"
-}
-
-docker_project_logs_truncate() {
-    local name="$1"
-    local compose="$2"
-    log_warn "该操作将清空项目 [${name}] 下所有容器的 stdout/stderr 日志，此操作不可逆！"
-    if confirm "确定要清空日志吗?"; then
-        # 寻找对应的 json-file 驱动路径
-        local containers
-        containers=$(docker compose -f "$compose" ps -q)
-        if [ -z "$containers" ]; then
-            log_info "项目未运行，没有活跃的容器日志。"
-            return 0
-        fi
-
-        for c_id in $containers; do
-            local log_path
-            log_path=$(docker inspect --format='{{.LogPath}}' "$c_id" 2>/dev/null)
-            if [ -n "$log_path" ] && [ -f "$log_path" ]; then
-                truncate -s 0 "$log_path"
-                log_success "已清空容器 [$(docker inspect --format='{{.Name}}' "$c_id" | cut -c2-)] 的日志文件"
-            else
-                log_info "容器 [$(docker inspect --format='{{.Name}}' "$c_id" | cut -c2-)] 未使用 json-file 驱动，无法 truncate 清理。"
-            fi
-        done
-    fi
-}
-
-docker_project_delete() {
-    local name="$1"
-    local compose="$2"
-    local proj_dir
-    proj_dir=$(dirname "$compose")
-
-    log_warn "警告：您正在请求彻底删除受管项目 [${name}]。"
-    log_warn "这会执行 docker compose down -v (删除容器、网络及非 external 卷) 并且物理删除目录: ${proj_dir}"
-    if ! confirm "确定执行此破坏性操作吗？"; then
-        return 1
-    fi
-
-    log_info "1. 停止并释放容器及内部卷..."
-    # 记录该项目启动过的镜像，以便稍后清理
-    local images
-    images=$(docker compose -f "$compose" images -q 2>/dev/null | sort -u)
-
-    docker compose -f "$compose" down -v
-
-    # 2. 扫描并处理 bind mount
-    log_info "2. 扫描挂载目录 (bind mounts)..."
-    local bind_mounts=()
-    # 用 python 解析 compose 获取所有宿主机路径
-    while IFS= read -r path; do
-        if [ -n "$path" ]; then
-            bind_mounts+=("$path")
-        fi
-    done < <(python3 -c "
-import yaml, sys
-try:
-    with open('$compose') as f:
-        cfg = yaml.safe_load(f)
-    for svc in cfg.get('services', {}).values():
-        for vol in svc.get('volumes', []):
-            if isinstance(vol, str):
-                parts = vol.split(':')
-                if len(parts) >= 2 and parts[0].startswith('/') and not parts[0].startswith('$proj_dir'):
-                    print(parts[0])
-            elif isinstance(vol, dict) and vol.get('type') == 'bind':
-                src = vol.get('source')
-                if src and src.startswith('/') and not src.startswith('$proj_dir'):
-                    print(src)
-except Exception as e:
-    pass
-" 2>/dev/null)
-
-    # 3. 删除项目物理目录 (宿主机 /docker/name/ 的数据)
-    log_info "3. 清理物理项目目录..."
-    rm -rf -- "$proj_dir"
-
-    # 处理项目外的 bind mount 询问
-    if [ ${#bind_mounts[@]} -gt 0 ]; then
-        log_warn "检测到以下位于项目目录外的绑定挂载目录："
-        for bm in "${bind_mounts[@]}"; do
-            echo " - $bm"
-        done
-        if confirm "是否同时删除上述项目外的挂载数据？"; then
-            for bm in "${bind_mounts[@]}"; do
-                if [ -d "$bm" ] || [ -f "$bm" ]; then
-                    rm -rf -- "$bm"
-                    log_success "已删除: $bm"
-                fi
-            done
-        fi
-    fi
-
-    # 4. 尝试清理不再被其他容器占用的镜像
-    log_info "4. 尝试卸载项目相关的 Docker 镜像..."
-    for img in $images; do
-        # 检查是否还有容器在使用该镜像 (包含其他独立运行 of 容器)
-        local count
-        count=$(docker ps -a --filter=ancestor="$img" -q | wc -l)
-        if [ "$count" -eq 0 ]; then
-            log_info "移除镜像: $img"
-            docker image rm "$img" >/dev/null 2>&1 || log_info "镜像 $img 移除失败 (可能已不存在或被其他网络缓存引用)"
-        else
-            log_info "保留镜像 $img，当前仍有 $count 个外部容器在使用。"
-        fi
-    done
-
-    # 5. 从状态管理中移除
-    state_remove_project "$name"
-    log_success "项目 [${name}] 删除并清理完毕！"
-    return 0
-}
-
-docker_project_health_all() {
-    local projects
-    projects=$(state_get "docker_projects")
-    if [ -z "$projects" ] || [ "$projects" = "[]" ] || [ "$projects" = "null" ]; then
-        log_info "当前没有受管项目。"
-        return 0
-    fi
-
-    local p_count
-    p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-
-    echo -e "\n${CYAN}=== 受管 Docker 项目健康自检 ===${NC}"
-    for ((i=0; i<p_count; i++)); do
-        local name
-        local compose
-        name=$(state_get "docker_projects.${i}.name")
-        compose=$(state_get "docker_projects.${i}.compose_file")
-        echo -e "\n项目: ${GREEN}${name}${NC} (${compose})"
-        if [ ! -f "$compose" ]; then
-            log_error " 配置文件丢失！"
-            continue
-        fi
-
-        # 检查重启策略风险 (即是否包含 restart 语句)
-        local risk_warn=0
-        if ! grep -qE "restart:" "$compose"; then
-            log_warn "  重启策略风险：检测到没有配置 restart 选项。VPS 重启后该服务将不会自动恢复！"
-            risk_warn=1
-        fi
-
-        # 列出该项目所有容器当前状态
-        docker compose -f "$compose" ps -a --format "  -> 容器: {{.Name}} | 状态: {{.State}} | 运行时长: {{.Status}}"
-    done
-}
-
-docker_uninstall_confirm() {
-    log_warn "警告：你请求卸载整个 Docker 模块！"
-    log_warn "这会删除所有受管项目、项目文件数据、APT 源、相关软件包，并彻底清理所有容器！"
-    if confirm "你真的要完全卸载 Docker 组件吗？"; then
-        docker_uninstall
-    fi
-}
-
-docker_uninstall() {
-    log_info "开始卸载 Docker 模块..."
-    # 1. 逐个删除受管项目
-    local p_count
-    p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', []))) if os.path.exists('${STATE_FILE}') else print(0)")
-    while [ "$p_count" -gt 0 ]; do
-        local name
-        local compose
-        name=$(state_get "docker_projects.0.name")
-        compose=$(state_get "docker_projects.0.compose_file")
-        docker_project_delete "$name" "$compose"
-        p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', []))) if os.path.exists('${STATE_FILE}') else print(0)")
-    done
-
-    # 2. 停止并禁用 Docker 服务
-    systemctl stop docker.socket 2>/dev/null
-    systemctl stop docker 2>/dev/null
-    systemctl disable docker 2>/dev/null
-
-    # 3. 卸载软件包
-    apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
-
-    # 4. 删除 APT 配置和密钥
-    rm -f /etc/apt/sources.list.d/docker.list
-    rm -f /etc/apt/keyrings/docker.gpg
-    apt-get update
-
-    log_success "Docker 模块卸载完成。"
-}
-
-# ==========================================
-# 6. Docker 项目管理模块
-# ==========================================
-docker_project_menu() {
-    while true; do
-        echo -e "\n${CYAN}====== Docker 项目管理 ======${NC}"
-        echo -e "1. 新建 Docker 项目"
-        echo -e "2. 管理现有项目"
-        echo -e "3. 查看所有项目健康状况"
-        echo -e "4. 卸载 Docker 模块"
-        echo -e "0. 返回主菜单"
-        read -p "请选择操作 [0-4]: " opt
-        case "$opt" in
-            1) docker_project_create ;;
-            2) docker_project_manage_list ;;
-            3) docker_project_health_all ;;
-            4) docker_uninstall_confirm ;;
-            0) break ;;
-            *) log_warn "无效选项！" ;;
-        esac
-    done
-}
-
-docker_project_create() {
-    log_info "新建 Docker 项目"
-    local name
-    read -p "请输入项目名称 (限英文/数字/./_/-, 字母/数字开头): " name
-    # 校验命名规范
-    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-        log_error "项目名格式不正确！"
-        return 1
-    fi
-
-    local proj_dir="/docker/${name}"
-    if [ -d "$proj_dir" ]; then
-        log_warn "该项目目录已存在 ($proj_dir)"
-        if ! confirm "是否继续覆盖/编辑该目录下的 compose 配置文件?"; then
-            return 0
-        fi
-    fi
-
-    mkdir -p "$proj_dir"
-    local compose_file="${proj_dir}/compose.yaml"
-
-    # 如果文件不存在，写入默认框架注释
-    if [ ! -f "$compose_file" ]; then
-        cat <<EOF > "$compose_file"
-# Managed by vps-toolkit
-# Project: ${name}
-# 请在下方输入你的 docker-compose 配置。提示：要随系统自启，请确保添加 "restart: unless-stopped"
-
-services:
-
-EOF
-    fi
-
-    # 编辑配置
-    local editor="nano"
-    if [ -n "$EDITOR" ]; then
-        editor="$EDITOR"
-    elif command -v vi >/dev/null 2>&1; then
-        editor="vi"
-    fi
-
-    $editor "$compose_file"
-
-    # 校验 compose 配置
-    log_info "正在验证 Compose 配置文件有效性..."
-    if ! docker compose -f "$compose_file" config -q; then
-        log_error "Compose 格式错误！请重新编辑。"
-        return 1
-    fi
-
-    log_success "配置文件验证通过！"
-    state_add_project "$name" "$proj_dir" "$compose_file"
-
-    if confirm "是否立即启动/更新此项目？"; then
-        docker_project_up "$name" "$compose_file"
-    fi
-}
-
-docker_project_up() {
-    local name="$1"
-    local compose="$2"
-    log_info "正在启动项目 [${name}]..."
-    if docker compose -f "$compose" up -d; then
-        log_success "项目 [${name}] 启动成功！"
-    else
-        log_error "项目启动失败！输出最后 30 行容器日志："
-        docker compose -f "$compose" logs --tail=30
-        return 1
-    fi
-}
-
-docker_project_manage_list() {
-    local projects
-    projects=$(state_get "docker_projects")
-    if [ -z "$projects" ] || [ "$projects" = "[]" ] || [ "$projects" = "null" ]; then
-        log_info "当前没有受管 Docker 项目。"
-        return 0
-    fi
-
-    local p_count
-    p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-
-    while true; do
-        echo -e "\n${CYAN}--- 选择要管理的 Docker 项目 ---${NC}"
-        for ((i=0; i<p_count; i++)); do
-            local p_name
-            p_name=$(state_get "docker_projects.${i}.name")
-            echo -e "$((i+1)). ${p_name}"
-        done
-        echo -e "0. 返回"
-        read -p "请选择项目编号 [0-${p_count}]: " idx
-        if [ "$idx" = "0" ] || [ -z "$idx" ]; then
-            break
-        fi
-
-        if (( idx > 0 && idx <= p_count )); then
-            local target_name
-            local target_compose
-            target_name=$(state_get "docker_projects.$((idx-1)).name")
-            target_compose=$(state_get "docker_projects.$((idx-1)).compose_file")
-            docker_project_operations "$target_name" "$target_compose"
-            # 刷新列表，以防有删除操作
-            p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-            [ "$p_count" -eq 0 ] && break
-        else
-            log_warn "输入无效！"
-        fi
-    done
-}
-
-docker_project_operations() {
-    local name="$1"
-    local compose="$2"
-    while true; do
-        echo -e "\n${CYAN}=== 项目 [${name}] 操作菜单 ===${NC}"
-        echo -e "1. 启动/更新项目 (up -d)"
-        echo -e "2. 停止项目 (stop)"
-        echo -e "3. 重启项目 (restart)"
-        echo -e "4. 查看运行状态"
-        echo -e "5. 清空容器日志 (Truncate)"
-        echo -e "6. 修改 Compose 配置文件"
-        echo -e "7. 删除项目并清理数据 (down & clean)"
-        echo -e "0. 返回"
-        read -p "选择操作 [0-7]: " opt
-        case "$opt" in
-            1) docker_project_up "$name" "$compose" ;;
-            2) 
-                log_info "停止项目..."
-                docker compose -f "$compose" stop 
-                ;;
-            3) 
-                log_info "重启项目..."
-                docker compose -f "$compose" restart 
-                ;;
-            4) docker_project_status "$name" "$compose" ;;
-            5) docker_project_logs_truncate "$name" "$compose" ;;
-            6) 
-                local editor="nano"
-                [ -n "$EDITOR" ] && editor="$EDITOR" || (command -v vi >/dev/null 2>&1 && editor="vi")
-                $editor "$compose"
-                if docker compose -f "$compose" config -q; then
-                    log_success "配置修改成功并验证通过！"
-                    if confirm "是否立即应用新配置以启动/更新服务?"; then
-                        docker_project_up "$name" "$compose"
-                    fi
-                else
-                    log_error "语法有误，请重新检查！"
-                fi
-                ;;
-            7) 
-                if docker_project_delete "$name" "$compose"; then
-                    break
-                fi
-                ;;
-            0) break ;;
-        esac
-    done
-}
-
-docker_project_status() {
-    local name="$1"
-    local compose="$2"
-    echo -e "\n${GREEN}=== 项目 [${name}] 状态详情 ===${NC}"
-    # 项目大小
-    local proj_dir
-    proj_dir=$(dirname "$compose")
-    local size_info
-    size_info=$(du -sh "$proj_dir" 2>/dev/null | awk '{print $1}')
-    echo -e "项目目录大小: ${size_info}"
-
-    # 容器详情
-    docker compose -f "$compose" ps -a --format "table {{.Name}}\t{{.State}}\t{{.Status}}\t{{.Ports}}"
-}
-
-docker_project_logs_truncate() {
-    local name="$1"
-    local compose="$2"
-    log_warn "该操作将清空项目 [${name}] 下所有容器的 stdout/stderr 日志，此操作不可逆！"
-    if confirm "确定要清空日志吗?"; then
-        # 寻找对应的 json-file 驱动路径
-        local containers
-        containers=$(docker compose -f "$compose" ps -q)
-        if [ -z "$containers" ]; then
-            log_info "项目未运行，没有活跃的容器日志。"
-            return 0
-        fi
-
-        for c_id in $containers; do
-            local log_path
-            log_path=$(docker inspect --format='{{.LogPath}}' "$c_id" 2>/dev/null)
-            if [ -n "$log_path" ] && [ -f "$log_path" ]; then
-                truncate -s 0 "$log_path"
-                log_success "已清空容器 [$(docker inspect --format='{{.Name}}' "$c_id" | cut -c2-)] 的日志文件"
-            else
-                log_info "容器 [$(docker inspect --format='{{.Name}}' "$c_id" | cut -c2-)] 未使用 json-file 驱动，无法 truncate 清理。"
-            fi
-        done
-    fi
-}
-
-docker_project_delete() {
-    local name="$1"
-    local compose="$2"
-    local proj_dir
-    proj_dir=$(dirname "$compose")
-
-    log_warn "警告：您正在请求彻底删除受管项目 [${name}]。"
-    log_warn "这会执行 docker compose down -v (删除容器、网络及非 external 卷) 并且物理删除目录: ${proj_dir}"
-    if ! confirm "确定执行此破坏性操作吗？"; then
-        return 1
-    fi
-
-    log_info "1. 停止并释放容器及内部卷..."
-    # 记录该项目启动过的镜像，以便稍后清理
-    local images
-    images=$(docker compose -f "$compose" images -q 2>/dev/null | sort -u)
-
-    docker compose -f "$compose" down -v
-
-    # 2. 扫描并处理 bind mount
-    log_info "2. 扫描挂载目录 (bind mounts)..."
-    local bind_mounts=()
-    # 用 python 解析 compose 获取所有宿主机路径
-    while IFS= read -r path; do
-        if [ -n "$path" ]; then
-            bind_mounts+=("$path")
-        fi
-    done < <(python3 -c "
-import yaml, sys
-try:
-    with open('$compose') as f:
-        cfg = yaml.safe_load(f)
-    for svc in cfg.get('services', {}).values():
-        for vol in svc.get('volumes', []):
-            if isinstance(vol, str):
-                parts = vol.split(':')
-                if len(parts) >= 2 and parts[0].startswith('/') and not parts[0].startswith('$proj_dir'):
-                    print(parts[0])
-            elif isinstance(vol, dict) and vol.get('type') == 'bind':
-                src = vol.get('source')
-                if src and src.startswith('/') and not src.startswith('$proj_dir'):
-                    print(src)
-except Exception as e:
-    pass
-" 2>/dev/null)
-
-    # 3. 删除项目物理目录 (宿主机 /docker/name/ 的数据)
-    log_info "3. 清理物理项目目录..."
-    rm -rf -- "$proj_dir"
-
-    # 处理项目外的 bind mount 询问
-    if [ ${#bind_mounts[@]} -gt 0 ]; then
-        log_warn "检测到以下位于项目目录外的绑定挂载目录："
-        for bm in "${bind_mounts[@]}"; do
-            echo " - $bm"
-        done
-        if confirm "是否同时删除上述项目外的挂载数据？"; then
-            for bm in "${bind_mounts[@]}"; do
-                if [ -d "$bm" ] || [ -f "$bm" ]; then
-                    rm -rf -- "$bm"
-                    log_success "已删除: $bm"
-                fi
-            done
-        fi
-    fi
-
-    # 4. 尝试清理不再被其他容器占用的镜像
-    log_info "4. 尝试卸载项目相关的 Docker 镜像..."
-    for img in $images; do
-        # 检查是否还有容器在使用该镜像 (包含其他独立运行 of 容器)
-        local count
-        count=$(docker ps -a --filter=ancestor="$img" -q | wc -l)
-        if [ "$count" -eq 0 ]; then
-            log_info "移除镜像: $img"
-            docker image rm "$img" >/dev/null 2>&1 || log_info "镜像 $img 移除失败 (可能已不存在或被其他网络缓存引用)"
-        else
-            log_info "保留镜像 $img，当前仍有 $count 个外部容器在使用。"
-        fi
-    done
-
-    # 5. 从状态管理中移除
-    state_remove_project "$name"
-    log_success "项目 [${name}] 删除并清理完毕！"
-    return 0
-}
-
-docker_project_health_all() {
-    local projects
-    projects=$(state_get "docker_projects")
-    if [ -z "$projects" ] || [ "$projects" = "[]" ] || [ "$projects" = "null" ]; then
-        log_info "当前没有受管项目。"
-        return 0
-    fi
-
-    local p_count
-    p_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))")
-
-    echo -e "\n${CYAN}=== 受管 Docker 项目健康自检 ===${NC}"
-    for ((i=0; i<p_count; i++)); do
-        local name
-        local compose
-        name=$(state_get "docker_projects.${i}.name")
-        compose=$(state_get "docker_projects.${i}.compose_file")
-        echo -e "\n项目: ${GREEN}${name}${NC} (${compose})"
-        if [ ! -f "$compose" ]; then
-            log_error " 配置文件丢失！"
-            continue
-        fi
-
-        # 检查重启策略风险 (即是否包含 restart 语句)
-        local risk_warn=0
-        if ! grep -qE "restart:" "$compose"; then
-            log_warn "  重启策略风险：检测到没有配置 restart 选项。VPS 重启后该服务将不会自动恢复！"
-            risk_warn=1
-        fi
-
-        # 列出该项目所有容器当前状态
-        docker compose -f "$compose" ps -a --format "  -> 容器: {{.Name}} | 状态: {{.State}} | 运行时长: {{.Status}}"
-    done
-}
-
-docker_uninstall_confirm() {
-    log_warn "警告：你请求卸载整个 Docker 模块！"
-    log_warn "这会删除所有受管项目、项目文件数据、APT 源、相关软件包，并彻底清理所有容器！"
-    if confirm "你真的要完全卸载 Docker 组件吗？"; then
-        docker_uninstall
-    fi
-}
-
-docker_uninstall() {
-    log_info "开始卸载 Docker 模块..."
-    # 1. 逐个删除受管项目
-    local p_count
-    p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', []))) if os.path.exists('${STATE_FILE}') else print(0)")
-    while [ "$p_count" -gt 0 ]; do
-        local name
-        local compose
-        name=$(state_get "docker_projects.0.name")
-        compose=$(state_get "docker_projects.0.compose_file")
-        docker_project_delete "$name" "$compose"
-        p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', []))) if os.path.exists('${STATE_FILE}') else print(0)")
-    done
-
-    # 2. 停止并禁用 Docker 服务
-    systemctl stop docker.socket 2>/dev/null
-    systemctl stop docker 2>/dev/null
-    systemctl disable docker 2>/dev/null
-
-    # 3. 卸载软件包
-    apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
-
-    # 4. 删除 APT 配置和密钥
-    rm -f /etc/apt/sources.list.d/docker.list
-    rm -f /etc/apt/keyrings/docker.gpg
-    apt-get update
-
-    log_success "Docker 模块卸载完成。"
-}
-
-# ==========================================
-# 8. 证书与 Cloudflare Token 管理
-# ==========================================
-cert_menu() {
-    while true; do
-        echo -e "\n${CYAN}====== 证书与 Cloudflare 管理 ======${NC}"
-        echo -e "1. 查看/更新 Cloudflare DNS Token"
-        echo -e "2. 查看现有证书列表"
-        echo -e "3. 手动申请新证书"
-        echo -e "4. 测试证书续期 (Dry run)"
-        echo -e "5. 强制对所有证书立即续期"
-        echo -e "6. 卸载 Certbot 模块"
-        echo -e "0. 返回主菜单"
-        read -p "请选择操作 [0-6]: " opt
-        case "$opt" in
-            1) cf_token_manage ;;
-            2) cert_list_show ;;
-            3) cert_interactive_create ;;
-            4) cert_renew_dry_run ;;
-            5) cert_force_renew_all ;;
-            6) cert_uninstall_confirm ;;
-            0) break ;;
-            *) log_warn "无效选项！" ;;
-        esac
-    done
-}
-
-cf_token_manage() {
-    if [ -f "$CF_TOKEN_FILE" ]; then
-        echo -e "\nCloudflare DNS Token 文件存在。路径: $CF_TOKEN_FILE"
-        echo -e "Token 权限: $(stat -c '%a' "$CF_TOKEN_FILE" 2>/dev/null)"
-        echo -e "1. 更新 Token"
-        echo -e "2. 删除 Token"
-        echo -e "0. 返回"
-        read -p "请选择 [0-2]: " opt
-        case "$opt" in
-            1) cf_token_input ;;
-            2) 
-                if confirm "确认删除 Cloudflare DNS Token 文件吗？"; then
-                    rm -f "$CF_TOKEN_FILE"
-                    log_success "Token 文件已删除。"
-                fi
-                ;;
-            0) return ;;
-        esac
-    else
-        echo -e "\n未检测到已存储的 Cloudflare DNS Token。"
-        if confirm "是否立即创建一个新 Token 文件？"; then
-            cf_token_input
-        fi
-    fi
-}
-
-cf_token_input() {
-    local token
-    read -p "请输入你的 Cloudflare API Token (需具备 DNS:Edit 权限): " token
-    if [ -z "$token" ]; then
-        log_error "Token 不能为空！"
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$CF_TOKEN_FILE")"
-    cat <<EOF > "$CF_TOKEN_FILE"
-# Managed by vps-toolkit
-dns_cloudflare_api_token = ${token}
-EOF
-    chmod 600 "$CF_TOKEN_FILE"
-    log_success "Cloudflare Token 写入成功，已锁定 600 权限。"
-}
-
-cert_setup_for_domain() {
-    local domain="$1"
-    local cert_name="$2"
-
-    # 若该证书已存在，不再重复申请，直接使用
-    if [ -d "/etc/letsencrypt/live/${cert_name}" ]; then
-        log_info "检测到已存在适用于域名 ${domain} 的本地证书: ${cert_name}"
-        # 写入状态文件
-        state_add_cert "$cert_name" "$domain"
-        return 0
-    fi
-
-    log_info "正在通过 Cloudflare DNS 验证模式为 ${domain} 申请证书..."
-    # 强制要求 Cloudflare Token
-    if [ ! -f "$CF_TOKEN_FILE" ]; then
-        log_warn "未检测到 Cloudflare Token 凭据，请先配置。"
-        cf_token_input || return 1
-    fi
-
-    # 自动生成随机前缀的临时邮箱
-    local random_prefix
-    random_prefix=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 8)
-    local email="${random_prefix}@${domain}"
-
-    log_info "使用随机邮箱 $email 提交 Let's Encrypt 注册申请..."
-    certbot certonly --dns-cloudflare \
-      --dns-cloudflare-credentials "$CF_TOKEN_FILE" \
-      --non-interactive --agree-tos --register-unsafely-without-email \
-      -m "$email" -d "$domain" --preferred-challenges dns-01
-
-    if [ -d "/etc/letsencrypt/live/${cert_name}" ]; then
-        log_success "证书申请成功！"
-        state_add_cert "$cert_name" "$domain"
-        return 0
-    else
-        log_error "证书申请失败！请检查 Cloudflare Token 或域名解析及 API 限制。"
-        return 1
-    fi
-}
-
-cert_interactive_create() {
-    local domain
-    read -p "请输入要申请证书的域名/通配符域名 (例如 app.example.com 或 *.example.com): " domain
-    if [ -z "$domain" ]; then
-        log_error "域名不能为空！"
-        return 1
-    fi
-
-    local cert_name="${domain#\*}" # 清理通配符 * 字符以作为文件夹名称
-    cert_name="${cert_name#.}"
-    
-    cert_setup_for_domain "$domain" "$cert_name"
-}
-
-cert_list_show() {
-    local certs
-    certs=$(state_get "certificates")
-    if [ -z "$certs" ] || [ "$certs" = "[]" ] || [ "$certs" = "null" ]; then
-        log_info "当前没有受管证书记录。"
-        return 0
-    fi
-
-    local c_count
-    c_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('certificates', [])))")
-
-    echo -e "\n${CYAN}=== 受管 SSL 证书列表 ===${NC}"
-    for ((i=0; i<c_count; i++)); do
-        local c_name
-        local c_domains
-        c_name=$(state_get "certificates.${i}.name")
-        c_domains=$(state_get "certificates.${i}.domains" | tr -d '[]" ' | tr '\n' ' ')
-        
-        # 检查过期时间
-        local expiry_days="未知"
-        if [ -f "/etc/letsencrypt/live/${c_name}/fullchain.pem" ]; then
-            local expiry_date
-            expiry_date=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${c_name}/fullchain.pem" | cut -d= -f2)
-            local expiry_epoch
-            expiry_epoch=$(date -d "$expiry_date" +%s)
-            local now_epoch
-            now_epoch=$(date +%s)
-            expiry_days=$(( (expiry_epoch - now_epoch) / 86400 ))
-        fi
-
-        echo -e "$((i+1)). 证书名: ${GREEN}${c_name}${NC}"
-        echo -e "   关联域名: ${c_domains}"
-        echo -e "   剩余有效期: ${expiry_days} 天"
-    done
-}
-
-cert_renew_dry_run() {
-    log_info "正在启动 Certbot 证书续期 Dry-run 测试..."
-    certbot renew --dry-run
-}
-
-cert_force_renew_all() {
-    log_info "正在启动所有受管证书的强制更新任务..."
-    certbot renew --force-renewal
-    if [ $? -eq 0 ]; then
-        log_success "强制续期成功完成！已触发 reload-nginx 挂钩。"
-    else
-        log_error "部分证书更新过程中出现错误。"
-    fi
-}
-
-cert_delete_by_name() {
-    local cert_name="$1"
-    log_info "正在彻底清理受管证书文件 [${cert_name}]..."
-    certbot delete --cert-name "$cert_name"
-    state_remove_cert "$cert_name"
-    log_success "证书 [${cert_name}] 已被物理删除。"
-}
-
-cert_uninstall_confirm() {
-    log_warn "警告：你请求卸载整个 Certbot 与 SSL 证书管理模块！"
-    log_warn "这会彻底删除所有申请的 SSL 证书、Cloudflare API 凭据，并卸载 Certbot 软件！"
-    if confirm "你确认完全卸载 Certbot 并销毁全部证书吗？"; then
-        cert_uninstall
-    fi
-}
-
-cert_uninstall() {
-    log_info "开始卸载 Certbot 模块..."
-    
-    # 1. 逐个删除受管证书
-    local c_count
-    c_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('certificates', [])))" 2>/dev/null || echo 0)
-    while [ "$c_count" -gt 0 ]; do
-        local name
-        name=$(state_get "certificates.0.name")
-        cert_delete_by_name "$name"
-        c_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('certificates', [])))" 2>/dev/null || echo 0)
-    done
-
-    # 2. 清理 cf 凭据与 hook
-    rm -rf /etc/letsencrypt/cloudflare
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/vps-toolkit-reload-nginx.sh
-
-    # 3. 卸载软件包
-    systemctl stop certbot.timer 2>/dev/null
-    systemctl disable certbot.timer 2>/dev/null
-    apt-get purge -y certbot python3-certbot-dns-cloudflare
-    rm -rf /etc/letsencrypt
-    rm -rf /var/log/letsencrypt
-
-    log_success "Certbot 模块卸载成功。"
-}
-
-# ==========================================
-# 9. sing-box 代理管理模块
-# ==========================================
-singbox_menu() {
-    while true; do
-        local sb_status="未安装/未运行"
-        if systemctl is-active --quiet sing-box; then
-            sb_status="运行中"
-        fi
-        echo -e "\n${CYAN}====== sing-box 代理管理 (服务状态: ${sb_status}) ======${NC}"
-        echo -e "1. 新建/重构入站配置 (VLESS Reality)"
-        echo -e "2. 管理代理用户 (新增/列出/重置/删除)"
-        echo -e "3. 查看当前用户的节点订阅链接"
-        echo -e "4. 查看 sing-box 服务实时日志"
-        echo -e "5. 卸载 sing-box 模块"
-        echo -e "0. 返回主菜单"
-        read -p "请选择操作 [0-5]: " opt
-        case "$opt" in
-            1) singbox_setup_inbound ;;
-            2) singbox_user_manage ;;
-            3) singbox_node_links ;;
-            4) 
-                log_info "输出 sing-box 服务最近 30 行运行日志:"
-                journalctl -u sing-box -n 30 --no-pager
-                ;;
-            5) singbox_uninstall_confirm ;;
-            0) break ;;
-            *) log_warn "无效选项！" ;;
-        esac
-    done
-}
-
-singbox_setup_inbound() {
-    log_info "新建/重构 VLESS + Reality + Vision 入站配置"
-
-    # 1. 检测端口冲突
-    local network_mode
-    network_mode=$(state_get "network_mode")
-    [ -z "$network_mode" ] && network_mode="standard"
-
-    local listen_port
-    local internal_port
-    if [ "$network_mode" = "sni" ]; then
-        log_info "当前网络为 SNI 分流模式，sing-box 将仅监听本地端口。"
-        read -p "请输入 sing-box 本地监听端口 [默认 8889]: " internal_port
-        [ -z "$internal_port" ] && internal_port=8889
-        listen_port="$internal_port"
-        
-        # 验证端口冲突
-        if check_port_occupied "$listen_port"; then
-            local proc
-            proc=$(get_port_process "$listen_port")
-            log_error "端口 ${listen_port} 已被占用，占用进程: $proc"
-            return 1
-        fi
-    else
-        log_info "当前网络为标准模式，sing-box 将独占指定公网端口。"
-        read -p "请输入公网监听端口 [默认 443]: " listen_port
-        [ -z "$listen_port" ] && listen_port=443
-
-        if check_port_occupied "$listen_port"; then
-            local proc
-            proc=$(get_port_process "$listen_port")
-            log_error "端口 ${listen_port} 被占用，占用进程: $proc"
-            return 1
-        fi
-    fi
-
-    # 2. 引导配置 Reality 参数
-    local server_name
-    read -p "请输入 Reality 目的域名 (SNI，默认 www.bing.com): " server_name
-    [ -z "$server_name" ] && server_name="www.bing.com"
-
-    # 简单校验域名合法性
-    if [[ ! "$server_name" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
-        log_error "目的域名格式不正确！"
-        return 1
-    fi
-
-    log_info "生成 Reality 密钥对中..."
-    # 借助 sing-box generate reality-keypair
-    if ! command -v sing-box >/dev/null 2>&1; then
-        install_singbox || return 1
-    fi
-
-    local kp_output
-    kp_output=$(sing-box generate reality-keypair)
-    local private_key
-    private_key=$(echo "$kp_output" | grep "Private key:" | awk '{print $3}')
-    local public_key
-    public_key=$(echo "$kp_output" | grep "Public key:" | awk '{print $3}')
-
-    local short_id
-    short_id=$(sing-box generate rand --hex 8)
-
-    local client_uuid
-    client_uuid=$(sing-box generate uuid)
-
-    # 3. 生成初始 config.json 模板
-    log_info "生成 sing-box 配置文件..."
-    mkdir -p "$(dirname "$SB_CONFIG_FILE")"
-
-    local listen_host="0.0.0.0"
-    if [ "$network_mode" = "sni" ]; then
-        listen_host="127.0.0.1"
-    fi
-
-    # 拼装初始配置文件
-    python3 -c "
-import json
-config = {
-    'log': {
-        'level': 'info',
-        'timestamp': True
-    },
-    'inbounds': [
-        {
-            'type': 'vless',
-            'tag': 'vless-in',
-            'listen': '$listen_host',
-            'listen_port': int('$listen_port'),
-            'sniff': True,
-            'sniff_override_destination': True,
-            'users': [
-                {
-                    'name': 'default_user',
-                    'uuid': '$client_uuid',
-                    'flow': 'xtls-rprx-vision'
-                }
-            ],
-            'tls': {
-                'enabled': True,
-                'server_name': '$server_name',
-                'reality': {
-                    'enabled': True,
-                    'handshake': {
-                        'server': '$server_name',
-                        'server_port': 443
-                    },
-                    'private_key': '$private_key',
-                    'short_id': [ '$short_id' ]
-                }
-            }
-        }
-    ],
-    'outbounds': [
-        {
-            'type': 'direct',
-            'tag': 'direct'
-        }
-    ]
-}
-with open('${SB_CONFIG_FILE}', 'w') as f:
-    json.dump(config, f, indent=2)
-"
-    chmod 600 "$SB_CONFIG_FILE"
-
-    # 4. 验证并开启服务
-    log_info "验证 sing-box 配置文件语法..."
-    if ! sing-box check -c "$SB_CONFIG_FILE"; then
-        log_error "配置文件语法校验失败！"
-        return 1
-    fi
-
-    log_info "正在启动/重载 sing-box 服务..."
-    systemctl enable sing-box
-    systemctl restart sing-box
-
-    if systemctl is-active --quiet sing-box; then
-        log_success "sing-box 配置并启动成功！"
-        # 记录到状态
-        if [ "$network_mode" = "sni" ]; then
-            state_set "sing_box_mode" '"sni"'
-            state_set "sing_box_internal_port" "$listen_port"
-        else
-            state_set "sing_box_mode" '"standalone"'
-            state_set "sing_box_port" "$listen_port"
-        fi
-        
-        # 记录 Reality 的公钥以备生成节点连接
-        state_set "sing_box_reality_public_key" "\"${public_key}\""
-
-        # 打印当前 default_user 节点链接
-        singbox_node_links
-    else
-        log_error "sing-box 服务启动失败！最近 30 行日志："
-        journalctl -u sing-box -n 30 --no-pager
-        return 1
-    fi
-}
-
-# 流量模式改变时，同步 sing-box 配置
-singbox_sync_network_mode() {
-    if [ ! -f "$SB_CONFIG_FILE" ]; then
-        return 0
-    fi
-    local network_mode
-    network_mode=$(state_get "network_mode")
-    local listen_host="0.0.0.0"
-    local listen_port=443
-    if [ "$network_mode" = "sni" ]; then
-        listen_host="127.0.0.1"
-        listen_port=$(state_get "sing_box_internal_port")
-        [ -z "$listen_port" ] && listen_port=8889
-    else
-        listen_port=$(state_get "sing_box_port")
-        [ -z "$listen_port" ] && listen_port=443
-    fi
-
-    # 备份当前配置
-    cp "$SB_CONFIG_FILE" "${SB_CONFIG_FILE}.bak"
-
-    python3 -c "
-import json
-try:
-    with open('${SB_CONFIG_FILE}') as f:
-        data = json.load(f)
-    for ib in data.get('inbounds', []):
-        if ib.get('type') == 'vless':
-            ib['listen'] = '$listen_host'
-            ib['listen_port'] = int('$listen_port')
-    with open('${SB_CONFIG_FILE}', 'w') as f:
-        json.dump(data, f, indent=2)
-except Exception as e:
-    print('Failed sync config:', e)
-"
-    if sing-box check -c "$SB_CONFIG_FILE"; then
-        systemctl restart sing-box
-        rm -f "${SB_CONFIG_FILE}.bak"
-        log_success "sing-box 入站监听地址已同步调整！"
-    else
-        log_error "同步后 sing-box 校验失败，已自动还原配置。"
-        mv "${SB_CONFIG_FILE}.bak" "$SB_CONFIG_FILE"
-    fi
-}
-
-singbox_user_manage() {
-    if [ ! -f "$SB_CONFIG_FILE" ]; then
-        log_error "未检测到 sing-box 配置，请先新建入站。"
-        return 1
-    fi
-
-    while true; do
-        echo -e "\n${CYAN}--- sing-box 用户管理 ---${NC}"
-        echo -e "1. 列出当前所有用户"
-        echo -e "2. 添加新用户"
-        echo -e "3. 重置用户 UUID"
-        echo -e "4. 删除用户"
-        echo -e "0. 返回上一级"
-        read -p "请选择 [0-4]: " opt
-        case "$opt" in
-            1) singbox_users_list ;;
-            2) singbox_user_add ;;
-            3) singbox_user_reset_uuid ;;
-            4) singbox_user_delete ;;
-            0) break ;;
-        esac
-    done
-}
-
-singbox_users_list() {
-    echo -e "\n${GREEN}=== 当前入站代理用户列表 ===${NC}"
-    python3 -c "
-import json
-try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    for idx, u in enumerate(d['inbounds'][0]['users']):
-        print(f\"{idx+1}. 用户名: {u['name']} | UUID: {u['uuid']}\")
-except Exception as e:
-    print('读取失败:', e)
-"
-}
-
-singbox_user_add() {
-    local username
-    read -p "请输入新用户名: " username
-    if [[ ! "$username" =~ ^[a-zA-Z0-9_]+$ ]]; then
-        log_error "用户名仅允许字母、数字和下划线！"
-        return 1
-    fi
-
-    # 查重
-    local exists
-    exists=$(python3 -c "
-import json
-try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    names = [u['name'] for u in d['inbounds'][0]['users']]
-    if '$username' in names:
-        print('1')
-except:
-    pass
-")
-    if [ "$exists" = "1" ]; then
-        log_error "用户名已存在！"
-        return 1
-    fi
-
-    local new_uuid
-    new_uuid=$(sing-box generate uuid)
-
-    # 写入配置
-    cp "$SB_CONFIG_FILE" "${SB_CONFIG_FILE}.bak"
-    python3 -c "
-import json
-try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    d['inbounds'][0]['users'].append({
-        'name': '$username',
-        'uuid': '$new_uuid',
-        'flow': 'xtls-rprx-vision'
-    })
-    json.dump(d, open('${SB_CONFIG_FILE}', 'w'), indent=2)
-except Exception as e:
-    print('写入出错:', e)
-"
-    if sing-box check -c "$SB_CONFIG_FILE"; then
-        systemctl restart sing-box
-        rm -f "${SB_CONFIG_FILE}.bak"
-        log_success "新用户 [${username}] 添加成功！"
-    else
-        log_error "配置验证失败，回滚操作。"
-        mv "${SB_CONFIG_FILE}.bak" "$SB_CONFIG_FILE"
-    fi
-}
-
-singbox_user_reset_uuid() {
-    singbox_users_list
-    local users_count
-    users_count=$(python3 -c "import json; print(len(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['users']))")
-    read -p "请输入要重置 UUID 的用户编号 [1-${users_count}]: " idx
-    if (( idx > 0 && idx <= users_count )); then
-        local new_uuid
-        new_uuid=$(sing-box generate uuid)
-        cp "$SB_CONFIG_FILE" "${SB_CONFIG_FILE}.bak"
-        python3 -c "
-import json
-try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    u = d['inbounds'][0]['users'][$((idx-1))]
-    u['uuid'] = '$new_uuid'
-    json.dump(d, open('${SB_CONFIG_FILE}', 'w'), indent=2)
-    print(f'已重置 {u[\"name\"]} 的 UUID 为 {new_uuid}')
-except Exception as e:
-    print('修改失败:', e)
-"
-        if sing-box check -c "$SB_CONFIG_FILE"; then
-            systemctl restart sing-box
-            rm -f "${SB_CONFIG_FILE}.bak"
-            log_success "用户 UUID 重置成功！"
-        else
-            log_error "验证失败，已回退配置。"
-            mv "${SB_CONFIG_FILE}.bak" "$SB_CONFIG_FILE"
-        fi
-    else
-        log_warn "输入无效！"
-    fi
-}
-
-singbox_user_delete() {
-    singbox_users_list
-    local users_count
-    users_count=$(python3 -c "import json; print(len(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['users']))")
-    read -p "请输入要删除的用户编号 [1-${users_count}]: " idx
-    if (( idx > 0 && idx <= users_count )); then
-        local username
-        username=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['users'][$((idx-1))]['name'])")
-        
-        # 强保障：至少保留一个用户
-        if [ "$users_count" -eq 1 ]; then
-            log_warn "警告：这是配置中最后一个活跃用户。删除后代理入站将由于无可用用户导致服务瘫痪！"
-            if ! confirm "确定要执意删除吗？"; then
-                return 0
-            fi
-        else
-            if ! confirm "确定要删除用户 [${username}] 吗？"; then
-                return 0
-            fi
-        fi
-
-        cp "$SB_CONFIG_FILE" "${SB_CONFIG_FILE}.bak"
-        python3 -c "
-import json
-try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    d['inbounds'][0]['users'].pop($((idx-1)))
-    json.dump(d, open('${SB_CONFIG_FILE}', 'w'), indent=2)
-except Exception as e:
-    print('修改出错:', e)
-"
-        if sing-box check -c "$SB_CONFIG_FILE"; then
-            systemctl restart sing-box
-            rm -f "${SB_CONFIG_FILE}.bak"
-            log_success "用户 [${username}] 已删除！"
-        else
-            log_error "验证失败，已回退配置。"
-            mv "${SB_CONFIG_FILE}.bak" "$SB_CONFIG_FILE"
-        fi
-    else
-        log_warn "输入无效！"
-    fi
-}
-
-singbox_node_links() {
-    if [ ! -f "$SB_CONFIG_FILE" ]; then
-        log_error "未检测到 sing-box 配置。"
-        return 1
-    fi
-
-    # 获取节点 IP
-    local ip
-    ip=$(get_public_ip)
-    if [ -z "$ip" ]; then
-        log_warn "无法自动获取公网 IP，请手动在节点链接中替换 <IP>。"
-        ip="<IP>"
-    fi
-
-    # 获取地理位置名称以用作节点别名
-    local node_tag
-    node_tag=$(get_ip_location "$ip")
-
-    local public_key
-    public_key=$(state_get "sing_box_reality_public_key")
-    if [ -z "$public_key" ] || [ "$public_key" = "null" ]; then
-        log_warn "未能在状态里找到公钥，正在重算 Reality 密钥..."
-        local kp_output
-        kp_output=$(sing-box generate reality-keypair)
-        local private_key
-        private_key=$(echo "$kp_output" | grep "Private key:" | awk '{print $3}')
-        public_key=$(echo "$kp_output" | grep "Public key:" | awk '{print $3}')
-        state_set "sing_box_reality_public_key" "\"${public_key}\""
-
-        # 修改 sing-box 配置文件中的私钥
-        if [ -f "$SB_CONFIG_FILE" ]; then
-            python3 -c "
-import json
-try:
-    d = json.load(open('${SB_CONFIG_FILE}'))
-    d['inbounds'][0]['tls']['reality']['private_key'] = '$private_key'
-    json.dump(d, open('${SB_CONFIG_FILE}', 'w'), indent=2)
-except:
-    pass
-"
-            systemctl restart sing-box
-        fi
-    fi
-
-    # 读取其余信息
-    local server_name port short_id
-    server_name=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['tls']['server_name'])")
-    port=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['listen_port'])")
-    short_id=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['tls']['reality']['short_id'][0])")
-
-    local network_mode
-    network_mode=$(state_get "network_mode")
-    local final_port="$port"
-    if [ "$network_mode" = "sni" ]; then
-        # 分流模式下，客户端连接的必须是公网 443 端口
-        final_port=443
-    fi
-
-    echo -e "\n${GREEN}=== 客户端 VLESS Reality 订阅连接 ===${NC}"
-    
-    # 遍历所有用户
-    local u_count
-    u_count=$(python3 -c "import json; print(len(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['users']))")
-    for ((i=0; i<u_count; i++)); do
-        local u_name u_uuid
-        u_name=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['users'][$i]['name'])")
-        u_uuid=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['users'][$i]['uuid'])")
-        
-        # 组装 VLESS Reality 标准 URI
-        # 节点名称 URL 编码
-        local encoded_tag
-        encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${node_tag}-${u_name}'))")
-
-        local link="vless://${u_uuid}@${ip}:${final_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${server_name}&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none&fp=chrome#${encoded_tag}"
-        echo -e "用户: ${u_name}"
-        echo -e "${YELLOW}${link}${NC}\n"
-    done
-}
-
-singbox_uninstall_confirm() {
-    log_warn "警告：你请求卸载整个 sing-box 服务模块！"
-    log_warn "这会删除服务单元、配置文件、缓存日志，并彻底卸载软件包！"
-    if confirm "确定执行吗？"; then
-        singbox_uninstall
-    fi
-}
-
-singbox_uninstall() {
-    log_info "开始卸载 sing-box 模块..."
-    systemctl stop sing-box 2>/dev/null
-    systemctl disable sing-box 2>/dev/null
-
-    # 物理清除
-    rm -f "$SB_CONFIG_FILE"
-    rm -rf "$SB_SERVICE_DIR"
-    rm -f /etc/apt/sources.list.d/sing-box.list
-    rm -f /etc/apt/keyrings/sing-box.gpg
-    apt-get update
-
-    # 卸载软件包
-    apt-get purge -y sing-box
-    rm -rf /var/log/sing-box
-
-    state_set "sing_box_reality_public_key" "null"
-    log_success "sing-box 模块已完全卸载。"
-}
-
-# ==========================================
-# 10. 健康自检与综合状态检查
-# ==========================================
-system_health_check() {
-    echo -e "\n${CYAN}====== VPS 全系统健康自检表 ======${NC}"
-    
-    # 1. 基础系统运行指标
-    echo -e "\n${BLUE}[系统资源信息]${NC}"
-    if [ -f /etc/os-release ]; then
-        ( . /etc/os-release && echo "系统版本: $PRETTY_NAME" )
-    fi
-    echo "系统负载: $(uptime | awk -F'load average:' '{print $2}')"
-    echo "内存状态: $(free -h | awk 'NR==2 {print "总共: "$2" | 已用: "$3" | 空闲: "$4}')"
-    echo "磁盘空间: $(df -h / | awk 'NR==2 {print "总共: "$2" | 已用: "$3" | 剩余: "$4" (占比 "$5")"}')"
-
-    # 2. Docker 模块自检
-    echo -e "\n${BLUE}[Docker 服务状态]${NC}"
-    if command -v docker >/dev/null 2>&1; then
-        local active_status
-        active_status=$(systemctl is-active docker)
-        local enabled_status
-        enabled_status=$(systemctl is-enabled docker)
-        echo "Docker 服务: active=${active_status} | enabled=${enabled_status}"
-        echo "活跃容器数量: $(docker ps -q | wc -l)"
-        echo "磁盘总占用: $(docker system df | awk 'NR==2 {print $4}')"
-        # 日志轮转配置检查
-        if [ -f /etc/docker/daemon.json ]; then
-            local rot_size
-            rot_size=$(python3 -c "import json; d=json.load(open('/etc/docker/daemon.json')); print(d.get('log-opts',{}).get('max-size','未配置'))" 2>/dev/null)
-            local rot_file
-            rot_file=$(python3 -c "import json; d=json.load(open('/etc/docker/daemon.json')); print(d.get('log-opts',{}).get('max-file','未配置'))" 2>/dev/null)
-            echo "容器日志限制: max-size=${rot_size} | max-files=${rot_file}"
-        else
-            log_warn "未检测到 Docker daemon.json，当前容器日志不受限制！"
-        fi
-    else
-        echo "Docker 模块: 未安装"
-    fi
-
-    # 3. Nginx 模块自检
-    echo -e "\n${BLUE}[Nginx 服务与反代状态]${NC}"
-    if command -v nginx >/dev/null 2>&1; then
-        local active_status
-        active_status=$(systemctl is-active nginx)
-        local enabled_status
-        enabled_status=$(systemctl is-enabled nginx)
-        echo "Nginx 服务: active=${active_status} | enabled=${enabled_status}"
-        echo "配置语法测试: $(nginx -t 2>&1 | tail -n 1)"
-        
-        local mode
-        mode=$(state_get "network_mode")
-        local web_tls_port
-        web_tls_port=$(state_get "web_tls_port")
-        echo "分流网络模式: ${mode} (Nginx TLS 监听端口: ${web_tls_port})"
-    else
-        echo "Nginx 模块: 未安装"
-    fi
-
-    # 4. Certbot 证书自检
-    echo -e "\n${BLUE}[Certbot SSL 证书状态]${NC}"
-    if command -v certbot >/dev/null 2>&1; then
-        local timer_status
-        timer_status=$(systemctl is-active certbot.timer)
-        echo "Certbot 自动续期定时器: ${timer_status}"
-        if [ "$timer_status" = "active" ]; then
-            local next_run
-            next_run=$(systemctl list-timers certbot.timer | tail -n +2 | head -n 1 | awk '{print $1,$2,$3}')
-            echo "定时器下次触发: ${next_run}"
-        fi
-        
-        # 受管证书列表
-        local c_count
-        c_count=$(python3 -c "import json; print(len(json.load(open('${STATE_FILE}')).get('certificates', [])))" 2>/dev/null || echo 0)
-        if [ "$c_count" -gt 0 ]; then
-            for ((i=0; i<c_count; i++)); do
-                local c_name
-                c_name=$(state_get "certificates.${i}.name")
-                if [ -f "/etc/letsencrypt/live/${c_name}/fullchain.pem" ]; then
-                    local expiry_date
-                    expiry_date=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${c_name}/fullchain.pem" | cut -d= -f2)
-                    local expiry_epoch
-                    expiry_epoch=$(date -d "$expiry_date" +%s)
-                    local now_epoch
-                    now_epoch=$(date +%s)
-                    local expiry_days=$(( (expiry_epoch - now_epoch) / 86400 ))
-                    echo " -> 证书: ${c_name} | 剩余有效期: ${expiry_days} 天"
-                else
-                    echo " -> 证书: ${c_name} | 文件缺失！"
-                fi
-            done
-        else
-            echo "受管证书: 无"
-        fi
-    else
-        echo "Certbot 模块: 未安装"
-    fi
-
-    # 5. sing-box 代理自检
-    echo -e "\n${BLUE}[sing-box 代理服务状态]${NC}"
-    if command -v sing-box >/dev/null 2>&1; then
-        local active_status
-        active_status=$(systemctl is-active sing-box)
-        local enabled_status
-        enabled_status=$(systemctl is-enabled sing-box)
-        echo "sing-box 服务: active=${active_status} | enabled=${enabled_status}"
-        if [ -f "$SB_CONFIG_FILE" ]; then
-            echo "配置文件测试: $(sing-box check -c "$SB_CONFIG_FILE" 2>&1 | head -n 1)"
-            
-            # 读取监听端口与协议
-            local sb_port
-            sb_port=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['listen_port'])")
-            local sb_listen
-            sb_listen=$(python3 -c "import json; print(json.load(open('${SB_CONFIG_FILE}'))['inbounds'][0]['listen'])")
-            echo "入站监听地址: ${sb_listen}:${sb_port}"
-        fi
-    else
-        echo "sing-box 模块: 未安装"
-    fi
-
-    # 6. 系统底层端口监听进程清单
-    echo -e "\n${BLUE}[关键网络端口监听进程]${NC}"
-    local p80 p443 p8443
-    p80=$(get_port_process 80)
-    p443=$(get_port_process 443)
-    p8443=$(get_port_process 8443)
-
-    echo "TCP Port 80 (HTTP): ${p80:-无监听}"
-    echo "TCP Port 443 (HTTPS): ${p443:-无监听}"
-    echo "TCP Port 8443 (HTTPs 本地分流): ${p8443:-无监听}"
-
-    # 7. 状态文件漂移检查
-    echo -e "\n${BLUE}[状态索引漂移检查]${NC}"
-    check_state_drift
-    
-    echo -e "\n${CYAN}==================================${NC}"
-}
-
-# ==========================================
-# 11. 全系统卸载与数据清理
-# ==========================================
-uninstall_all_modules() {
-    log_warn "警告：此操作将卸载全部受管组件并清理所有数据配置！"
-    log_warn "包含 Docker 容器与卷、Nginx 反代及 Stream 模块、所有 SSL 证书、sing-box 代理配置等！"
-    log_warn "该操作不可逆，将恢复系统基础状态。"
-    if ! confirm "确定执行完全卸载吗？"; then
-        return 0
-    fi
-
-    log_info "1. 开始检查是否存在本工具管理外的冲突资源..."
-    
-    # 检查非本工具管理的 Nginx 站点 (不存在 Managed by vps-toolkit 标记的站点文件)
-    if [ -d "/etc/nginx/sites-available" ]; then
-        local foreign_sites=0
-        for conf in /etc/nginx/sites-available/*; do
-            [ -f "$conf" ] || continue
-            if ! grep -q "Managed by vps-toolkit" "$conf"; then
-                foreign_sites=1
-                break
-            fi
-        done
-        if [ $foreign_sites -eq 1 ]; then
-            log_warn "警告：检测到存在非本工具创建的 Nginx 站点配置文件！为防止误删，脚本将拒绝卸载 nginx 软件包。"
-        fi
-    fi
-
-    # 检查非本工具管理的 Docker 容器项目
-    if command -v docker >/dev/null 2>&1; then
-        local total_containers
-        total_containers=$(docker ps -a -q | wc -l)
-        # 读取受管项目容器总数
-        local managed_containers=0
-        local p_count
-        p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))" 2>/dev/null || echo 0)
-        for ((i=0; i<p_count; i++)); do
-            local comp
-            comp=$(state_get "docker_projects.${i}.compose_file")
-            if [ -f "$comp" ]; then
-                local c_ids
-                c_ids=$(docker compose -f "$comp" ps -q 2>/dev/null | wc -l)
-                managed_containers=$((managed_containers + c_ids))
-            fi
-        done
-        if [ "$total_containers" -gt "$managed_containers" ]; then
-            log_warn "警告：检测到存在不受本工具管理的外部 Docker 容器！为防止误操作损坏数据，脚本将拒绝卸载 Docker 引擎。"
-        fi
-    fi
-
-    log_info "2. 开始顺序卸载受管服务..."
-    
-    # 卸载 sing-box
-    if command -v sing-box >/dev/null 2>&1; then
-        singbox_uninstall
-    fi
-
-    # 卸载 Certbot
-    if command -v certbot >/dev/null 2>&1; then
-        cert_uninstall
-    fi
-
-    # 卸载 Nginx (若无外部站点冲突则进行卸载)
-    if command -v nginx >/dev/null 2>&1; then
-        if [ "${foreign_sites:-0}" -eq 0 ]; then
-            nginx_uninstall
-        else
-            log_info "跳过卸载 Nginx 软件，只清除本工具配置..."
-            local s_count
-            s_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('nginx_sites', [])))" 2>/dev/null || echo 0)
-            while [ "$s_count" -gt 0 ]; do
-                local name
-                name=$(state_get "nginx_sites.0.name")
-                nginx_site_delete "$name"
-                s_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('nginx_sites', [])))" 2>/dev/null || echo 0)
-            done
-            rm -f "$NGINX_STREAM_CONF"
-            rm -f "$NGINX_WS_MAP_CONF"
-            sed -i '/vps-toolkit-stream.conf/d' /etc/nginx/nginx.conf
-            systemctl reload nginx 2>/dev/null
-        fi
-    fi
-
-    # 卸载 Docker (若无外部容器冲突则彻底清理并卸载)
-    if command -v docker >/dev/null 2>&1; then
-        if [ "${total_containers:-0}" -eq "${managed_containers:-0}" ]; then
-            docker_uninstall
-            # 物理清理 docker 数据目录
-            log_info "清理 Docker 默认数据目录 /var/lib/docker 与 /var/lib/containerd..."
-            rm -rf /var/lib/docker
-            rm -rf /var/lib/containerd
-        else
-            log_info "跳过卸载 Docker 引擎，只清除本工具所属的项目..."
-            local p_count
-            p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))" 2>/dev/null || echo 0)
-            while [ "$p_count" -gt 0 ]; do
-                local name
-                local compose
-                name=$(state_get "docker_projects.0.name")
-                compose=$(state_get "docker_projects.0.compose_file")
-                docker_project_delete "$name" "$compose"
-                p_count=$(python3 -c "import json, os; print(len(json.load(open('${STATE_FILE}')).get('docker_projects', [])))" 2>/dev/null || echo 0)
-            done
-        fi
-    fi
-
-    # 清除残留日志与状态主目录
-    log_info "3. 清理 VPS Toolkit 本地配置及缓存日志目录..."
-    rm -rf /var/log/nginx 2>/dev/null
-    rm -rf /var/log/letsencrypt 2>/dev/null
-    rm -rf "$STATE_DIR"
-
-    log_success "所有组件和对应的数据已完全清理干净！"
-}
-
-# ==========================================
-# 12. 主菜单循环与交互引导
-# ==========================================
-main_menu() {
-    # 状态漂移自检
-    check_state_drift
-
-    while true; do
-        echo -e "\n${PURPLE}===============================================${NC}"
-        echo -e "          VPS 运维管理系统 (vps-toolkit)          "
-        echo -e "          适用环境: Debian 10+ / Ubuntu 20.04+  "
-        echo -e "${PURPLE}===============================================${NC}"
-        echo -e "1. Docker 项目部署管理"
-        echo -e "2. Nginx 反代与分流网络管理"
-        echo -e "3. SSL 证书与 Cloudflare Token 管理"
-        echo -e "4. sing-box 代理管理"
-        echo -e "5. 系统状态综合健康检查"
-        echo -e "6. 重新扫描物理资源并修复状态索引"
-        echo -e "7. 卸载全部组件并清理系统数据"
-        echo -e "0. 退出脚本"
-        echo -e "${PURPLE}-----------------------------------------------${NC}"
-        read -p "请输入选项 [0-7]: " menu_opt
-        case "$menu_opt" in
-            1) docker_project_menu ;;
-            2) nginx_menu ;;
-            3) cert_menu ;;
-            4) singbox_menu ;;
-            5) system_health_check ;;
-            6) scan_resources ;;
-            7) uninstall_all_modules ;;
-            0) 
-                log_info "退出脚本。祝您运维愉快！"
-                exit 0
-                ;;
-            *) log_warn "无效输入，请重新输入选项！" ;;
-        esac
-    done
-}
-
-# ==========================================
-# 13. 入口执行控制
-# ==========================================
-ensure_python3
-check_base_env
-main_menu
+uninstall_docker() { confirm '卸载 Docker 模块及所有受管项目数据？' || return; local n; while IFS= read -r n; do delete_project "$n" || true; done < <(state_json docker_projects|python3 -c "import json,sys;[print(x['name']) for x in json.load(sys.stdin)]"); docker ps -aq 2>/dev/null|grep -q . && { err '仍存在非受管 Docker 容器，拒绝 purge Docker。'; return 1; }; systemctl disable --now docker 2>/dev/null||true; rm -f -- /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc; apt_purge docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; state_update "d['docker_projects']=[]"; }
+uninstall_nginx() { confirm '卸载 Nginx 模块及本工具受管站点？' || return; local f; while IFS= read -r -d '' f; do grep -qF "$MARKER" "$f" && { rm -f -- "$f" "/etc/nginx/sites-enabled/$(basename "$f")"; }; done < <(find /etc/nginx/sites-available -maxdepth 1 -type f -print0); remove_stream_loader; rm -f -- "$NGINX_MAP_CONF"; nginx -t 2>/dev/null || true; local unmanaged; unmanaged=$(find /etc/nginx/sites-available -maxdepth 1 -type f -exec grep -L "$MARKER" {} + 2>/dev/null); [ -n "$unmanaged" ] && { err "发现非受管 Nginx 站点，拒绝 purge：$unmanaged"; return 1; }; systemctl disable --now nginx 2>/dev/null||true; apt_purge nginx-full libnginx-mod-stream; state_update "d['nginx_sites']=[]; d['network_mode']='standard'; d['web_tls_port']=443"; }
+uninstall_certbot() { confirm '卸载 Certbot、证书、Cloudflare Token 及 Let\x27s Encrypt 数据？' || return; rm -f -- "$CF_INI" /etc/letsencrypt/renewal-hooks/deploy/vps-toolkit-nginx-reload; rm -rf -- /etc/letsencrypt /var/log/letsencrypt; systemctl disable --now certbot.timer 2>/dev/null||true; apt_purge certbot python3-certbot-dns-cloudflare; state_update "d['certificates']=[]"; }
+uninstall_singbox() { confirm '卸载 sing-box 模块及用户、配置、日志？' || return; systemctl disable --now sing-box 2>/dev/null||true; rm -f -- "$SB_UNIT" "$SB_CONFIG" /etc/apt/sources.list.d/sagernet.list /etc/apt/keyrings/sagernet.asc; rm -rf -- /var/log/sing-box; systemctl daemon-reload; apt_purge sing-box; state_update "d['sing_box']={'mode':'none','port':0}"; }
+uninstall_all() { confirm '将卸载全部受管模块及其数据；回车确认继续？' || return; uninstall_singbox || true; uninstall_nginx || true; uninstall_certbot || true; uninstall_docker || true; if ! command_ok docker && ! command_ok nginx && ! command_ok certbot && ! command_ok sing-box; then rm -rf -- /var/lib/docker /var/lib/containerd /var/log/nginx /var/log/letsencrypt /var/log/sing-box /etc/letsencrypt "$STATE_DIR"; ok '全部受管资源已清理。'; else warn '仍有软件包因非受管资源冲突被保留，状态目录未删除。'; fi; }
+
+main() { check_host; startup_state; local a; while :; do clear; echo '========================================'; echo '          VPS Toolkit 运维管理'; echo '========================================'; echo "网络模式：$(state_get network_mode) | 状态：$STATE"; state_drift && echo '状态漂移：是（建议重新扫描）' || echo '状态漂移：否'; echo '1. Docker 项目管理'; echo '2. Nginx 反向代理管理'; echo '3. Certbot 与 Cloudflare 管理'; echo '4. sing-box Reality 管理'; echo '5. 全局健康检查'; echo '6. 重新扫描并修复状态索引'; echo '7. 卸载全部'; echo '0. 退出'; read -r -p '选择：' a; case "$a" in 1) docker_module;;2) nginx_module;;3) cert_menu;;4) singbox_module;;5) health_check; pause;;6) scan_resources; ok '状态索引已重新扫描。'; pause;;7) uninstall_all; pause;;0) exit 0;;*) err '无效选择。'; pause;;esac; done; }
+main "$@"
