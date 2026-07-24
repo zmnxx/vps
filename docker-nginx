@@ -481,9 +481,14 @@ config_docker_log_rotation(){
     read -rp "  单文件最大 [50m]: " input; [ -n "$input" ] && max_size="$input"
     read -rp "  保留文件数 [3]: " input; [ -n "$input" ] && max_file="$input"
   fi
-  mkdir -p /etc/docker
+  mkdir -p /etc/docker || { err "无法创建 /etc/docker"; return 1; }
+  if ! cmd_exists jq; then
+    info "安装 JSON 配置工具 jq..."
+    apt-get install -y -qq jq || { err "jq 安装失败，无法安全修改 daemon.json"; cleanup_install_artifacts; return 1; }
+    cleanup_install_artifacts
+  fi
   if [ -f "$daemon_json" ]; then
-    if ! cmd_exists jq || ! jq empty "$daemon_json" >/dev/null 2>&1; then
+    if ! jq empty "$daemon_json" >/dev/null 2>&1; then
       err "已有 daemon.json 但无法安全解析，未覆盖原配置"
       return 1
     fi
@@ -851,13 +856,24 @@ docker_menu(){
 ensure_connection_upgrade_map(){
   local conf="/etc/nginx/nginx.conf" tmp line inserted=0
   [ -f "$conf" ] || { err "未找到 $conf"; return 1; }
+  if ! nginx -t >/dev/null 2>&1; then
+    err "现有 Nginx 配置已经损坏，未做任何修改"
+    nginx -t 2>&1 | head -5 | sed 's/^/  /'
+    return 1
+  fi
   grep -q 'map[[:space:]]\+\$http_upgrade[[:space:]]\+\$connection_upgrade' "$conf" 2>/dev/null && return 0
   recovery_begin "$conf" || { err "无法创建 Nginx 恢复文件"; return 1; }
   tmp=$(mktemp) || { recovery_commit; return 1; }
   while IFS= read -r line || [ -n "$line" ]; do
     printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; recovery_restore; return 1; }
     if [ "$inserted" -eq 0 ] && printf '%s\n' "$line" | grep -q '^[[:space:]]*http[[:space:]]*{'; then
-      printf '    map $http_upgrade $connection_upgrade {\n        default upgrade;\n        '\''\'' close;\n    }\n\n' >> "$tmp" || { rm -f "$tmp"; recovery_restore; return 1; }
+      cat >> "$tmp" <<'MAPEOF'
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+MAPEOF
       inserted=1
     fi
   done < "$conf"
@@ -866,8 +882,11 @@ ensure_connection_upgrade_map(){
   fi
   rm -f "$tmp"
   if ! nginx -t >/dev/null 2>&1; then
-    err "nginx -t 失败，恢复 Nginx 配置"; nginx -t 2>&1 | head -5 | sed 's/^/  /'
-    recovery_restore; return 1
+    err "新增 WebSocket map 后 nginx -t 失败，恢复原配置"
+    nginx -t 2>&1 | head -5 | sed 's/^/  /'
+    recovery_restore
+    if ! nginx -t >/dev/null 2>&1; then err "原 Nginx 配置恢复后仍无法通过测试，请检查 $conf"; fi
+    return 1
   fi
   recovery_commit
 }
