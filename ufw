@@ -80,14 +80,17 @@ ufw_rule_exists(){
 	ufw status 2>/dev/null | awk -v p="$port" -v proto="$proto" '
 		$0 !~ /^Status:/ && $0 !~ /^--/ {
 			line=$0; gsub(/[[:space:]]+/," ",line)
-			if (line ~ "(^| )" p "/" proto "( |$)" || line ~ "(^| )" p "( |$).*" proto) found=1
+			if (line ~ "(^| )" p "/" proto "( |$)" || line ~ "(^| )" p "( |$).*" proto || line ~ "(^| )" p "( |$).*" proto " ") found=1
 		}
 		END { exit(found ? 0 : 1) }'
 }
 ufw_number_is_ssh(){
 	local id="$1" port="$2"
 	ufw status numbered 2>/dev/null | awk -v id="$id" -v p="$port" '
-		$0 ~ /^\\[[0-9]+\\]/ { n=$1; gsub(/[\\[\\]]/,"",n); if (n==id && $0 ~ "(^|[^0-9])" p "/tcp([^0-9]|$)") found=1 }
+		{
+			n=$1 $2; gsub(/[\\[\\]]/,"",n)
+			if (n==id && $0 ~ "(^|[^0-9])" p "/tcp([^0-9]|$)") found=1
+		}
 		END { exit(found ? 0 : 1) }'
 }
 
@@ -316,7 +319,13 @@ manage_ufw(){
 						3) proto=tcp+udp; ufw allow "$p/tcp" || add_failed=1; ufw allow "$p/udp" || add_failed=1 ;;
 						*) proto=tcp; ufw allow "$p/tcp" || add_failed=1 ;;
 					esac
-					if [ "$add_failed" -eq 0 ] && { [ "$proto" = tcp+udp ] || ufw status | grep -Eq "[[:space:]]$p/$proto([[:space:]]|$)"; }; then echo -e "${G}已确认开放 $p${N}"; else echo -e "${R}$p 添加或验证失败${N}"; fi
+					local verified=0
+					if [ "$proto" = tcp+udp ]; then
+						ufw_rule_exists "$p" tcp && ufw_rule_exists "$p" udp && verified=1
+					else
+						ufw_rule_exists "$p" "$proto" && verified=1
+					fi
+					if [ "$add_failed" -eq 0 ] && [ "$verified" -eq 1 ]; then echo -e "${G}已确认开放 $p${N}"; else echo -e "${R}$p 添加或验证失败${N}"; fi
 				done
 				echo -e "\n${X}当前规则:${N}"; ufw status numbered 2>/dev/null; pause ;;
 			3) echo -e "\n${C}--- 删除规则 ---${N}"
