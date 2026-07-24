@@ -18,34 +18,34 @@ STATE_DIR="/var/lib/vps-mgmt"
 STATE_FILE="$STATE_DIR/state.env"
 install -d -m 0700 "$STATE_DIR"
 [ -f "$STATE_FILE" ] && chmod 600 "$STATE_FILE"
-# state.env 仅记录本工具写入的 sysctl 标记，用于卸载时精准清理
-# 字段: TOOL_SYSCTL_BBR=1  TOOL_SWAP=1
-state_load(){ [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true; }
+# 唯一状态文件：只保存当前恢复所需状态，不创建历史备份
+# shellcheck disable=SC1090
+state_load(){
+	[ -f "$STATE_FILE" ] || return 0
+	. "$STATE_FILE" 2>/dev/null || true
+}
 state_save(){
-	local tmp; tmp=$(mktemp "$STATE_FILE.XXXXXX") || return 1
-	chmod 600 "$tmp"
-	[ -n "$TOOL_SYSCTL_BBR" ] && printf 'TOOL_SYSCTL_BBR=%s\n' "$TOOL_SYSCTL_BBR" >> "$tmp"
-	[ -n "$TOOL_SWAP" ] && printf 'TOOL_SWAP=%s\n' "$TOOL_SWAP" >> "$tmp"
+	local tmp
+	tmp=$(mktemp "$STATE_FILE.XXXXXX") || return 1
+	chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+	[ -n "${TOOL_SYSCTL_BBR:-}" ] && printf 'TOOL_SYSCTL_BBR=%q\n' "$TOOL_SYSCTL_BBR" >> "$tmp"
+	[ -n "${TOOL_SWAP:-}" ] && printf 'TOOL_SWAP=%q\n' "$TOOL_SWAP" >> "$tmp"
+	[ -n "${TOOL_OLD_CC:-}" ] && printf 'TOOL_OLD_CC=%q\n' "$TOOL_OLD_CC" >> "$tmp"
+	[ -n "${TOOL_OLD_QDISC:-}" ] && printf 'TOOL_OLD_QDISC=%q\n' "$TOOL_OLD_QDISC" >> "$tmp"
+	[ -n "${TOOL_OLD_SWAPPINESS:-}" ] && printf 'TOOL_OLD_SWAPPINESS=%q\n' "$TOOL_OLD_SWAPPINESS" >> "$tmp"
+	[ -n "${TOOL_JOURNALD_LIMIT:-}" ] && printf 'TOOL_JOURNALD_LIMIT=%q\n' "$TOOL_JOURNALD_LIMIT" >> "$tmp"
 	mv -f "$tmp" "$STATE_FILE"
 }
 state_set_bbr(){ TOOL_SYSCTL_BBR=1; state_save; }
-state_clear_bbr(){ TOOL_SYSCTL_BBR=""; state_save; }
+state_clear_bbr(){ TOOL_SYSCTL_BBR=""; TOOL_OLD_CC=""; TOOL_OLD_QDISC=""; state_save; }
 state_set_swap(){ TOOL_SWAP=1; state_save; }
-state_clear_swap(){ TOOL_SWAP=""; state_save; }
+state_clear_swap(){ TOOL_SWAP=""; TOOL_OLD_SWAPPINESS=""; state_save; }
 state_load
 
 # 仅管理本工具自己的配置文件，绝不删除用户其他 sysctl 配置
 SYSCTL_DIR="/etc/sysctl.d"
 BBR_SYSCTL_FILE="$SYSCTL_DIR/99-vps-mgmt-bbr.conf"
 SWAP_SYSCTL_FILE="$SYSCTL_DIR/99-vps-mgmt-swap.conf"
-write_checked_file(){
-	local file="$1"; shift; local tmp
-	tmp=$(mktemp "${file}.XXXXXX") || return 1
-	if ! "$@" > "$tmp"; then rm -f "$tmp"; return 1; fi
-	chmod 0644 "$tmp" && mv -f "$tmp" "$file"
-}
-sysctl_reload(){ sysctl --system >/tmp/vps-mgmt-sysctl.log 2>&1; }
-
 # journald 使用独立 drop-in，避免覆盖用户原有配置
 JOURNALD_DIR="/etc/systemd/journald.conf.d"
 JOURNALD_LIMIT_FILE="$JOURNALD_DIR/99-vps-mgmt-limit.conf"
@@ -82,11 +82,21 @@ confirm(){
 	done
 }
 has_cmd(){ command -v "$1" >/dev/null 2>&1; }
-# systemctl 操作必须返回真实结果
-svc_enable(){ systemctl enable "$1" >/dev/null 2>&1; }
-svc_start(){ systemctl start "$1"; }
-svc_restart(){ systemctl restart "$1"; }
-svc_is_active(){ systemctl is-active --quiet "$1"; }
+bbr_ok(){
+	local available
+	available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+	if ! printf '%s\n' "$available" | grep -qw bbr; then
+		modprobe tcp_bbr 2>/dev/null || true
+		available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+	fi
+	printf '%s\n' "$available" | grep -qw bbr
+}
+sysctl_set_verify(){
+	local key="$1" value="$2" actual
+	sysctl -w "$key=$value" >/dev/null 2>&1 || return 1
+	actual=$(sysctl -n "$key" 2>/dev/null) || return 1
+	[ "$(printf '%s' "$actual" | xargs)" = "$(printf '%s' "$value" | xargs)" ]
+}
 # 检查编号规则是否为指定 SSH 端口，避免 22 误匹配 222
 ufw_rule_exists(){
 	local port="$1" proto="$2"
@@ -155,20 +165,24 @@ ensure_ufw_installed(){
 	echo -e "\n${C}--- 配置放行端口 ---${N}"
 	echo -e "当前 SSH 监听端口: ${Y}${dp}${N}"
 	read -r -p "放行 SSH 端口 [默认: ${dp}]: " sp; sp=${sp:-$dp}
+	local rules_ok=0
 	if [[ "$sp" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$sp" -le 65535 ]; then
-		ufw default deny incoming && ufw default allow outgoing && ufw allow "$sp/tcp" && ufw allow 80/tcp && ufw allow 443/tcp || echo -e "${R}部分 UFW 规则配置失败${N}"
-		if ufw_rule_exists "$sp" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp; then echo -e "${G}已确认放行 SSH/$sp、80、443${N}"; else echo -e "${R}UFW 规则验证失败${N}"; fi
+		if ufw default deny incoming && ufw default allow outgoing && ufw allow "$sp/tcp" && ufw allow 80/tcp && ufw allow 443/tcp && ufw_rule_exists "$sp" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp; then
+			rules_ok=1
+			echo -e "${G}已确认放行 SSH/$sp、80、443${N}"
+		else
+			echo -e "${R}UFW 规则配置或验证失败，不启用防火墙${N}"
+		fi
 	else
-		echo -e "${R}端口无效，未配置放行规则${N}"
+		echo -e "${R}端口无效，未配置放行规则，不启用防火墙${N}"
 	fi
-	local ufw_ok=true journald_ok=true
-	if ! printf 'y\n' | ufw enable; then ufw_ok=false; fi
-	ufw logging off || ufw_ok=false
-	configure_journald_limit || journald_ok=false
+	local ufw_ok=false journald_ok=false
+	if [ "$rules_ok" -eq 1 ] && printf 'y\n' | ufw enable && ufw logging off && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then ufw_ok=true; fi
+	configure_journald_limit && journald_ok=true
 	if $ufw_ok && $journald_ok; then
-		echo -e "${G}UFW 已启用，日志已关闭；journald 上限 100M${N}"
+		echo -e "${G}UFW 已确认启用，日志已关闭；journald 上限 100M${N}"
 	else
-		echo -e "${R}UFW 或 journald 初始化部分失败，请检查日志${N}"
+		echo -e "${R}UFW 或 journald 初始化失败，未显示为成功${N}"
 	fi
 	pause
 }
@@ -268,8 +282,12 @@ manage_ufw(){
 					*) echo -e "${R}无效${N}"; continue ;;
 				esac
 				# 验证日志级别
-				local curlv; curlv=$(ufw status verbose 2>/dev/null | awk -F'[:/]' '/Logging/{gsub(/ /,"",$2);print $2}')
-				[ -n "$curlv" ] && echo -e "${G}已设置 (当前: $curlv)${N}" || echo -e "${G}已设置${N}"
+				local curlv; curlv=$(ufw status verbose 2>/dev/null | sed -n 's/^[[:space:]]*Logging:[[:space:]]*//p' | head -1 | tr '[:upper:]' '[:lower:]')
+				if [ -n "$curlv" ]; then
+					echo -e "${G}已确认设置 (当前: $curlv)${N}"
+				else
+					echo -e "${R}设置结果无法验证${N}"
+				fi
 				pause ;;
 			0) break ;;
 			*) echo -e "${R}无效选项${N}"; sleep 1 ;;
@@ -289,6 +307,9 @@ manage_bbr(){
 		case $c in
 			1) bbr_ok || { echo -e "${R}系统当前未报告支持 bbr（内核可能过旧，需 ≥4.9）${N}"; pause; continue; }
 				confirm "开启?" && {
+					TOOL_OLD_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'cubic')
+					TOOL_OLD_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 'fq_codel')
+					state_save || { echo -e "${R}状态保存失败，未修改 BBR${N}"; pause; continue; }
 					if ! mkdir -p "$SYSCTL_DIR" || ! printf '%s\n' 'net.core.default_qdisc=fq' 'net.ipv4.tcp_congestion_control=bbr' > "$BBR_SYSCTL_FILE"; then
 						echo -e "${R}BBR 配置文件写入失败${N}"
 					elif ! chmod 0644 "$BBR_SYSCTL_FILE" || ! apply_bbr; then
@@ -354,8 +375,10 @@ EOF
 			4) confirm "恢复兼容默认 (cubic)?" && {
 				# 清理残留硬化参数（已废弃的网络加固写入的行）
 				if [ -f "$BBR_SYSCTL_FILE" ] && ! rm -f "$BBR_SYSCTL_FILE"; then echo -e "${R}BBR 配置文件删除失败${N}"; pause; continue; fi
-				sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-				sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+				local old_cc="${TOOL_OLD_CC:-cubic}" old_qdisc="${TOOL_OLD_QDISC:-fq_codel}"
+				if ! sysctl_set_verify net.ipv4.tcp_congestion_control "$old_cc" || ! sysctl_set_verify net.core.default_qdisc "$old_qdisc"; then
+					echo -e "${R}BBR 参数恢复失败${N}"; pause; continue
+				fi
 				# 恢复网卡 qdisc
 				for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo' | grep -v '@'); do
 					tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
@@ -397,7 +420,8 @@ apply_bbr(){
 		sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || aerr=1
 		sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || aerr=1
 		if [ "$aerr" -ne 0 ]; then
-			echo -e "${Y}部分进阶参数写入失败，但 BBR 核心已生效${N}"
+			echo -e "${R}部分进阶参数写入或验证失败；BBR 核心已生效，但不标记为完整进阶模式${N}"
+			return 1
 		else
 			echo -e "${G}进阶 TCP 调优参数已全部生效${N}"
 		fi
@@ -445,6 +469,7 @@ manage_swap(){
 		read -r -p "请选择: " c
 		case $c in
 			1) echo -e "\n${C}--- 创建 SWAP ---${N}"
+				TOOL_OLD_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || printf '60')
 				if [ "$(free 2>/dev/null | awk '/Swap/{print $2}')" -gt 0 ] 2>/dev/null; then
 					echo -e "${Y}检测到已有 SWAP，继续将重建${N}"; confirm "确认?" || { pause; continue; }
 				fi
@@ -466,21 +491,14 @@ manage_swap(){
 				if ! chmod 600 /swapfile || ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then echo -e "${R}SWAP 初始化失败${N}"; swapoff /swapfile >/dev/null 2>&1 || true; rm -f /swapfile; pause; continue; fi
 				if ! grep -qFx '/swapfile swap swap defaults 0 0' /etc/fstab; then printf '%s\n' '/swapfile swap swap defaults 0 0' >> /etc/fstab || { echo -e "${R}fstab 写入失败${N}"; swapoff /swapfile; rm -f /swapfile; pause; continue; }; fi
 				if ! printf 'vm.swappiness=%s\n' "$sv" > "$SWAP_SYSCTL_FILE" || ! chmod 0644 "$SWAP_SYSCTL_FILE" || ! sysctl -w "vm.swappiness=$sv" >/dev/null 2>&1; then echo -e "${R}swappiness 配置失败${N}"; swapoff /swapfile; rm -f /swapfile; sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab; rm -f "$SWAP_SYSCTL_FILE"; pause; continue; fi
-				if swapon --show=NAME --noheadings | grep -qx '/swapfile' && [ "$(sysctl -n vm.swappiness 2>/dev/null)" = "$sv" ] && grep -qFx '/swapfile swap swap defaults 0 0' /etc/fstab; then echo -e "${G}创建成功${N} $(free -h 2>/dev/null | awk '/Swap/{print "Swap: "$2}')"; state_set_swap; else echo -e "${R}创建后验证失败，正在回滚${N}"; swapoff /swapfile; rm -f /swapfile; sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab; rm -f "$SWAP_SYSCTL_FILE"; fi
+				if swapon --show=NAME --noheadings | grep -qx '/swapfile' && [ "$(sysctl -n vm.swappiness 2>/dev/null)" = "$sv" ] && grep -qFx '/swapfile swap swap defaults 0 0' /etc/fstab && state_save; then echo -e "${G}创建成功${N} $(free -h 2>/dev/null | awk '/Swap/{print "Swap: "$2}')"; state_set_swap; else echo -e "${R}创建后验证失败，正在回滚${N}"; swapoff /swapfile; rm -f /swapfile; sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab; rm -f "$SWAP_SYSCTL_FILE"; fi
 				pause ;;
 			2) echo -e "\n${C}=== 内存 ===${N}"; free -h; echo -e "\n${C}=== SWAP 挂载 ===${N}"; swapon --show 2>/dev/null || echo "无 SWAP"; pause ;;
-			3) [ "$(free 2>/dev/null | awk '/Swap/{print $2}')" -eq 0 ] 2>/dev/null && { echo -e "${Y}无 SWAP${N}"; pause; continue; }
-				confirm "彻底删除?" && {
-					local ok=true
-					if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && ! swapoff /swapfile >/dev/null 2>&1; then ok=false; fi
-					if ! rm -f /swapfile; then ok=false; fi
-					sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab
-					if [ -f "$SWAP_SYSCTL_FILE" ] && ! rm -f "$SWAP_SYSCTL_FILE"; then ok=false; fi
-					sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
-					if $ok && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
-						echo -e "${G}已删除${N}"; state_clear_swap
+			3) confirm "彻底删除 SWAP？" && {
+					if cleanup_swap; then
+						echo -e "${G}SWAP 已删除并完成验证${N}"
 					else
-						echo -e "${R}删除后仍有残留，请检查${N}"
+						echo -e "${R}SWAP 删除失败或仍有残留${N}"
 					fi
 				}; pause ;;
 			0) break ;;
@@ -490,74 +508,104 @@ manage_swap(){
 }
 
 # ---------- 卸载与清理 ----------
+cleanup_bbr(){
+    if [ "${TOOL_SYSCTL_BBR:-}" != "1" ] && [ ! -e "$BBR_SYSCTL_FILE" ]; then
+        return 0
+    fi
+    local failed=0 old_cc="${TOOL_OLD_CC:-cubic}" old_qdisc="${TOOL_OLD_QDISC:-fq_codel}"
+    rm -f "$BBR_SYSCTL_FILE" || failed=1
+    [ ! -e "$BBR_SYSCTL_FILE" ] || failed=1
+    sysctl_set_verify net.ipv4.tcp_congestion_control "$old_cc" || failed=1
+    sysctl_set_verify net.core.default_qdisc "$old_qdisc" || failed=1
+    if [ "$failed" -eq 0 ]; then
+        state_clear_bbr || failed=1
+    fi
+    return "$failed"
+}
+cleanup_swap(){
+    if [ "${TOOL_SWAP:-}" != "1" ] && [ ! -e /swapfile ] && [ ! -e "$SWAP_SYSCTL_FILE" ]; then
+        return 0
+    fi
+    local failed=0 old_sw="${TOOL_OLD_SWAPPINESS:-60}"
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+        swapoff /swapfile >/dev/null 2>&1 || failed=1
+    fi
+    rm -f /swapfile || failed=1
+    [ ! -e /swapfile ] || failed=1
+    sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab || failed=1
+    grep -qFx '/swapfile swap swap defaults 0 0' /etc/fstab 2>/dev/null && failed=1
+    rm -f "$SWAP_SYSCTL_FILE" || failed=1
+    [ ! -e "$SWAP_SYSCTL_FILE" ] || failed=1
+    sysctl_set_verify vm.swappiness "$old_sw" || failed=1
+    if [ "$failed" -eq 0 ]; then
+        state_clear_swap || failed=1
+    fi
+    return "$failed"
+}
+cleanup_journald(){
+    local failed=0
+    if [ -e "$JOURNALD_LIMIT_FILE" ]; then
+        rm -f "$JOURNALD_LIMIT_FILE" || failed=1
+    fi
+    [ ! -e "$JOURNALD_LIMIT_FILE" ] || failed=1
+    if has_cmd systemctl; then
+        systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald-clean.log 2>&1 || failed=1
+    fi
+    return "$failed"
+}
+uninstall_ufw(){
+    local failed=0
+    if has_cmd ufw; then
+        printf 'y
+' | ufw disable >/tmp/ufw-disable.log 2>&1 || failed=1
+        printf 'y
+' | ufw reset >/tmp/ufw-reset.log 2>&1 || failed=1
+        if [ "$failed" -eq 0 ]; then
+            apt-get purge -y ufw >/tmp/uninst-ufw.log 2>&1 || failed=1
+        fi
+    fi
+    has_cmd ufw && failed=1
+    cleanup_journald || failed=1
+    return "$failed"
+}
 uninstall(){
-	clear; echo -e "${R}=== 卸载与清理 ===${N}\n"
-	has_cmd ufw && echo -e "  ${Y}1.${N} 卸载 UFW"
-	echo -e "  ${Y}2.${N} 清理 BBR 参数"
-	echo -e "  ${Y}3.${N} 清理 SWAP"
-	echo -e "  ${R}4.${N} 一键全部卸载"
-	echo -e "  ${X}0. 返回主菜单${N}"
-	read -r -p "请选择: " c
-	case $c in
-		1) has_cmd ufw || { echo -e "${R}未安装${N}"; pause; return; }
-			confirm "卸载 UFW? (将关闭防火墙并删除规则)" || return
-			if ! printf 'y\n' | ufw disable >/tmp/ufw-disable.log 2>&1; then echo -e "${R}UFW 关闭失败，未继续卸载${N}"; cat /tmp/ufw-disable.log; pause; return; fi
-			if ! ufw reset >/tmp/ufw-reset.log 2>&1; then echo -e "${R}UFW 规则清空失败，未继续卸载${N}"; cat /tmp/ufw-reset.log; pause; return; fi
-			if apt-get purge -y ufw >/tmp/uninst-ufw.log 2>&1; then
-				echo -e "${G}UFW 已卸载${N}"
-			else
-				echo -e "${R}UFW 卸载出错${N}"; tail -20 /tmp/uninst-ufw.log
-			fi
-			pause ;;
-		2) confirm "清理所有 BBR/TCP 调优参数? (恢复 cubic 默认)" || return
-			if [ -f "$BBR_SYSCTL_FILE" ] && ! rm -f "$BBR_SYSCTL_FILE"; then echo -e "${R}BBR 配置文件删除失败${N}"; pause; return; fi
-			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-			sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
-			local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-			[ "$ncc" = "cubic" ] && { echo -e "${G}已清理 (cc=$ncc)${N}"; state_clear_bbr; } || echo -e "${R}清理后验证失败${N}"
-			pause ;;
-		3) confirm "清理所有 SWAP?" || return
-			local ok=true
-			if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && ! swapoff /swapfile >/dev/null 2>&1; then ok=false; fi
-			if ! rm -f /swapfile; then ok=false; fi
-			sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab
-			if [ -f "$SWAP_SYSCTL_FILE" ] && ! rm -f "$SWAP_SYSCTL_FILE"; then ok=false; fi
-			sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
-			if $ok && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
-				echo -e "${G}已清理${N}"; state_clear_swap
-			else
-				echo -e "${R}清理失败或仍有残留${N}"
-			fi
-			pause ;;
-		4) echo -e "${R}即将执行: 卸载 UFW + 清理 BBR + SWAP${N}"
-			confirm "确认?" || return
-			confirm "再次确认? (不可逆)" || return
-			# UFW
-			if has_cmd ufw; then
-				if ! printf 'y\n' | ufw disable >/tmp/ufw-disable-all.log 2>&1; then echo -e "UFW: ${R}关闭失败，跳过卸载${N}"; cat /tmp/ufw-disable-all.log
-				elif ! ufw reset >/tmp/ufw-reset-all.log 2>&1; then echo -e "UFW: ${R}规则清空失败，跳过卸载${N}"; cat /tmp/ufw-reset-all.log
-				else apt-get purge -y ufw >/tmp/uninst-all.log 2>&1 && echo -e "UFW: ${G}已卸载${N}" || echo -e "UFW: ${R}卸载出错${N}"
-				fi
-			fi
-			# BBR：只删除本工具独立配置文件
-			rm -f "$BBR_SYSCTL_FILE"
-			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-			sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
-			local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-			[ "$ncc" = "cubic" ] && echo -e "BBR: ${G}已清理${N}" || echo -e "BBR: ${R}清理失败${N}"
-			# SWAP
-			local swok=true
-			if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && ! swapoff /swapfile >/dev/null 2>&1; then swok=false; fi
-			if ! rm -f /swapfile; then swok=false; fi
-			sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab
-			if [ -f "$SWAP_SYSCTL_FILE" ] && ! rm -f "$SWAP_SYSCTL_FILE"; then swok=false; fi
-			$swok && ! swapon --show 2>/dev/null | grep -q '/swapfile' && echo -e "SWAP: ${G}已清理${N}" || echo -e "SWAP: ${R}清理失败${N}"
-			# 清除状态文件
-			rm -f "$STATE_FILE"
-			echo -e "\n${G}全部完成${N}"; pause ;;
-		0) return ;;
-		*) echo -e "${R}无效${N}"; sleep 1 ;;
-	esac
+    clear
+    echo -e "${R}=== 卸载与清理 ===${N}
+"
+    echo -e "  ${Y}1.${N} 卸载 UFW（关闭防火墙、清空规则并 purge）"
+    echo -e "  ${R}2.${N} 全部卸载（UFW + BBR + SWAP + journald 配置）"
+    echo -e "  ${X}0.${N} 返回主菜单"
+    read -r -p "请选择: " c
+    case "$c" in
+        1)
+            confirm "确认卸载 UFW？" || { pause; return; }
+            if uninstall_ufw; then
+                echo -e "${G}UFW 已卸载并完成验证${N}"
+            else
+                echo -e "${R}UFW 卸载或残留清理失败，请检查 /tmp/ufw-disable.log、/tmp/ufw-reset.log、/tmp/uninst-ufw.log${N}"
+            fi
+            pause ;;
+        2)
+            confirm "确认全部卸载？此操作会删除本工具创建的 UFW、BBR、SWAP 和 journald 配置" || { pause; return; }
+            local failed=0
+            uninstall_ufw || failed=1
+            cleanup_bbr || failed=1
+            cleanup_swap || failed=1
+            cleanup_journald || failed=1
+            if [ "$failed" -eq 0 ]; then
+                rm -f "$STATE_FILE" || failed=1
+                [ ! -e "$STATE_FILE" ] || failed=1
+                rmdir "$STATE_DIR" 2>/dev/null || true
+            fi
+            if [ "$failed" -eq 0 ]; then
+                echo -e "${G}全部卸载完成，已通过结果验证${N}"
+            else
+                echo -e "${R}全部卸载部分失败，未显示为成功；请检查上方错误和 /tmp/vps-mgmt-*.log${N}"
+            fi
+            pause ;;
+        0) return ;;
+        *) echo -e "${R}无效选项${N}"; sleep 1 ;;
+    esac
 }
 
 # ---------- 主循环 ----------
