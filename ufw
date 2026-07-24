@@ -59,7 +59,8 @@ pause(){ echo -e "\n${Y}按回车键返回菜单...${N}"; read -r _; }
 confirm(){
 	local m="${1:-确认?}" yn
 	while true; do
-		read -r -p "$m ${G}Y${N}/n ${X}[回车=Y]${N}: " yn
+		printf '%b' "$m ${G}Y${N}/n ${X}[回车=Y]${N}: "
+		IFS= read -r yn
 		case "$yn" in
 			""|[Yy]) return 0 ;;
 			[Nn]) return 1 ;;
@@ -74,6 +75,15 @@ svc_start(){ systemctl start "$1"; }
 svc_restart(){ systemctl restart "$1"; }
 svc_is_active(){ systemctl is-active --quiet "$1"; }
 # 检查编号规则是否为指定 SSH 端口，避免 22 误匹配 222
+ufw_rule_exists(){
+	local port="$1" proto="$2"
+	ufw status 2>/dev/null | awk -v p="$port" -v proto="$proto" '
+		$0 !~ /^Status:/ && $0 !~ /^--/ {
+			line=$0; gsub(/[[:space:]]+/," ",line)
+			if (line ~ "(^| )" p "/" proto "( |$)" || line ~ "(^| )" p "( |$).*" proto) found=1
+		}
+		END { exit(found ? 0 : 1) }'
+}
 ufw_number_is_ssh(){
 	local id="$1" port="$2"
 	ufw status numbered 2>/dev/null | awk -v id="$id" -v p="$port" '
@@ -254,7 +264,7 @@ install_basics(){
 			if ! ufw allow "$sp/tcp"; then setup_failed=1; fi
 			if ! ufw allow 80/tcp; then setup_failed=1; fi
 			if ! ufw allow 443/tcp; then setup_failed=1; fi
-			if [ "$setup_failed" -eq 0 ] && ufw status | grep -Eq "^[[:space:]]*${sp}/tcp|[[:space:]]${sp}/tcp" && ufw status | grep -Eq "[[:space:]]80/tcp" && ufw status | grep -Eq "[[:space:]]443/tcp"; then
+			if [ "$setup_failed" -eq 0 ] && ufw_rule_exists "$sp" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp; then
 				echo -e "${G}已确认设置默认策略并放行 SSH/$sp、80、443${N}"
 			else
 				echo -e "${R}UFW 规则配置或验证失败，未报告为成功${N}"
@@ -884,6 +894,7 @@ uninstall(){
 		1) has_cmd ufw || { echo -e "${R}未安装${N}"; pause; return; }
 			confirm "卸载 UFW? (将关闭防火墙并删除规则)" || return
 			if ! printf 'y\n' | ufw disable >/tmp/ufw-disable.log 2>&1; then echo -e "${R}UFW 关闭失败，未继续卸载${N}"; cat /tmp/ufw-disable.log; pause; return; fi
+			if ! ufw reset >/tmp/ufw-reset.log 2>&1; then echo -e "${R}UFW 规则清空失败，未继续卸载${N}"; cat /tmp/ufw-reset.log; pause; return; fi
 			if apt-get purge -y ufw >/tmp/uninst-ufw.log 2>&1; then
 				echo -e "${G}UFW 已卸载${N}"
 			else
@@ -931,7 +942,9 @@ uninstall(){
 			confirm "再次确认? (不可逆)" || return
 			# UFW
 			if has_cmd ufw; then
-				if ! printf 'y\n' | ufw disable >/tmp/ufw-disable-all.log 2>&1; then echo -e "UFW: ${R}关闭失败，跳过卸载${N}"; cat /tmp/ufw-disable-all.log; else apt-get purge -y ufw >/tmp/uninst-all.log 2>&1 && echo -e "UFW: ${G}已卸载${N}" || echo -e "UFW: ${R}卸载出错${N}"
+				if ! printf 'y\n' | ufw disable >/tmp/ufw-disable-all.log 2>&1; then echo -e "UFW: ${R}关闭失败，跳过卸载${N}"; cat /tmp/ufw-disable-all.log
+				elif ! ufw reset >/tmp/ufw-reset-all.log 2>&1; then echo -e "UFW: ${R}规则清空失败，跳过卸载${N}"; cat /tmp/ufw-reset-all.log
+				else apt-get purge -y ufw >/tmp/uninst-all.log 2>&1 && echo -e "UFW: ${G}已卸载${N}" || echo -e "UFW: ${R}卸载出错${N}"
 				fi
 			fi
 			# Fail2ban：先清理本工具文件再 purge
