@@ -49,21 +49,52 @@ SWAP_SYSCTL_FILE="$SYSCTL_DIR/99-vps-mgmt-swap.conf"
 # journald 使用独立 drop-in，避免覆盖用户原有配置
 JOURNALD_DIR="/etc/systemd/journald.conf.d"
 JOURNALD_LIMIT_FILE="$JOURNALD_DIR/99-vps-mgmt-limit.conf"
+journald_effective_ok(){
+	local cfg system_value runtime_value
+	has_cmd systemd-analyze || return 1
+	cfg=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null) || return 1
+	# 读取最终生效值；后出现的 drop-in 覆盖先出现的配置
+	system_value=$(printf '%s\n' "$cfg" | awk '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
+		/^\[Journal\][[:space:]]*$/ {in_j=1; next}
+		/^\[/ {in_j=0}
+		in_j && /^[[:space:]]*SystemMaxUse=/ {sub(/^[^=]*=/,"",$0); v=$0}
+		END {print v}')
+	runtime_value=$(printf '%s\n' "$cfg" | awk '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
+		/^\[Journal\][[:space:]]*$/ {in_j=1; next}
+		/^\[/ {in_j=0}
+		in_j && /^[[:space:]]*RuntimeMaxUse=/ {sub(/^[^=]*=/,"",$0); v=$0}
+		END {print v}')
+	[ "$system_value" = "100M" ] && [ "$runtime_value" = "100M" ]
+}
 configure_journald_limit(){
 	mkdir -p "$JOURNALD_DIR" || return 1
 	local tmp
 	tmp=$(mktemp "${JOURNALD_LIMIT_FILE}.XXXXXX") || return 1
-	cat > "$tmp" <<'EOF'
+	if ! cat > "$tmp" <<'EOF'
 [Journal]
 SystemMaxUse=100M
 RuntimeMaxUse=100M
 EOF
-	chmod 0644 "$tmp" && mv -f "$tmp" "$JOURNALD_LIMIT_FILE" || { rm -f "$tmp"; return 1; }
-	if systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald.log 2>&1; then
-		return 0
+	then
+		rm -f "$tmp"
+		return 1
 	fi
-	# 某些精简系统不支持 reload-or-restart，退回 reload
-	systemctl restart systemd-journald >/tmp/vps-mgmt-journald.log 2>&1
+	chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+	mv -f "$tmp" "$JOURNALD_LIMIT_FILE" || { rm -f "$tmp"; return 1; }
+	grep -qFx 'SystemMaxUse=100M' "$JOURNALD_LIMIT_FILE" || return 1
+	grep -qFx 'RuntimeMaxUse=100M' "$JOURNALD_LIMIT_FILE" || return 1
+
+	if ! systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald.log 2>&1; then
+		systemctl restart systemd-journald >/tmp/vps-mgmt-journald.log 2>&1 || return 1
+	fi
+	systemctl is-active --quiet systemd-journald || return 1
+	journald_effective_ok || return 1
+
+	TOOL_JOURNALD_LIMIT=1
+	state_save || return 1
+	return 0
 }
 
 # ---------- 通用函数 ----------
@@ -550,16 +581,19 @@ cleanup_journald(){
     [ ! -e "$JOURNALD_LIMIT_FILE" ] || failed=1
     if has_cmd systemctl; then
         systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald-clean.log 2>&1 || failed=1
+        systemctl is-active --quiet systemd-journald || failed=1
+    fi
+    if [ "$failed" -eq 0 ]; then
+        TOOL_JOURNALD_LIMIT=""
+        state_save || failed=1
     fi
     return "$failed"
 }
 uninstall_ufw(){
     local failed=0
     if has_cmd ufw; then
-        printf 'y
-' | ufw disable >/tmp/ufw-disable.log 2>&1 || failed=1
-        printf 'y
-' | ufw reset >/tmp/ufw-reset.log 2>&1 || failed=1
+        printf 'y\n' | ufw disable >/tmp/ufw-disable.log 2>&1 || failed=1
+        printf 'y\n' | ufw reset >/tmp/ufw-reset.log 2>&1 || failed=1
         if [ "$failed" -eq 0 ]; then
             apt-get purge -y ufw >/tmp/uninst-ufw.log 2>&1 || failed=1
         fi
