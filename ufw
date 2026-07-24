@@ -16,12 +16,22 @@ set -o pipefail
 # ---------- 状态文件（本工具唯一持久产物）----------
 STATE_DIR="/var/lib/vps-mgmt"
 STATE_FILE="$STATE_DIR/state.env"
-mkdir -p "$STATE_DIR"
+install -d -m 0700 "$STATE_DIR"
+[ -f "$STATE_FILE" ] && chmod 600 "$STATE_FILE"
 # state.env 记录：本工具写入的 jail 文件、filter 文件、sysctl 标记等，用于卸载时精准清理
 # 字段: TOOL_JAILS="sshd.local ufw-block-abuse.local"  TOOL_FILTERS="ufw-block-abuse.conf"
 #       TOOL_SYSCTL_BBR=1  TOOL_SWAP=1
 state_load(){ [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true; }
-state_save(){ : > "$STATE_FILE"; [ -n "$TOOL_JAILS" ] && echo "TOOL_JAILS=\"$TOOL_JAILS\"" >> "$STATE_FILE"; [ -n "$TOOL_FILTERS" ] && echo "TOOL_FILTERS=\"$TOOL_FILTERS\"" >> "$STATE_FILE"; [ -n "$TOOL_SYSCTL_BBR" ] && echo "TOOL_SYSCTL_BBR=$TOOL_SYSCTL_BBR" >> "$STATE_FILE"; [ -n "$TOOL_SWAP" ] && echo "TOOL_SWAP=$TOOL_SWAP" >> "$STATE_FILE"; }
+state_save(){
+	local tmp; tmp=$(mktemp "$STATE_FILE.XXXXXX") || return 1
+	chmod 600 "$tmp"
+	[ -n "$TOOL_JAILS" ] && printf 'TOOL_JAILS="%s"\n' "$TOOL_JAILS" >> "$tmp"
+	[ -n "$TOOL_FILTERS" ] && printf 'TOOL_FILTERS="%s"\n' "$TOOL_FILTERS" >> "$tmp"
+	[ -n "$TOOL_SYSCTL_BBR" ] && printf 'TOOL_SYSCTL_BBR=%s\n' "$TOOL_SYSCTL_BBR" >> "$tmp"
+	[ -n "$TOOL_SWAP" ] && printf 'TOOL_SWAP=%s\n' "$TOOL_SWAP" >> "$tmp"
+	[ -n "$TOOL_UFW_LOGSRC" ] && printf 'TOOL_UFW_LOGSRC="%s"\n' "$TOOL_UFW_LOGSRC" >> "$tmp"
+	mv -f "$tmp" "$STATE_FILE"
+}
 state_add_jail(){ case " $TOOL_JAILS " in *" $1 "*) ;; *) TOOL_JAILS="${TOOL_JAILS:+$TOOL_JAILS }$1"; state_save ;; esac; }
 state_del_jail(){ TOOL_JAILS=$(echo "$TOOL_JAILS" | tr ' ' '\n' | grep -vx "$1" | tr '\n' ' '); state_save; }
 state_add_filter(){ case " $TOOL_FILTERS " in *" $1 "*) ;; *) TOOL_FILTERS="${TOOL_FILTERS:+$TOOL_FILTERS }$1"; state_save ;; esac; }
@@ -31,16 +41,45 @@ state_set_swap(){ TOOL_SWAP=1; state_save; }
 state_clear_swap(){ TOOL_SWAP=""; state_save; }
 state_load
 
+# 仅管理本工具自己的配置文件，绝不删除用户其他 sysctl 配置
+SYSCTL_DIR="/etc/sysctl.d"
+BBR_SYSCTL_FILE="$SYSCTL_DIR/99-vps-mgmt-bbr.conf"
+SWAP_SYSCTL_FILE="$SYSCTL_DIR/99-vps-mgmt-swap.conf"
+write_checked_file(){
+	local file="$1"; shift; local tmp
+	tmp=$(mktemp "${file}.XXXXXX") || return 1
+	if ! "$@" > "$tmp"; then rm -f "$tmp"; return 1; fi
+	chmod 0644 "$tmp" && mv -f "$tmp" "$file"
+}
+sysctl_reload(){ sysctl --system >/tmp/vps-mgmt-sysctl.log 2>&1; }
+
 # ---------- 通用函数 ----------
 pause(){ echo -e "\n${Y}按回车键返回菜单...${N}"; read -r _; }
 # confirm: y/n，默认 y，回车=确认
-confirm(){ local m="${1:-确认?}"; echo -e "$m ${G}Y${N}/n  ${X}[回车=Y]${N}"; read -r -p "> " yn; [[ "$yn" =~ ^[Nn]$ ]] && return 1 || return 0; }
+confirm(){
+	local m="${1:-确认?}" yn
+	while true; do
+		read -r -p "$m ${G}Y${N}/n ${X}[回车=Y]${N}: " yn
+		case "$yn" in
+			""|[Yy]) return 0 ;;
+			[Nn]) return 1 ;;
+			*) echo -e "${Y}请输入 y 或 n。${N}" ;;
+		esac
+	done
+}
 has_cmd(){ command -v "$1" >/dev/null 2>&1; }
-# 带结果检查的 systemctl 操作
-svc_enable(){ systemctl enable "$1" 2>&1 | grep -vi 'created symlink\|^$' || true; }
+# systemctl 操作必须返回真实结果
+svc_enable(){ systemctl enable "$1" >/dev/null 2>&1; }
 svc_start(){ systemctl start "$1"; }
 svc_restart(){ systemctl restart "$1"; }
 svc_is_active(){ systemctl is-active --quiet "$1"; }
+# 检查编号规则是否为指定 SSH 端口，避免 22 误匹配 222
+ufw_number_is_ssh(){
+	local id="$1" port="$2"
+	ufw status numbered 2>/dev/null | awk -v id="$id" -v p="$port" '
+		$0 ~ /^\\[[0-9]+\\]/ { n=$1; gsub(/[\\[\\]]/,"",n); if (n==id && $0 ~ "(^|[^0-9])" p "/tcp([^0-9]|$)") found=1 }
+		END { exit(found ? 0 : 1) }'
+}
 
 # ---------- 状态显示 ----------
 ufw_st(){ has_cmd ufw || { echo -e "${X}未安装${N}"; return; }; local e; e=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2); [ "${e^^}" = "YES" ] && echo -e "${G}运行中${N}" || echo -e "${Y}已停止${N}"; }
@@ -72,6 +111,10 @@ bbr_ok(){
 	sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
 }
 detect_ufw_logsrc(){
+	if [ -n "$TOOL_UFW_LOGSRC" ]; then echo "$TOOL_UFW_LOGSRC"; return; fi
+	if journalctl -k -n 50 --no-pager 2>/dev/null >/dev/null && has_cmd fail2ban-client; then
+		TOOL_UFW_LOGSRC="systemd:kernel"; echo "$TOOL_UFW_LOGSRC"; return
+	fi
 	if [ -s /var/log/ufw.log ]  && grep -q 'UFW' /var/log/ufw.log  2>/dev/null; then echo "file:/var/log/ufw.log";  return; fi
 	if [ -s /var/log/kern.log ] && grep -q 'UFW' /var/log/kern.log 2>/dev/null; then echo "file:/var/log/kern.log"; return; fi
 	if [ -s /var/log/syslog ]   && grep -q 'UFW' /var/log/syslog   2>/dev/null; then echo "file:/var/log/syslog";  return; fi
@@ -204,21 +247,27 @@ install_basics(){
 		fi
 		echo -e "\n${C}--- 配置放行端口 ---${N}"; local dp; dp=$(get_ssh_port); echo -e "当前 SSH 监听端口: ${Y}${dp}${N}"
 		read -r -p "放行 SSH 端口 [默认: ${dp}]: " sp; sp=${sp:-$dp}
-		if [[ "$sp" =~ ^[0-9]+$ ]]; then
-			ufw default deny incoming 2>&1 | grep -v '^$' || true
-			ufw default allow outgoing 2>&1 | grep -v '^$' || true
-			ufw allow "$sp/tcp" 2>&1 | grep -v '^$' || true
-			ufw allow 80/tcp  2>&1 | grep -v '^$' || true
-			ufw allow 443/tcp 2>&1 | grep -v '^$' || true
-			echo -e "${G}已设置默认策略并放行 SSH/$sp、80、443${N}"
+		if [[ "$sp" =~ ^[0-9]+$ ]] && [ "$sp" -ge 1 ] && [ "$sp" -le 65535 ]; then
+			local setup_failed=0
+			if ! ufw default deny incoming; then setup_failed=1; fi
+			if ! ufw default allow outgoing; then setup_failed=1; fi
+			if ! ufw allow "$sp/tcp"; then setup_failed=1; fi
+			if ! ufw allow 80/tcp; then setup_failed=1; fi
+			if ! ufw allow 443/tcp; then setup_failed=1; fi
+			if [ "$setup_failed" -eq 0 ] && ufw status | grep -Eq "^[[:space:]]*${sp}/tcp|[[:space:]]${sp}/tcp" && ufw status | grep -Eq "[[:space:]]80/tcp" && ufw status | grep -Eq "[[:space:]]443/tcp"; then
+				echo -e "${G}已确认设置默认策略并放行 SSH/$sp、80、443${N}"
+			else
+				echo -e "${R}UFW 规则配置或验证失败，未报告为成功${N}"
+			fi
 		else
 			echo -e "${R}端口无效，跳过${N}"
 		fi
 		confirm "启动 UFW 防火墙?" && {
-			echo "y" | ufw enable 2>&1 | grep -vi '^$' || true
-			ufw logging on 2>&1 | grep -vi '^$' || true
+			local ufw_ok=true
+			if ! printf 'y\n' | ufw enable; then ufw_ok=false; fi
+			if ! ufw logging on; then ufw_ok=false; fi
 			# 验证是否真正启用
-			if grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+			if $ufw_ok && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null && ufw status verbose >/dev/null 2>&1; then
 				echo -e "${G}UFW 已启用${N}"
 			else
 				echo -e "${R}UFW 启用失败，请检查 iptables/nftables 后端${N}"
@@ -250,14 +299,14 @@ manage_ufw(){
 			2) echo -e "\n${C}--- 添加端口 ---${N}"; read -r -p "端口 (空格分隔, 如: 80 443): " ps; [ -z "$ps" ] && { pause; continue; }
 				echo -e "协议: 1.TCP  2.UDP  3.TCP+UDP"; read -r -p "选择 [1]: " pt; echo ""
 				for p in $ps; do
-					[[ "$p" =~ ^[0-9]+(:[0-9]+)?$ ]] || { echo -e "${R}跳过: $p (格式无效)${N}"; continue; }
+					[[ "$p" =~ ^([1-9][0-9]{0,4})(:[1-9][0-9]{0,4})?$ ]] || { echo -e "${R}跳过: $p (格式无效)${N}"; continue; }
+					local add_failed=0 proto
 					case "$pt" in
-						2) ufw allow "$p/udp" 2>&1 | grep -vi '^$' ;;
-						3) ufw allow "$p/tcp" 2>&1 | grep -vi '^$'; ufw allow "$p/udp" 2>&1 | grep -vi '^$' ;;
-						*) ufw allow "$p/tcp" 2>&1 | grep -vi '^$' ;;
+						2) proto=udp; ufw allow "$p/udp" || add_failed=1 ;;
+						3) proto=tcp+udp; ufw allow "$p/tcp" || add_failed=1; ufw allow "$p/udp" || add_failed=1 ;;
+						*) proto=tcp; ufw allow "$p/tcp" || add_failed=1 ;;
 					esac
-					# 验证规则确实生效
-					if ufw status | grep -qw "$p"; then echo -e "${G}已开放 $p${N}"; else echo -e "${R}$p 添加失败${N}"; fi
+					if [ "$add_failed" -eq 0 ] && { [ "$proto" = tcp+udp ] || ufw status | grep -Eq "[[:space:]]$p/$proto([[:space:]]|$)"; }; then echo -e "${G}已确认开放 $p${N}"; else echo -e "${R}$p 添加或验证失败${N}"; fi
 				done
 				echo -e "\n${X}当前规则:${N}"; ufw status numbered 2>/dev/null; pause ;;
 			3) echo -e "\n${C}--- 删除规则 ---${N}"
@@ -265,29 +314,35 @@ manage_ufw(){
 				read -r -p "输入要删除的规则编号 (空格分隔): " ids; [ -z "$ids" ] && continue
 				local sp rs=false; sp=$(get_ssh_port)
 				for id in $ids; do
-					ufw status numbered 2>/dev/null | awk -v id="$id" -v sp="$sp" '/^\[/{n=$1;gsub(/[\[\]]/,"",n);if(n==id && $0~sp){exit 1}}' || rs=true
+					if ufw_number_is_ssh "$id" "$sp"; then
+						rs=true
+					fi
 				done
 				[ "$rs" = true ] && { echo -e "${Y}警告: 包含 SSH(${sp}) 规则${N}"; confirm "继续? (可能断连)" || { echo -e "${Y}已取消${N}"; pause; continue; }; }
 				confirm "确认删除?" || { echo -e "${Y}已取消${N}"; pause; continue; }
 				local fail_del=0
 				for id in $(echo "$ids" | tr ' ' '\n' | sort -rn); do
 					[[ "$id" =~ ^[0-9]+$ ]] || continue
-					if echo "y" | ufw delete "$id" 2>/dev/null; then :; else echo -e "${R}删除规则 $id 失败${N}"; fail_del=1; fi
+					local before after
+					before=$(ufw status numbered 2>/dev/null | awk -v id="[$id]" '$1==id{print; exit}')
+					if [ -z "$before" ]; then echo -e "${R}规则编号 $id 不存在${N}"; fail_del=1; continue; fi
+					if ! printf 'y\n' | ufw delete "$id" >/tmp/ufw-delete.log 2>&1; then
+						echo -e "${R}删除规则 $id 命令失败:${N}"; cat /tmp/ufw-delete.log; fail_del=1; continue
+					fi
+					after=$(ufw status numbered 2>/dev/null | grep -F -- "$before" || true)
+					if [ -n "$after" ]; then echo -e "${R}删除规则 $id 后仍检测到原规则${N}"; fail_del=1; else echo -e "${G}已确认删除规则 $id${N}"; fi
 				done
 				[ "$fail_del" -eq 0 ] && echo -e "${G}已删除${N}" || echo -e "${Y}部分删除失败，请查看上方提示${N}"
 				pause ;;
 			4) echo -e "\n${C}--- 开关 ---${N}"; echo -e "  ${Y}1.${N} 开启  ${Y}2.${N} 关闭  ${Y}3.${N} 重载"; read -r -p "选择: " op
 				case $op in
 					1) confirm "开启?" && {
-						echo "y" | ufw enable 2>&1 | grep -vi '^$'
-						ufw logging on 2>&1 | grep -vi '^$'
-						grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null && echo -e "${G}已开启${N}" || echo -e "${R}开启失败${N}"
+						if printf 'y\n' | ufw enable && ufw logging on && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then echo -e "${G}已确认开启${N}"; else echo -e "${R}开启失败${N}"; fi
 					} ;;
 					2) confirm "关闭?" && {
-						echo "y" | ufw disable 2>&1 | grep -vi '^$'
-						grep -qi '^ENABLED=no' /etc/ufw/ufw.conf 2>/dev/null && echo -e "${Y}已关闭${N}" || echo -e "${R}关闭失败${N}"
+						if printf 'y\n' | ufw disable && grep -qi '^ENABLED=no' /etc/ufw/ufw.conf 2>/dev/null; then echo -e "${Y}已确认关闭${N}"; else echo -e "${R}关闭失败${N}"; fi
 					} ;;
-					3) if ufw reload 2>&1 | grep -vi '^$'; then echo -e "${G}已重载${N}"; else echo -e "${R}重载失败${N}"; fi ;;
+					3) if ufw reload; then echo -e "${G}已确认重载${N}"; else echo -e "${R}重载失败${N}"; fi ;;
 				esac; pause ;;
 			5) local ip6; ip6=$(awk -F= '/^IPV6=/{print tolower($2)}' /etc/default/ufw 2>/dev/null); echo -e "当前: ${C}${ip6}${N}"
 				confirm "切换?" && {
@@ -299,10 +354,10 @@ manage_ufw(){
 				}; pause ;;
 			6) echo -e "\n${C}--- 日志级别 ---${N}"; echo -e "  ${Y}1.${N} off  ${Y}2.${N} low  ${Y}3.${N} medium  ${Y}4.${N} high"; read -r -p "选择 [2]: " lv
 				case "$lv" in
-					1) ufw logging off  2>&1 | grep -vi '^$' ;;
-					2|"") ufw logging low 2>&1 | grep -vi '^$' ;;
-					3) ufw logging medium 2>&1 | grep -vi '^$' ;;
-					4) ufw logging high 2>&1 | grep -vi '^$' ;;
+					1) ufw logging off || { echo -e "${R}日志关闭失败${N}"; continue; } ;;
+					2|"") ufw logging low || { echo -e "${R}日志级别设置失败${N}"; continue; } ;;
+					3) ufw logging medium || { echo -e "${R}日志级别设置失败${N}"; continue; } ;;
+					4) ufw logging high || { echo -e "${R}日志级别设置失败${N}"; continue; } ;;
 					*) echo -e "${R}无效${N}"; continue ;;
 				esac
 				# 验证日志级别
@@ -316,6 +371,16 @@ manage_ufw(){
 }
 
 # 验证 banaction 在当前系统是否实际可用（防止 nft/iptables 不匹配导致封禁命令静默失败）
+verify_real_ban_action(){
+	local jail="$1" test_ip="198.51.100.23" listed
+	fail2ban-client set "$jail" banip "$test_ip" >/tmp/f2b-ban-test.log 2>&1 || { echo -e "${R}真实 ban 测试失败:${N}"; cat /tmp/f2b-ban-test.log; return 1; }
+	listed=$(fail2ban-client status "$jail" 2>/dev/null | awk -F: '/Banned IP list/{print $2}')
+	if ! echo "$listed" | grep -qw "$test_ip"; then echo -e "${R}ban 命令返回成功，但状态中没有测试 IP${N}"; fail2ban-client set "$jail" unbanip "$test_ip" >/dev/null 2>&1 || true; return 1; fi
+	if ! fail2ban-client set "$jail" unbanip "$test_ip" >/tmp/f2b-unban-test.log 2>&1; then echo -e "${R}真实 unban 测试失败:${N}"; cat /tmp/f2b-unban-test.log; return 1; fi
+	if fail2ban-client status "$jail" 2>/dev/null | awk -F: '/Banned IP list/{print $2}' | grep -qw "$test_ip"; then echo -e "${R}unban 后测试 IP 仍存在${N}"; return 1; fi
+	echo -e "${G}真实 ban/unban 动作验证通过${N}"; return 0
+}
+
 verify_banaction(){
 	local banaction; banaction=$(get_f2b_banaction)
 	local action_file="/etc/fail2ban/action.d/${banaction}.conf"
@@ -398,10 +463,10 @@ write_portscan(){
 	cat > /etc/fail2ban/filter.d/ufw-block-abuse.conf <<'EOF'
 [Definition]
 failregex = ^.*\[UFW BLOCK\].*SRC=<HOST>.*DPT=[0-9]+.*$
-ignoreregex = ^.*\[UFW BLOCK\].*PROTO=ICMP.*$
 EOF
 	state_add_filter "ufw-block-abuse.conf"
 	src=$(detect_ufw_logsrc)
+	TOOL_UFW_LOGSRC="$src"; state_save || return 1
 	case "$src" in
 		file:*)
 			logfile="${src#file:}"
@@ -502,7 +567,15 @@ manage_fail2ban(){
 				read -r -p "日志路径 [${lp_display}]: " lp; lp=${lp:-$dl}
 				[[ "$lp" != systemd:* ]] && [ ! -f "$lp" ] && touch "$lp" 2>/dev/null
 				echo -e "端口:${C}${pt}${N} 封禁:${C}${bt}${N} 重试:${C}${mr}${N} 日志:${C}${lp_display}${N} 白名单:${C}${ssh_ignoreips:-仅本机}${N}"
-				confirm "应用?" && { write_sshd_jail "$bt" "$mr" "$pt" "$lp" "$ssh_ignoreips"; restart_f2b && { verify_banaction; echo -e "${G}SSH 防护已生效${N}"; } || echo -e "${R}配置未生效，请按提示修复${N}"; }
+				confirm "应用?" && {
+					if ! write_sshd_jail "$bt" "$mr" "$pt" "$lp" "$ssh_ignoreips"; then
+						echo -e "${R}SSH jail 写入失败，未应用配置${N}"
+					elif restart_f2b && verify_banaction && verify_real_ban_action sshd; then
+						echo -e "${G}SSH 防护已生效${N}"
+					else
+						echo -e "${R}配置或封禁动作验证失败，未报告为已生效${N}"
+					fi
+				}
 				pause ;;
 			2) has_cmd ufw || { echo -e "${R}未安装 UFW${N}"; pause; continue; }
 				echo -e "\n${C}--- UFW 拦截联动封禁 ---${N}"
@@ -513,22 +586,17 @@ manage_fail2ban(){
 				read -r -p "触发阈值 [10]: " mr; mr=${mr:-10}
 				echo -e "白名单:${C}${ignoreips:-无}${N} 封禁:${C}${bt}${N} 阈值:${C}${mr}${N}"
 				confirm "应用?" && {
-					ufw logging on 2>&1 | grep -vi '^$'
-					ensure_ufw_log_readable
-					write_portscan "$bt" "$mr" "$ignoreips"
-					if restart_f2b; then
-						echo -e "${G}UFW 联动 jail 已加载${N}"
-						verify_banaction
-						verify_ufw_filter
+					if ! ufw logging on; then
+						echo -e "${R}UFW 日志启用失败，未应用联动配置${N}"
+					elif ! write_portscan "$bt" "$mr" "$ignoreips"; then
+						echo -e "${R}UFW 联动配置写入失败${N}"
+					elif restart_f2b && verify_banaction && verify_ufw_filter && verify_real_ban_action ufw-block-abuse && fail2ban-client status ufw-block-abuse >/dev/null 2>&1; then
+						echo -e "${G}UFW 联动 jail 已加载并通过配置验证${N}"
 						show_log_health
-						if fail2ban-client status ufw-block-abuse >/dev/null 2>&1; then
-							echo -e "${G}已生效${N}"
-							[ -n "$ignoreips" ] && echo -e "${G}白名单:${C} $ignoreips${N}"
-						else
-							echo -e "${R}jail 未加载，请检查日志${N}"
-						fi
+						[ -n "$ignoreips" ] && echo -e "${G}白名单:${C} $ignoreips${N}"
 					else
-						echo -e "${R}启动失败，配置未生效${N}"
+						echo -e "${R}UFW 联动配置、日志匹配或封禁动作验证失败，未报告为已生效${N}"
+						show_log_health
 					fi
 				}
 				pause ;;
@@ -602,16 +670,17 @@ manage_bbr(){
 		case $c in
 			1) bbr_ok || { echo -e "${R}系统当前未报告支持 bbr（内核可能过旧，需 ≥4.9）${N}"; pause; continue; }
 				confirm "开启?" && {
-					sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-					echo -e "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-					apply_bbr
+					if ! mkdir -p "$SYSCTL_DIR" || ! printf '%s\n' 'net.core.default_qdisc=fq' 'net.ipv4.tcp_congestion_control=bbr' > "$BBR_SYSCTL_FILE"; then
+						echo -e "${R}BBR 配置文件写入失败${N}"
+					elif ! chmod 0644 "$BBR_SYSCTL_FILE" || ! apply_bbr; then
+						echo -e "${R}BBR 应用失败${N}"
+					fi
 				}
 				pause ;;
 			2) bbr_ok || { echo -e "${R}系统当前未报告支持 bbr（内核可能过旧，需 ≥4.9）${N}"; pause; continue; }
 				echo -e "${Y}BBR + TCP 调优将调整多个 TCP 参数，不保证所有场景均收益${N}"
 				confirm "开启?" && {
-					sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
-					cat >> /etc/sysctl.conf <<'EOF'
+					if ! mkdir -p "$SYSCTL_DIR" || ! cat > "$BBR_SYSCTL_FILE" <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_fastopen=3
@@ -620,7 +689,8 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 EOF
-					apply_bbr advanced
+					then echo -e "${R}BBR 高级配置写入失败${N}"
+					elif ! chmod 0644 "$BBR_SYSCTL_FILE" || ! apply_bbr advanced; then echo -e "${R}BBR 高级配置应用失败${N}"; fi
 				}
 				pause ;;
 			3) echo -e "\n${C}=== BBR 状态详情 ===${N}"
@@ -664,11 +734,9 @@ EOF
 				pause ;;
 			4) confirm "恢复兼容默认 (cubic)?" && {
 				# 清理残留硬化参数（已废弃的网络加固写入的行）
-				sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-				sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
-				echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-				sysctl -w net.ipv4.tcp_congestion_control=cubic 2>/dev/null
-				sysctl -w net.core.default_qdisc=fq_codel 2>/dev/null
+				if [ -f "$BBR_SYSCTL_FILE" ] && ! rm -f "$BBR_SYSCTL_FILE"; then echo -e "${R}BBR 配置文件删除失败${N}"; pause; continue; fi
+				sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+				sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
 				# 恢复网卡 qdisc
 				for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo' | grep -v '@'); do
 					tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
@@ -773,34 +841,23 @@ manage_swap(){
 				else echo -e "${R}格式无效${N}"; pause; continue; fi
 				[ "${sz:-0}" -gt 0 ] || { echo -e "${R}大小无效${N}"; pause; continue; }
 				read -r -p "swappiness (0-100, 默认 10): " sv; sv=${sv:-10}
+				[[ "$sv" =~ ^[0-9]+$ ]] && [ "$sv" -le 100 ] || { echo -e "${R}swappiness 必须为 0-100${N}"; pause; continue; }
 				echo -e "\n${C}创建 ${sz}MB SWAP...${N}"
-				if ! { fallocate -l "${sz}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$sz" status=progress 2>/dev/null; }; then
-					echo -e "${R}SWAP 文件创建失败${N}"; rm -f /swapfile; pause; continue
-				fi
-				chmod 600 /swapfile || { echo -e "${R}chmod 失败${N}"; pause; continue; }
-				if ! mkswap /swapfile >/dev/null 2>&1; then echo -e "${R}mkswap 失败${N}"; rm -f /swapfile; pause; continue; fi
-				if ! swapon /swapfile 2>/dev/null; then echo -e "${R}swapon 失败${N}"; rm -f /swapfile; pause; continue; fi
-				echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-				sed -i '/vm.swappiness/d' /etc/sysctl.conf; echo "vm.swappiness=$sv" >> /etc/sysctl.conf
-				sysctl -w "vm.swappiness=$sv" >/dev/null 2>&1
-				# 验证
-				if [ "$(free 2>/dev/null | awk '/Swap/{print $2}')" -gt 0 ] 2>/dev/null; then
-					echo -e "${G}创建成功${N} $(free -h 2>/dev/null | awk '/Swap/{print "Swap: "$2}')"
-					state_set_swap
-				else
-					echo -e "${R}创建后验证失败，SWAP 未生效${N}"
-				fi
+				if ! { fallocate -l "${sz}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$sz" status=progress 2>/dev/null; }; then echo -e "${R}SWAP 文件创建失败${N}"; rm -f /swapfile; pause; continue; fi
+				if ! chmod 600 /swapfile || ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then echo -e "${R}SWAP 初始化失败${N}"; swapoff /swapfile >/dev/null 2>&1 || true; rm -f /swapfile; pause; continue; fi
+				if ! grep -qFx '/swapfile swap swap defaults 0 0' /etc/fstab; then printf '%s\n' '/swapfile swap swap defaults 0 0' >> /etc/fstab || { echo -e "${R}fstab 写入失败${N}"; swapoff /swapfile; rm -f /swapfile; pause; continue; }; fi
+				if ! printf 'vm.swappiness=%s\n' "$sv" > "$SWAP_SYSCTL_FILE" || ! chmod 0644 "$SWAP_SYSCTL_FILE" || ! sysctl -w "vm.swappiness=$sv" >/dev/null 2>&1; then echo -e "${R}swappiness 配置失败${N}"; swapoff /swapfile; rm -f /swapfile; sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab; rm -f "$SWAP_SYSCTL_FILE"; pause; continue; fi
+				if swapon --show=NAME --noheadings | grep -qx '/swapfile' && [ "$(sysctl -n vm.swappiness 2>/dev/null)" = "$sv" ] && grep -qFx '/swapfile swap swap defaults 0 0' /etc/fstab; then echo -e "${G}创建成功${N} $(free -h 2>/dev/null | awk '/Swap/{print "Swap: "$2}')"; state_set_swap; else echo -e "${R}创建后验证失败，正在回滚${N}"; swapoff /swapfile; rm -f /swapfile; sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab; rm -f "$SWAP_SYSCTL_FILE"; fi
 				pause ;;
 			2) echo -e "\n${C}=== 内存 ===${N}"; free -h; echo -e "\n${C}=== SWAP 挂载 ===${N}"; swapon --show 2>/dev/null || echo "无 SWAP"; pause ;;
 			3) [ "$(free 2>/dev/null | awk '/Swap/{print $2}')" -eq 0 ] 2>/dev/null && { echo -e "${Y}无 SWAP${N}"; pause; continue; }
 				confirm "彻底删除?" && {
 					local ok=true
-					if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
-						swapoff /swapfile 2>/dev/null && rm -f /swapfile || { ok=false; echo -e "${R}swapoff/rm 失败${N}"; }
-					fi
-					sed -i '/^\/swapfile\s/d' /etc/fstab
-					sed -i '/vm.swappiness/d' /etc/sysctl.conf
-					sysctl -w vm.swappiness=60 >/dev/null 2>&1
+					if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && ! swapoff /swapfile >/dev/null 2>&1; then ok=false; fi
+					if ! rm -f /swapfile; then ok=false; fi
+					sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab
+					if [ -f "$SWAP_SYSCTL_FILE" ] && ! rm -f "$SWAP_SYSCTL_FILE"; then ok=false; fi
+					sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
 					if $ok && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
 						echo -e "${G}已删除${N}"; state_clear_swap
 					else
@@ -826,8 +883,7 @@ uninstall(){
 	case $c in
 		1) has_cmd ufw || { echo -e "${R}未安装${N}"; pause; return; }
 			confirm "卸载 UFW? (将关闭防火墙并删除规则)" || return
-			echo "y" | ufw disable 2>/dev/null
-			ufw reset 2>/dev/null
+			if ! printf 'y\n' | ufw disable >/tmp/ufw-disable.log 2>&1; then echo -e "${R}UFW 关闭失败，未继续卸载${N}"; cat /tmp/ufw-disable.log; pause; return; fi
 			if apt-get purge -y ufw >/tmp/uninst-ufw.log 2>&1; then
 				echo -e "${G}UFW 已卸载${N}"
 			else
@@ -851,22 +907,19 @@ uninstall(){
 			rm -f /var/log/fail2ban.log 2>/dev/null
 			pause ;;
 		3) confirm "清理所有 BBR/TCP 调优参数? (恢复 cubic 默认)" || return
-			# 先清理残留的硬化参数（已废弃的网络加固功能写入的行）
-			sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-			sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
-			echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+			if [ -f "$BBR_SYSCTL_FILE" ] && ! rm -f "$BBR_SYSCTL_FILE"; then echo -e "${R}BBR 配置文件删除失败${N}"; pause; return; fi
+			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+			sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
 			local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 			[ "$ncc" = "cubic" ] && { echo -e "${G}已清理 (cc=$ncc)${N}"; state_clear_bbr; } || echo -e "${R}清理后验证失败${N}"
 			pause ;;
 		4) confirm "清理所有 SWAP?" || return
 			local ok=true
-			if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
-				swapoff /swapfile 2>/dev/null && rm -f /swapfile || ok=false
-			fi
-			sed -i '/^\/swapfile\s/d' /etc/fstab
-			sed -i '/vm.swappiness/d' /etc/sysctl.conf
-			sysctl -w vm.swappiness=60 >/dev/null 2>&1
+			if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && ! swapoff /swapfile >/dev/null 2>&1; then ok=false; fi
+			if ! rm -f /swapfile; then ok=false; fi
+			sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab
+			if [ -f "$SWAP_SYSCTL_FILE" ] && ! rm -f "$SWAP_SYSCTL_FILE"; then ok=false; fi
+			sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
 			if $ok && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
 				echo -e "${G}已清理${N}"; state_clear_swap
 			else
@@ -878,8 +931,8 @@ uninstall(){
 			confirm "再次确认? (不可逆)" || return
 			# UFW
 			if has_cmd ufw; then
-				echo "y" | ufw disable 2>/dev/null; ufw reset 2>/dev/null
-				apt-get purge -y ufw >/tmp/uninst-all.log 2>&1 && echo -e "UFW: ${G}已卸载${N}" || echo -e "UFW: ${R}卸载出错${N}"
+				if ! printf 'y\n' | ufw disable >/tmp/ufw-disable-all.log 2>&1; then echo -e "UFW: ${R}关闭失败，跳过卸载${N}"; cat /tmp/ufw-disable-all.log; else apt-get purge -y ufw >/tmp/uninst-all.log 2>&1 && echo -e "UFW: ${G}已卸载${N}" || echo -e "UFW: ${R}卸载出错${N}"
+				fi
 			fi
 			# Fail2ban：先清理本工具文件再 purge
 			if has_cmd fail2ban-client; then
@@ -891,21 +944,18 @@ uninstall(){
 				rm -f /var/log/fail2ban.log 2>/dev/null
 				TOOL_JAILS=""; TOOL_FILTERS=""
 			fi
-			# BBR
-			sed -i '/# vps-mgmt-hardening/d' /etc/sysctl.conf
-			sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.ipv4.tcp_fastopen/d;/net.ipv4.tcp_rmem/d;/net.ipv4.tcp_wmem/d;/net.ipv4.tcp_mtu_probing/d;/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
-			echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
-			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+			# BBR：只删除本工具独立配置文件
+			rm -f "$BBR_SYSCTL_FILE"
+			sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+			sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
 			local ncc; ncc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 			[ "$ncc" = "cubic" ] && echo -e "BBR: ${G}已清理${N}" || echo -e "BBR: ${R}清理失败${N}"
 			# SWAP
 			local swok=true
-			if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
-				swapoff /swapfile 2>/dev/null && rm -f /swapfile || swok=false
-			fi
-			sed -i '/^\/swapfile\s/d' /etc/fstab
-			sed -i '/vm.swappiness/d' /etc/sysctl.conf
-			sysctl -w vm.swappiness=60 >/dev/null 2>&1
+			if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && ! swapoff /swapfile >/dev/null 2>&1; then swok=false; fi
+			if ! rm -f /swapfile; then swok=false; fi
+			sed -i '\#^/swapfile swap swap defaults 0 0$#d' /etc/fstab
+			if [ -f "$SWAP_SYSCTL_FILE" ] && ! rm -f "$SWAP_SYSCTL_FILE"; then swok=false; fi
 			$swok && ! swapon --show 2>/dev/null | grep -q '/swapfile' && echo -e "SWAP: ${G}已清理${N}" || echo -e "SWAP: ${R}清理失败${N}"
 			# 清除状态文件
 			rm -f "$STATE_FILE"
