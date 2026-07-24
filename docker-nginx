@@ -520,24 +520,28 @@ install_acme(){
   info "安装 acme.sh..."
   apt-get install -y -qq curl socat || { err "acme.sh 依赖安装失败"; return 1; }
 
-  # Download first so curl errors are not confused with an installer pipe failure.
-  local installer tmp
-  tmp=$(mktemp /run/acme-install.XXXXXX) || { err "无法创建 acme.sh 临时文件"; return 1; }
-  installer="https://get.acme.sh"
+  # Download the official archive and run its local installer directly.
+  # This avoids get.acme.sh's email-argument rewriting entirely.
+  local work archive source
+  command -v tar >/dev/null 2>&1 || { err "缺少 tar，无法解压 acme.sh 官方归档"; return 1; }
+  work=$(mktemp -d /run/acme-install.XXXXXX) || { err "无法创建 acme.sh 临时目录"; return 1; }
+  archive="$work/master.tar.gz"
   if ! curl --fail --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
-      "$installer" -o "$tmp"; then
-    rm -f "$tmp"
-    err "acme.sh 安装脚本下载失败，请检查网络、DNS 或 TLS"
+      "https://github.com/acmesh-official/acme.sh/archive/master.tar.gz" -o "$archive"; then
+    rm -rf "$work"
+    err "acme.sh 官方归档下载失败，请检查网络、DNS 或 TLS"
     return 1
   fi
-  [ -s "$tmp" ] || { rm -f "$tmp"; err "acme.sh 安装脚本为空"; return 1; }
-  # get.acme.sh treats its first argument as an email option; keep it empty.
-  if ! sh "$tmp" "" --nocron; then
-    rm -f "$tmp"
-    err "acme.sh 安装器执行失败，以上为实际错误"
+  [ -s "$archive" ] || { rm -rf "$work"; err "acme.sh 官方归档为空"; return 1; }
+  tar -xzf "$archive" -C "$work" || { rm -rf "$work"; err "acme.sh 官方归档解压失败"; return 1; }
+  source="$work/acme.sh-master/acme.sh"
+  [ -f "$source" ] || { rm -rf "$work"; err "acme.sh 源文件缺失"; return 1; }
+  if ! sh "$source" --install --nocron --noprofile; then
+    rm -rf "$work"
+    err "acme.sh 本地安装器执行失败，以上为实际错误"
     return 1
   fi
-  rm -f "$tmp"
+  rm -rf "$work"
   [ -x "$ACME_BIN" ] || { err "acme.sh 安装后未找到可执行文件: $ACME_BIN"; return 1; }
   "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" || { err "acme.sh 默认 CA 配置失败"; return 1; }
   ok "acme.sh 安装完成（账户将在首次签发证书时注册）"
