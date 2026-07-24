@@ -15,7 +15,7 @@ keep-alive-interval: 15
 keep-alive-idle: 15
 
 
-
+# -------------------- 控制 API / 面板 --------------------
 external-controller: 127.0.0.1:9090
 secret: ""
 external-ui: ./ui
@@ -37,6 +37,7 @@ geox-url:
   asn: "https://github.com/xishang0128/geoip/releases/download/latest/GeoLite2-ASN.mmdb"
 
 # -------------------- TUN：Windows --------------------
+
 tun:
   enable: true
   stack: mixed
@@ -153,6 +154,7 @@ rule-providers:
     proxy: DIRECT
 
 # -------------------- DNS --------------------
+
 dns:
   enable: true
   listen: 0.0.0.0:1053
@@ -192,9 +194,6 @@ dns:
   nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
-  fallback:
-    - tls://8.8.4.4
-    - tls://1.1.1.1
   proxy-server-nameserver:
     - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
@@ -210,20 +209,6 @@ dns:
     "geosite:geolocation-!cn,gfw":
       - https://dns.google/dns-query
       - https://cloudflare-dns.com/dns-query
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    geosite:
-      - gfw
-    ipcidr:
-      - 240.0.0.0/4
-      - 0.0.0.0/32
-      - 127.0.0.1/32
-      - 100.64.0.0/10
-    domain:
-      - "+.google.com"
-      - "+.facebook.com"
-      - "+.youtube.com"
   respect-rules: false
   use-hosts: true
   use-system-hosts: true
