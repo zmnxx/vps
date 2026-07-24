@@ -77,8 +77,8 @@ svc_is_active(){ systemctl is-active --quiet "$1"; }
 # 检查编号规则是否为指定 SSH 端口，避免 22 误匹配 222
 ufw_rule_exists(){
 	local port="$1" proto="$2"
-	ufw status numbered 2>/dev/null | awk -v p="$port" -v proto="$proto" '
-		$3 == (p "/" proto) { found=1 }
+	ufw status 2>/dev/null | awk -v p="$port" -v proto="$proto" '
+		$1 == (p "/" proto) { found=1 }
 		END { exit(found ? 0 : 1) }'
 }
 ufw_number_is_ssh(){
