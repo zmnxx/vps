@@ -531,7 +531,8 @@ install_acme(){
     return 1
   fi
   [ -s "$tmp" ] || { rm -f "$tmp"; err "acme.sh 安装脚本为空"; return 1; }
-  if ! sh "$tmp" --nocron; then
+  # get.acme.sh treats its first argument as an email option; keep it empty.
+  if ! sh "$tmp" "" --nocron; then
     rm -f "$tmp"
     err "acme.sh 安装器执行失败，以上为实际错误"
     return 1
