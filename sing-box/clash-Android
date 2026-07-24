@@ -12,7 +12,7 @@ keep-alive-interval: 15
 keep-alive-idle: 15
 
 external-controller: 127.0.0.1:9090
-secret: ""
+secret: "CHANGE_ME"
 
 profile:
   store-selected: true
@@ -65,7 +65,6 @@ sniffer:
     - "+.push.apple.com"
 
 # -------------------- Sub-Store Mihomo 配置注入 --------------------
-
 proxies: []
 
 rule-providers:
@@ -142,6 +141,7 @@ rule-providers:
     interval: 86400
     proxy: DIRECT
 
+# -------------------- DNS --------------------
 dns:
   enable: true
   listen: 0.0.0.0:1053
@@ -172,9 +172,6 @@ dns:
   nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
-  fallback:
-    - tls://8.8.4.4
-    - tls://1.1.1.1
   proxy-server-nameserver:
     - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
@@ -190,12 +187,6 @@ dns:
     "geosite:geolocation-!cn,gfw":
       - https://dns.google/dns-query
       - https://cloudflare-dns.com/dns-query
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    geosite: [gfw]
-    ipcidr: [240.0.0.0/4, 0.0.0.0/32, 127.0.0.1/32, 100.64.0.0/10]
-    domain: ["+.google.com", "+.facebook.com", "+.youtube.com"]
   respect-rules: false
   use-hosts: true
   use-system-hosts: true
