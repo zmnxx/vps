@@ -78,9 +78,10 @@ svc_is_active(){ systemctl is-active --quiet "$1"; }
 ufw_rule_exists(){
 	local port="$1" proto="$2"
 	ufw status 2>/dev/null | awk -v p="$port" -v proto="$proto" '
-		$0 !~ /^Status:/ && $0 !~ /^--/ {
-			line=$0; gsub(/[[:space:]]+/," ",line)
-			if (line ~ "(^| )" p "/" proto "( |$)" || line ~ "(^| )" p "( |$).*" proto || line ~ "(^| )" p "( |$).*" proto " ") found=1
+		{
+			field=$1
+			split(field,a,"/")
+			if (a[1]==p && a[2]==proto) found=1
 		}
 		END { exit(found ? 0 : 1) }'
 }
@@ -88,8 +89,12 @@ ufw_number_is_ssh(){
 	local id="$1" port="$2"
 	ufw status numbered 2>/dev/null | awk -v id="$id" -v p="$port" '
 		{
-			n=$1 $2; gsub(/[\\[\\]]/,"",n)
-			if (n==id && $0 ~ "(^|[^0-9])" p "/tcp([^0-9]|$)") found=1
+			line=$0
+			if (match(line,/^\[[[:space:]]*[0-9]+\]/)) {
+				n=substr(line,RSTART,RLENGTH); gsub(/[^0-9]/,"",n)
+				rest=substr(line,RSTART+RLENGTH); gsub(/^[[:space:]]+/,"",rest)
+				if (n==id && rest ~ ("^" p "/tcp([[:space:]]|$)")) found=1
+			}
 		}
 		END { exit(found ? 0 : 1) }'
 }
@@ -343,7 +348,7 @@ manage_ufw(){
 				for id in $(echo "$ids" | tr ' ' '\n' | sort -rn); do
 					[[ "$id" =~ ^[0-9]+$ ]] || continue
 					local before after
-					before=$(ufw status numbered 2>/dev/null | awk -v id="[$id]" '$1==id{print; exit}')
+					before=$(ufw status numbered 2>/dev/null | awk -v id="$id" '$2 ~ "^\\[" id "\\]$" {print; exit}')
 					if [ -z "$before" ]; then echo -e "${R}规则编号 $id 不存在${N}"; fail_del=1; continue; fi
 					if ! printf 'y\n' | ufw delete "$id" >/tmp/ufw-delete.log 2>&1; then
 						echo -e "${R}删除规则 $id 命令失败:${N}"; cat /tmp/ufw-delete.log; fail_del=1; continue
