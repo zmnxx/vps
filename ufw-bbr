@@ -141,60 +141,41 @@ bbr_st(){
 }
 swap_st(){ local t s; t=$(free 2>/dev/null | awk '/Swap/{print $2}'); if [ -n "$t" ] && [ "$t" -gt 0 ] 2>/dev/null; then s=$(free -h 2>/dev/null | awk '/Swap/{print $2}'); echo -e "${G}已启用${N} (${s})"; else echo -e "${X}未启用${N}"; fi; }
 
-# ---------- 基础安装 ----------
-install_basics(){
-	clear; echo -e "${C}=== 基础安装 ===${N}\n"; local uf= need_update=
-	has_cmd ufw && uf=true || { echo -e "✗ UFW: ${R}未安装${N}"; need_update=true; }
-	[ "$need_update" = true ] && { echo -e "${B}正在更新软件源...${N}"; apt-get update -qq || { echo -e "${R}apt update 失败${N}"; pause; return; }; }
-	if [ "$uf" != true ]; then
-		echo -e "\n${Y}» 正在安装 UFW...${N}"
-		if apt-get install -y ufw >/tmp/install-ufw.log 2>&1; then
-			echo -e "${G}UFW 安装成功${N}"
-		else
-			echo -e "${R}UFW 安装失败${N}"; tail -20 /tmp/install-ufw.log; pause; return
-		fi
-		echo -e "\n${C}--- 配置放行端口 ---${N}"; local dp; dp=$(get_ssh_port); echo -e "当前 SSH 监听端口: ${Y}${dp}${N}"
-		read -r -p "放行 SSH 端口 [默认: ${dp}]: " sp; sp=${sp:-$dp}
-		if [[ "$sp" =~ ^[0-9]+$ ]] && [ "$sp" -ge 1 ] && [ "$sp" -le 65535 ]; then
-			local setup_failed=0
-			if ! ufw default deny incoming; then setup_failed=1; fi
-			if ! ufw default allow outgoing; then setup_failed=1; fi
-			if ! ufw allow "$sp/tcp"; then setup_failed=1; fi
-			if ! ufw allow 80/tcp; then setup_failed=1; fi
-			if ! ufw allow 443/tcp; then setup_failed=1; fi
-			if [ "$setup_failed" -eq 0 ] && ufw_rule_exists "$sp" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp; then
-				echo -e "${G}已确认设置默认策略并放行 SSH/$sp、80、443${N}"
-			else
-				echo -e "${R}UFW 规则配置或验证失败，未报告为成功${N}"
-			fi
-		else
-			echo -e "${R}端口无效，跳过${N}"
-		fi
-		confirm "启动 UFW 防火墙?" && {
-			local ufw_ok=true journald_ok=true
-			if ! printf 'y\n' | ufw enable; then ufw_ok=false; fi
-			# 首次安装默认关闭 UFW 日志，避免无必要的内核日志增长
-			if ! ufw logging off; then ufw_ok=false; fi
-			# 限制 systemd-journald 持久化日志最大占用为 100M
-			if ! configure_journald_limit; then journald_ok=false; fi
-			# 验证是否真正启用
-			if $ufw_ok && $journald_ok && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null && ufw status verbose >/dev/null 2>&1; then
-				echo -e "${G}UFW 已启用，日志已关闭${N}"
-				echo -e "${G}journald 最大持久化占用已限制为 100M${N}"
-			else
-				$ufw_ok || echo -e "${R}UFW 启用或日志设置失败${N}"
-			$journald_ok || echo -e "${R}journald 100M 限制设置失败${N}"
-				echo -e "${R}请检查 iptables/nftables 或 systemd-journald${N}"
-			fi
-		}
+# ---------- UFW 安装与初始化 ----------
+ensure_ufw_installed(){
+	if has_cmd ufw; then
+		echo -e "${G}UFW 已安装，跳过安装步骤${N}"
+		return 0
 	fi
-	echo -e "
-${G}基础安装完成${N} SSH端口: ${Y}$(get_ssh_port)${N}"; pause
+	echo -e "${Y}本机未安装 UFW，正在自动安装...${N}"
+	apt-get update -qq || { echo -e "${R}apt update 失败${N}"; return 1; }
+	apt-get install -y ufw >/tmp/install-ufw.log 2>&1 || { echo -e "${R}UFW 安装失败${N}"; tail -20 /tmp/install-ufw.log; return 1; }
+	echo -e "${G}UFW 安装成功${N}"
+	local dp sp; dp=$(get_ssh_port)
+	echo -e "\n${C}--- 配置放行端口 ---${N}"
+	echo -e "当前 SSH 监听端口: ${Y}${dp}${N}"
+	read -r -p "放行 SSH 端口 [默认: ${dp}]: " sp; sp=${sp:-$dp}
+	if [[ "$sp" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$sp" -le 65535 ]; then
+		ufw default deny incoming && ufw default allow outgoing && ufw allow "$sp/tcp" && ufw allow 80/tcp && ufw allow 443/tcp || echo -e "${R}部分 UFW 规则配置失败${N}"
+		if ufw_rule_exists "$sp" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp; then echo -e "${G}已确认放行 SSH/$sp、80、443${N}"; else echo -e "${R}UFW 规则验证失败${N}"; fi
+	else
+		echo -e "${R}端口无效，未配置放行规则${N}"
+	fi
+	local ufw_ok=true journald_ok=true
+	if ! printf 'y\n' | ufw enable; then ufw_ok=false; fi
+	ufw logging off || ufw_ok=false
+	configure_journald_limit || journald_ok=false
+	if $ufw_ok && $journald_ok; then
+		echo -e "${G}UFW 已启用，日志已关闭；journald 上限 100M${N}"
+	else
+		echo -e "${R}UFW 或 journald 初始化部分失败，请检查日志${N}"
+	fi
+	pause
 }
 
 # ---------- UFW 管理 ----------
 manage_ufw(){
-	has_cmd ufw || { echo -e "${R}未安装 UFW${N}"; pause; return; }
+	ensure_ufw_installed || { pause; return; }
 	while true; do
 		clear; echo -e "${P}=== UFW 防火墙管理 ===${N}"; echo -e "状态: $(ufw_st) | IPv6: ${C}$(awk -F= '/^IPV6=/{print tolower($2)}' /etc/default/ufw 2>/dev/null)${N}\n"
 		echo -e "  ${Y}1.${N} 查看规则列表"; echo -e "  ${Y}2.${N} 批量添加端口"; echo -e "  ${Y}3.${N} 批量删除规则"; echo -e "  ${Y}4.${N} 防火墙开关/重载"; echo -e "  ${Y}5.${N} IPv6 开关"; echo -e "  ${Y}6.${N} 日志级别设置"; echo -e "  ${X}0. 返回主菜单${N}"
@@ -263,7 +244,17 @@ manage_ufw(){
 					local cur; cur=$(awk -F= '/^IPV6=/{print tolower($2)}' /etc/default/ufw 2>/dev/null)
 					[ "$cur" = "$newv" ] && echo -e "${G}已切换为 $newv${N}" || echo -e "${R}切换失败${N}"
 				}; pause ;;
-			6) echo -e "\n${C}--- UFW 日志级别 ---${N}"
+			6) local current_log log_name
+				current_log=$(ufw status verbose 2>/dev/null | sed -n 's/^[[:space:]]*Logging:[[:space:]]*//p' | head -1 | tr '[:upper:]' '[:lower:]')
+				case "$current_log" in
+					off*)    log_name="关闭" ;;
+					low*)    log_name="低级" ;;
+					medium*) log_name="中级" ;;
+					high*)   log_name="高级" ;;
+					*)       current_log="未知"; log_name="未获取（UFW 可能尚未启用）" ;;
+				 esac
+				echo -e "\n${C}--- UFW 日志级别 ---${N}"
+				echo -e "${G}当前日志状态: Logging: ${current_log}（${log_name}）${N}\n"
 				echo -e "  ${Y}1.${N} 关闭（不记录 UFW 防火墙日志，推荐低配置 VPS）"
 				echo -e "  ${Y}2.${N} 低级（仅记录被拦截的新连接，推荐默认）"
 				echo -e "  ${Y}3.${N} 中级（记录被拦截连接及部分无效数据包）"
@@ -580,17 +571,16 @@ while true; do
 	echo -e "    BBR      : $(bbr_st)"
 	echo -e "    SWAP     : $(swap_st)\n"
 	echo -e "${C}----------------------------------------${N}\n"
-	echo -e "  ${Y}1.${N} 基础安装"
-	echo -e "  ${Y}2.${N} UFW 防火墙管理"
-	echo -e "  ${Y}3.${N} BBR 加速管理"
-	echo -e "  ${Y}4.${N} SWAP 虚拟内存管理"
-	echo -e "  ${Y}5.${N} ${R}卸载与清理${N}"
-	echo -e "  ${R}0. 退出${N}"
+	echo -e "  ${Y}1.${N} UFW   管理"
+	echo -e "  ${Y}2.${N} BBR   管理"
+	echo -e "  ${Y}3.${N} SWAP  管理"
+	echo -e "  ${Y}4.${N} 卸载"
+	echo -e "  ${R}0.${N} 退出"
 	echo -e "${C}========================================${N}"
 	read -r -p "请选择: " c
 	case $c in
-		1) install_basics;; 2) manage_ufw;;
-		3) manage_bbr;;    4) manage_swap;; 5) uninstall;;
+		1) manage_ufw;;
+		2) manage_bbr;;    3) manage_swap;; 4) uninstall;;
 		0) echo -e "\n${G}再见${N}"; exit 0;;
 		*) echo -e "\n${R}无效${N}"; sleep 1;;
 	esac
