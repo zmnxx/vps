@@ -1,10 +1,3 @@
-# ================================================================
-# Mihomo Windows 配置
-# 依据 Mihomo 官方文档整理
-# 订阅来源：由自建 Sub-Store 服务生成 Mihomo / Clash.Meta YAML
-# 请将 YOUR_SUBSTORE_MIHOМO_URL 替换为你的实际转换订阅地址
-# ================================================================
-
 # -------------------- 基础设置 --------------------
 mixed-port: 7890
 allow-lan: false
@@ -18,7 +11,7 @@ unified-delay: true
 tcp-concurrent: true
 
 # Windows 如需进程规则，可将 off 改为 strict；当前不添加进程分流
-find-process-mode: off
+find-process-mode: strict
 keep-alive-interval: 15
 keep-alive-idle: 15
 # disable-keep-alive: false
@@ -26,9 +19,7 @@ keep-alive-idle: 15
 # -------------------- 控制 API / 面板 --------------------
 # 仅本机监听，避免局域网暴露
 external-controller: 127.0.0.1:9090
-# 请自行修改为随机密钥；面板连接时需要填写相同密钥
-secret: "CHANGE_ME"
-# MetaCubeXD 面板；客户端不支持时可删除本段
+secret: ""
 external-ui: ./ui
 external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
 
@@ -48,8 +39,7 @@ geox-url:
   asn: "https://github.com/xishang0128/geoip/releases/download/latest/GeoLite2-ASN.mmdb"
 
 # -------------------- TUN：Windows --------------------
-# auto-redirect 仅 Linux 支持，Windows 配置不使用
-# mixed 是官方建议优先尝试的协议栈
+
 tun:
   enable: true
   stack: mixed
@@ -86,25 +76,8 @@ sniffer:
     - Mijia Cloud
     - "+.push.apple.com"
 
-# -------------------- Sub-Store Mihomo 订阅 --------------------
-# Sub-Store 输出目标请选择 Mihomo / Clash.Meta。
-# 这里填 Sub-Store 生成的最终 Mihomo YAML 订阅地址，而不是原始节点订阅地址。
-proxy-providers:
-  substore:
-    type: http
-    url: "YOUR_SUBSTORE_MIHOМO_URL"
-    path: ./providers/proxy/substore.yaml
-    interval: 86400
-    proxy: DIRECT
-    health-check:
-      enable: true
-      url: https://cp.cloudflare.com
-      interval: 600
-      timeout: 5000
-      lazy: true
-      expected-status: 204
-    override:
-      udp: true
+#节点入口由sub-store生成
+proxies: []
 
 # -------------------- 规则集 --------------------
 rule-providers:
@@ -264,12 +237,12 @@ proxy-groups:
   - name: 手动选择
     type: select
     icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Static.png
-    use: [substore]
     proxies: [自动选择, DIRECT]
+    include-all-proxies: true
   - name: 自动选择
     type: url-test
     icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Auto.png
-    use: [substore]
+    include-all-proxies: true
     url: https://cp.cloudflare.com
     interval: 600
     tolerance: 50
