@@ -514,6 +514,12 @@ config_docker_log_rotation(){
 
 # ─── 安装 ────────────────────────────────────────────────
 
+cleanup_install_artifacts(){
+  # Remove downloaded package archives and only this tool's temporary files.
+  apt-get clean >/dev/null 2>&1 || true
+  rm -rf /run/acme-install.* /run/singbox-install.*
+}
+
 # 安装 acme.sh（纯 shell 客户端，无 Python 依赖，卸载干净，无 archive 残留）
 install_acme(){
   if [ -x "$ACME_BIN" ]; then ok "acme.sh 已安装"; return 0; fi
@@ -522,7 +528,7 @@ install_acme(){
 
   # Download the official archive and run its local installer directly.
   # This avoids get.acme.sh's email-argument rewriting entirely.
-  local work archive source
+  local work archive
   command -v tar >/dev/null 2>&1 || { err "缺少 tar，无法解压 acme.sh 官方归档"; return 1; }
   work=$(mktemp -d /run/acme-install.XXXXXX) || { err "无法创建 acme.sh 临时目录"; return 1; }
   archive="$work/master.tar.gz"
@@ -536,14 +542,16 @@ install_acme(){
   tar -xzf "$archive" -C "$work" || { rm -rf "$work"; err "acme.sh 官方归档解压失败"; return 1; }
   source="$work/acme.sh-master/acme.sh"
   [ -f "$source" ] || { rm -rf "$work"; err "acme.sh 源文件缺失"; return 1; }
-  if ! sh "$source" --install --nocron --noprofile; then
+  if ! (cd "$work/acme.sh-master" && sh ./acme.sh --install --nocron --noprofile); then
     rm -rf "$work"
+    cleanup_install_artifacts
     err "acme.sh 本地安装器执行失败，以上为实际错误"
     return 1
   fi
   rm -rf "$work"
-  [ -x "$ACME_BIN" ] || { err "acme.sh 安装后未找到可执行文件: $ACME_BIN"; return 1; }
-  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" || { err "acme.sh 默认 CA 配置失败"; return 1; }
+  [ -x "$ACME_BIN" ] || { cleanup_install_artifacts; err "acme.sh 安装后未找到可执行文件: $ACME_BIN"; return 1; }
+  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" || { cleanup_install_artifacts; err "acme.sh 默认 CA 配置失败"; return 1; }
+  cleanup_install_artifacts
   ok "acme.sh 安装完成（账户将在首次签发证书时注册）"
 }
 
@@ -569,6 +577,7 @@ install_docker(){
   systemctl enable --now docker || { err "Docker 服务启动失败"; return 1; }
   docker_ready || { err "Docker 启动后不可用"; return 1; }
   systemctl is-enabled --quiet docker || { err "Docker 开机自启校验失败"; return 1; }
+  cleanup_install_artifacts
   ok "Docker 安装完成并已设置开机自启"
 }
 
@@ -588,6 +597,7 @@ install_nginx(){
   systemctl is-active --quiet nginx || { err "Nginx 启动后状态异常"; return 1; }
   ensure_stream_module || { err "stream 模块不可用"; return 1; }
   nginx -t >/dev/null 2>&1 || { err "Nginx 配置测试失败"; return 1; }
+  cleanup_install_artifacts
   ok "Nginx 安装完成（stream 就绪）"
 }
 
@@ -1307,8 +1317,9 @@ install_singbox(){
   if cmd_exists sing-box; then sing-box version >/dev/null 2>&1 || { err "sing-box 命令不可用"; return 1; }; ok "sing-box 已安装: $(sing-box version 2>/dev/null | head -1)"; return 0; fi
   info "安装 sing-box（官方脚本）..."
   apt-get install -y -qq curl wget openssl ca-certificates || { err "sing-box 依赖安装失败"; return 1; }
-  curl -fsSL https://sing-box.app/install.sh | sh || { err "sing-box 安装脚本失败"; return 1; }
-  cmd_exists sing-box && sing-box version >/dev/null 2>&1 || { err "sing-box 安装后不可用"; return 1; }
+  curl -fsSL https://sing-box.app/install.sh | sh || { err "sing-box 安装脚本失败"; cleanup_install_artifacts; return 1; }
+  cmd_exists sing-box && sing-box version >/dev/null 2>&1 || { err "sing-box 安装后不可用"; cleanup_install_artifacts; return 1; }
+  cleanup_install_artifacts
   ok "sing-box 安装完成"
 }
 
@@ -1540,7 +1551,8 @@ singbox_show_client(){
   # 还能完美支持多用户（多个 UUID）以及未来可能添加的其他入站协议（如 Hysteria2、TUIC、Trojan 等），彻底防范排版错乱。
   if ! cmd_exists python3; then
     info "解析客户端参数需要 python3，正在安装..."
-    apt-get install -y -qq python3 >/dev/null 2>&1 || { err "python3 安装失败，无法解析配置"; pause; return 1; }
+    apt-get install -y -qq python3 >/dev/null 2>&1 || { err "python3 安装失败，无法解析配置"; cleanup_install_artifacts; pause; return 1; }
+    cleanup_install_artifacts
   fi
 
   # 准备调用 python3 脚本输出
