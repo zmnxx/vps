@@ -1262,11 +1262,12 @@ acme_remove(){
   ok "已删除 $c"
 }
 
-# 测试续期
+# 测试续期：acme.sh 新版已移除 --dry-run，使用 Let's Encrypt staging CA。
+# 这会执行真实 DNS 验证，但不会签发受信任的生产证书。
 acme_renew_test(){
   local c="$1"
-  "$ACME_BIN" --renew -d "$c" --force --dnssleep 30 --dry-run 2>&1 \
-    | tail -3 | sed 's/^/  /'
+  "$ACME_BIN" --renew -d "$c" --force --staging --dnssleep 30 2>&1 \
+    | tail -12 | sed 's/^/  /'
 }
 
 # acme.sh 续期 cron 是否已安装
@@ -1873,8 +1874,38 @@ ensure_stream_module(){
   return 1
 }
 
+migrate_legacy_sni_config(){
+  local -a paths=() f tmp
+  [ -f /etc/nginx/conf.d/stream.conf ] && grep -q 'ssl_preread\|upstream singbox' /etc/nginx/conf.d/stream.conf 2>/dev/null && paths+=(/etc/nginx/conf.d/stream.conf)
+  for f in /etc/nginx/sites-available/*; do
+    [ -f "$f" ] || continue
+    grep -qE 'listen[[:space:]]+127\.0\.0\.1:8443[^;]*proxy_protocol|real_ip_header[[:space:]]+proxy_protocol' "$f" 2>/dev/null && paths+=("$f")
+  done
+  [ ${#paths[@]} -eq 0 ] && return 0
+  recovery_begin "${paths[@]}" || { err "无法创建旧 SNI 配置恢复文件"; return 1; }
+  for f in "${paths[@]}"; do
+    if [ "$f" = "/etc/nginx/conf.d/stream.conf" ]; then
+      rm -f "$f" || { recovery_restore; return 1; }
+    else
+      tmp=$(mktemp) || { recovery_restore; return 1; }
+      sed -e 's/[[:space:]]\+proxy_protocol[[:space:]]*;/;/g' \
+          -e '/^[[:space:]]*set_real_ip_from[[:space:]]\+127\.0\.0\.1;/d' \
+          -e '/^[[:space:]]*real_ip_header[[:space:]]\+proxy_protocol;/d' "$f" > "$tmp" || { rm -f "$tmp"; recovery_restore; return 1; }
+      install -m 0644 "$tmp" "$f" || { rm -f "$tmp"; recovery_restore; return 1; }
+      rm -f "$tmp"
+    fi
+  done
+  if ! nginx -t >/dev/null 2>&1; then
+    err "旧 SNI 兼容迁移后 Nginx 测试失败，恢复原配置"
+    recovery_restore
+    return 1
+  fi
+  recovery_commit
+}
+
 setup_sni_split(){
   ui_header "SNI 分流配置"
+  migrate_legacy_sni_config || { pause; return 1; }
   ensure_stream_module || { err "stream 模块不可用，无法配置 SNI 分流"; pause; return 1; }
   local ng_conf="/etc/nginx/nginx.conf" stream_conf="/etc/nginx/stream.conf" web_domains extra_domains domain listen_v6=""
   [ -e /proc/net/if_inet6 ] && listen_v6='        listen [::]:443;'
@@ -2030,6 +2061,7 @@ install_all(){
   fi
 
   ui_header "[3/6] SNI 分流"
+  migrate_legacy_sni_config || { err "旧 SNI 配置迁移失败，一键安装中止"; return 1; }
   if cmd_exists sing-box; then
     if [ -f /etc/nginx/stream.conf ] && grep -Fq 'include /etc/nginx/stream.conf;' /etc/nginx/nginx.conf 2>/dev/null; then ok "已配置"
     elif ask_yn "配置 SNI 分流？" "y"; then
