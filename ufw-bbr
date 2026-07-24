@@ -106,6 +106,27 @@ ufw_number_is_ssh(){
 		END { exit(found ? 0 : 1) }'
 }
 
+# ---------- SSH 端口探测 ----------
+get_ssh_port(){
+	local p=""
+	# SSH_CONNECTION 的本地端口就是当前 SSH 会话实际连接端口
+	if [ -n "${SSH_CONNECTION:-}" ]; then
+		p=$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}')
+	fi
+	# 从当前已建立的 sshd 会话中读取本地监听端口
+	if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+		p=$(ss -tnp 2>/dev/null | awk '/sshd/ && /ESTAB/ {n=split($4,a,":"); print a[n]; exit}')
+	fi
+	# sshd -T 读取最终生效配置，优先于直接解析配置文件
+	if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+		p=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}')
+	fi
+	if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+		p=$(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {p=$2} END{print p}' /etc/ssh/sshd_config 2>/dev/null)
+	fi
+	[[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$p" -le 65535 ] && printf '%s\n' "$p" || printf '22\n'
+}
+
 # ---------- 状态显示 ----------
 ufw_st(){ has_cmd ufw || { echo -e "${X}未安装${N}"; return; }; local e; e=$(grep -i '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2); [ "${e^^}" = "YES" ] && echo -e "${G}运行中${N}" || echo -e "${Y}已停止${N}"; }
 bbr_st(){
@@ -242,7 +263,12 @@ manage_ufw(){
 					local cur; cur=$(awk -F= '/^IPV6=/{print tolower($2)}' /etc/default/ufw 2>/dev/null)
 					[ "$cur" = "$newv" ] && echo -e "${G}已切换为 $newv${N}" || echo -e "${R}切换失败${N}"
 				}; pause ;;
-			6) echo -e "\n${C}--- 日志级别 ---${N}"; echo -e "  ${Y}1.${N} off  ${Y}2.${N} low  ${Y}3.${N} medium  ${Y}4.${N} high"; read -r -p "选择 [2]: " lv
+			6) echo -e "\n${C}--- UFW 日志级别 ---${N}"
+				echo -e "  ${Y}1.${N} 关闭（不记录 UFW 防火墙日志，推荐低配置 VPS）"
+				echo -e "  ${Y}2.${N} 低级（仅记录被拦截的新连接，推荐默认）"
+				echo -e "  ${Y}3.${N} 中级（记录被拦截连接及部分无效数据包）"
+				echo -e "  ${Y}4.${N} 高级（记录大量被拦截数据包，可能快速占用磁盘）"
+				read -r -p "选择 [2]: " lv
 				case "$lv" in
 					1) ufw logging off || { echo -e "${R}日志关闭失败${N}"; continue; } ;;
 					2|"") ufw logging low || { echo -e "${R}日志级别设置失败${N}"; continue; } ;;
