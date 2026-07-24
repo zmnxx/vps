@@ -18,7 +18,7 @@ profile:
   store-selected: true
   store-fake-ip: true
 
-# Android 使用内存优化加载器
+
 geodata-mode: true
 geodata-loader: memconservative
 geo-auto-update: true
@@ -65,7 +65,7 @@ sniffer:
     - "+.push.apple.com"
 
 # -------------------- Sub-Store Mihomo 配置注入 --------------------
-# 在 Sub-Store 中选择：组合订阅 -> 本配置 -> 生成 Mihomo 配置链接。
+
 proxies: []
 
 rule-providers:
@@ -205,10 +205,12 @@ dns:
 proxy-groups:
   - name: 手动选择
     type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Static.png
     proxies: [自动选择, DIRECT]
     include-all-proxies: true
   - name: 自动选择
     type: url-test
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Auto.png
     include-all-proxies: true
     url: https://cp.cloudflare.com
     interval: 600
@@ -218,18 +220,23 @@ proxy-groups:
     timeout: 5000
   - name: 去广告
     type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Advertising.png
     proxies: [REJECT, DIRECT]
   - name: 国内
     type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/China_Map.png
     proxies: [DIRECT, 手动选择, 自动选择]
   - name: 谷歌
     type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Google_Search.png
     proxies: [手动选择, 自动选择, DIRECT]
   - name: 电报
     type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png
     proxies: [手动选择, 自动选择, DIRECT]
   - name: 兜底
     type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Final.png
     proxies: [手动选择, 自动选择, DIRECT]
 
 rules:
