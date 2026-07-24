@@ -518,10 +518,27 @@ config_docker_log_rotation(){
 install_acme(){
   if [ -x "$ACME_BIN" ]; then ok "acme.sh 已安装"; return 0; fi
   info "安装 acme.sh..."
-  apt-get install -y -qq curl socat >/dev/null 2>&1 || { err "acme.sh 依赖安装失败"; return 1; }
-  curl -fsSL https://get.acme.sh | sh -s --nocron >/dev/null 2>&1 || { err "acme.sh 安装失败"; return 1; }
-  [ -x "$ACME_BIN" ] || { err "acme.sh 安装后未找到可执行文件"; return 1; }
-  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" >/dev/null 2>&1 || { err "acme.sh 默认 CA 配置失败"; return 1; }
+  apt-get install -y -qq curl socat || { err "acme.sh 依赖安装失败"; return 1; }
+
+  # Download first so curl errors are not confused with an installer pipe failure.
+  local installer tmp
+  tmp=$(mktemp /run/acme-install.XXXXXX) || { err "无法创建 acme.sh 临时文件"; return 1; }
+  installer="https://get.acme.sh"
+  if ! curl --fail --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+      "$installer" -o "$tmp"; then
+    rm -f "$tmp"
+    err "acme.sh 安装脚本下载失败，请检查网络、DNS 或 TLS"
+    return 1
+  fi
+  [ -s "$tmp" ] || { rm -f "$tmp"; err "acme.sh 安装脚本为空"; return 1; }
+  if ! sh "$tmp" --nocron; then
+    rm -f "$tmp"
+    err "acme.sh 安装器执行失败，以上为实际错误"
+    return 1
+  fi
+  rm -f "$tmp"
+  [ -x "$ACME_BIN" ] || { err "acme.sh 安装后未找到可执行文件: $ACME_BIN"; return 1; }
+  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" || { err "acme.sh 默认 CA 配置失败"; return 1; }
   ok "acme.sh 安装完成（账户将在首次签发证书时注册）"
 }
 
