@@ -1,454 +1,319 @@
-{
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
-  "experimental": {
-    "cache_file": {
-      "enabled": true,
-      "path": "cache.db",
-      "store_fakeip": true,
-      "store_dns": true
-    },
-    "clash_api": {
-      "external_controller": "127.0.0.1:9090",
-      "secret": "",
-      "default_mode": "rule",
-      "external_ui": "ui",
-      "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
-    }
-  },
-  "http_clients": [
-    {
-      "tag": "http-直连下载",
-      "domain_resolver": "dns-本地"
-    },
-    {
-      "tag": "http-代理下载",
-      "detour": "手动选择",
-      "domain_resolver": "dns-本地"
-    }
-  ],
-  "dns": {
-    "servers": [
-      {
-        "type": "udp",
-        "tag": "dns-本地",
-        "server": "223.5.5.5"
-      },
-      {
-        "type": "https",
-        "tag": "dns-国内",
-        "server": "223.5.5.5",
-        "domain_resolver": "dns-本地"
-      },
-      {
-        "type": "fakeip",
-        "tag": "dns-fakeip",
-        "inet4_range": "198.18.0.0/15"
-      }
-    ],
-    "rules": [
-      {
-        "clash_mode": "direct",
-        "action": "route",
-        "server": "dns-国内"
-      },
-      {
-        "clash_mode": "global",
-        "action": "route",
-        "server": "dns-fakeip"
-      },
-      {
-        "query_type": ["AAAA", "HTTPS", "SVCB"],
-        "action": "reject",
-        "method": "default",
-        "no_drop": true
-      },
-      {
-        "rule_set": "规则-广告",
-        "action": "reject",
-        "method": "default",
-        "no_drop": true
-      },
-      {
-        "domain_suffix": [
-          "douyin.com",
-          "bytedance.com",
-          "zijieapi.com",
-          "byteoversea.com"
-        ],
-        "action": "route",
-        "server": "dns-国内"
-      },
-      {
-        "domain_suffix": [
-          "google.com",
-          "youtube.com",
-          "github.com"
-        ],
-        "action": "route",
-        "server": "dns-fakeip"
-      },
-      {
-        "domain_suffix": [
-          "cloudflare.com",
-          "cloudflare-dns.com",
-          "cloudflareinsights.com",
-          "cloudflarestream.com",
-          "cloudflareclient.com",
-          "cf-ns.com",
-          "cf-ns.net"
-        ],
-        "action": "route",
-        "server": "dns-fakeip"
-      },
-      {
-        "domain_suffix": ["pcloud.com"],
-        "action": "route",
-        "server": "dns-fakeip"
-      },
-      {
-        "domain_suffix": [
-          "msftconnecttest.com",
-          "msftncsi.com"
-        ],
-        "action": "route",
-        "server": "dns-国内"
-      },
-      {
-        "rule_set": [
-          "规则-私有域名",
-          "规则-国内域名",
-          "规则-苹果中国"
-        ],
-        "action": "route",
-        "server": "dns-国内"
-      },
-      {
-        "query_type": ["A"],
-        "action": "route",
-        "server": "dns-fakeip",
-        "rewrite_ttl": 1
-      }
-    ],
-    "final": "dns-国内",
-    "strategy": "ipv4_only",
-    "optimistic": {
-      "enabled": true,
-      "timeout": "3d"
-    },
-    "timeout": "5s",
-    "reverse_mapping": true,
-    "cache_capacity": 4096
-  },
-  "ntp": {
-    "enabled": true,
-    "server": "time.apple.com",
-    "server_port": 123,
-    "interval": "30m",
-    "domain_resolver": "dns-本地"
-  },
-  "inbounds": [
-    {
-      "type": "tun",
-      "tag": "tun-in",
-      "address": ["172.19.0.1/30"],
-      "mtu": 1500,
-      "auto_route": true,
-      "strict_route": true,
-      "stack": "system"
-    },
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "127.0.0.1",
-      "listen_port": 7890
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "selector",
-      "tag": "手动选择",
-      "outbounds": ["自动选择", "DIRECT"],
-      "default": "自动选择",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "urltest",
-      "tag": "自动选择",
-      "outbounds": ["COMPATIBLE"],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "5m",
-      "tolerance": 50,
-      "idle_timeout": "15m",
-      "interrupt_exist_connections": true
-    },
-    {
-      "type": "selector",
-      "tag": "国内",
-      "outbounds": ["DIRECT", "手动选择", "自动选择"],
-      "default": "DIRECT"
-    },
-    {
-      "type": "selector",
-      "tag": "谷歌",
-      "outbounds": ["手动选择", "自动选择", "DIRECT"],
-      "default": "手动选择"
-    },
-    {
-      "type": "selector",
-      "tag": "电报",
-      "outbounds": ["手动选择", "自动选择", "DIRECT"],
-      "default": "手动选择"
-    },
-    {
-      "type": "selector",
-      "tag": "兜底",
-      "outbounds": ["手动选择", "自动选择", "DIRECT"],
-      "default": "手动选择"
-    },
-    {
-      "type": "direct",
-      "tag": "DIRECT"
-    },
-    {
-      "type": "direct",
-      "tag": "COMPATIBLE"
-    }
-  ],
-  "route": {
-    "auto_detect_interface": true,
-    "default_domain_resolver": "dns-本地",
-    "default_http_client": "http-直连下载",
-    "find_process": false,
-    "final": "兜底",
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "规则-广告",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-私有域名",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-国内域名",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-国内IP",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "3d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-苹果中国",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/apple@cn.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-谷歌域名",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-电报域名",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/telegram.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-电报IP",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "3d"
-      },
-      {
-        "type": "remote",
-        "tag": "规则-GFW",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/gfw.srs",
-        "http_client": "http-直连下载",
-        "update_interval": "1d"
-      }
-    ],
-    "rules": [
-      {
-        "clash_mode": "direct",
-        "action": "route",
-        "outbound": "DIRECT"
-      },
-      {
-        "clash_mode": "global",
-        "action": "route",
-        "outbound": "手动选择"
-      },
-      { "action": "sniff" },
-      {
-        "type": "logical",
-        "mode": "or",
-        "rules": [
-          { "protocol": "dns" },
-          { "port": 53 }
-        ],
-        "action": "hijack-dns"
-      },
-      {
-        "domain_suffix": [
-          "douyin.com",
-          "bytedance.com",
-          "zijieapi.com",
-          "byteoversea.com"
-        ],
-        "action": "route",
-        "outbound": "国内"
-      },
-      {
-        "ip_cidr": ["101.36.166.16/32"],
-        "action": "route",
-        "outbound": "国内"
-      },
-      {
-        "domain_suffix": [
-          "google.com",
-          "youtube.com",
-          "github.com"
-        ],
-        "action": "route",
-        "outbound": "谷歌"
-      },
-      {
-        "ip_cidr": ["142.250.0.0/15"],
-        "action": "route",
-        "outbound": "谷歌"
-      },
-      {
-        "domain_suffix": [
-          "cloudflare.com",
-          "cloudflare-dns.com",
-          "cloudflareinsights.com",
-          "cloudflarestream.com",
-          "cloudflareclient.com",
-          "cf-ns.com",
-          "cf-ns.net"
-        ],
-        "action": "route",
-        "outbound": "兜底"
-      },
-      {
-        "domain_suffix": ["pcloud.com"],
-        "action": "route",
-        "outbound": "兜底"
-      },
-      {
-        "ip_cidr": ["192.168.100.111/32"],
-        "action": "reject",
-        "method": "default",
-        "no_drop": true
-      },
-      {
-        "domain_suffix": [
-          "msftconnecttest.com",
-          "msftncsi.com"
-        ],
-        "action": "route",
-        "outbound": "DIRECT"
-      },
-      {
-        "rule_set": "规则-广告",
-        "action": "reject",
-        "method": "default",
-        "no_drop": true
-      },
-      {
-        "rule_set": "规则-私有域名",
-        "action": "route",
-        "outbound": "DIRECT"
-      },
-      {
-        "ip_is_private": true,
-        "action": "route",
-        "outbound": "DIRECT"
-      },
-      {
-        "rule_set": "规则-苹果中国",
-        "action": "route",
-        "outbound": "国内"
-      },
-      {
-        "rule_set": "规则-谷歌域名",
-        "action": "route",
-        "outbound": "谷歌"
-      },
-      {
-        "rule_set": "规则-电报域名",
-        "action": "route",
-        "outbound": "电报"
-      },
-      {
-        "rule_set": "规则-国内域名",
-        "action": "route",
-        "outbound": "国内"
-      },
-      {
-        "rule_set": "规则-GFW",
-        "action": "route",
-        "outbound": "兜底"
-      },
-      {
-        "type": "logical",
-        "mode": "or",
-        "rules": [
-          { "port": 853 },
-          { "network": "udp", "port": 443 },
-          { "protocol": "stun" }
-        ],
-        "action": "reject"
-      },
-      {
-        "action": "resolve",
-        "strategy": "ipv4_only"
-      },
-      {
-        "rule_set": "规则-电报IP",
-        "action": "route",
-        "outbound": "电报"
-      },
-      {
-        "rule_set": "规则-国内IP",
-        "action": "route",
-        "outbound": "国内"
-      },
-      {
-        "clash_mode": "rule",
-        "action": "route",
-        "outbound": "兜底"
-      }
-    ]
-  }
-}
+# ================================================================
+# Mihomo Windows 配置
+# 依据 Mihomo 官方文档整理
+# 订阅来源：由自建 Sub-Store 服务生成 Mihomo / Clash.Meta YAML
+# 请将 YOUR_SUBSTORE_MIHOМO_URL 替换为你的实际转换订阅地址
+# ================================================================
+
+# -------------------- 基础设置 --------------------
+mixed-port: 7890
+allow-lan: false
+bind-address: "*"
+mode: rule
+log-level: warning
+ipv6: false
+
+# -------------------- 内核特性 --------------------
+unified-delay: true
+tcp-concurrent: true
+
+# Windows 如需进程规则，可将 off 改为 strict；当前不添加进程分流
+find-process-mode: off
+keep-alive-interval: 15
+keep-alive-idle: 15
+# disable-keep-alive: false
+
+# -------------------- 控制 API / 面板 --------------------
+# 仅本机监听，避免局域网暴露
+external-controller: 127.0.0.1:9090
+# 请自行修改为随机密钥；面板连接时需要填写相同密钥
+secret: "CHANGE_ME"
+# MetaCubeXD 面板；客户端不支持时可删除本段
+external-ui: ./ui
+external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+# -------------------- GEO 数据库 --------------------
+geodata-mode: true
+geodata-loader: standard
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  geoip: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  geosite: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+  asn: "https://github.com/xishang0128/geoip/releases/download/latest/GeoLite2-ASN.mmdb"
+
+# -------------------- TUN：Windows --------------------
+# auto-redirect 仅 Linux 支持，Windows 配置不使用
+# mixed 是官方建议优先尝试的协议栈
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+# -------------------- NTP --------------------
+ntp:
+  enable: true
+  write-to-system: false
+  server: time.apple.com
+  port: 123
+  interval: 30
+
+# -------------------- 域名嗅探 --------------------
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: false
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - Mijia Cloud
+    - "+.push.apple.com"
+
+# -------------------- Sub-Store Mihomo 订阅 --------------------
+# Sub-Store 输出目标请选择 Mihomo / Clash.Meta。
+# 这里填 Sub-Store 生成的最终 Mihomo YAML 订阅地址，而不是原始节点订阅地址。
+proxy-providers:
+  substore:
+    type: http
+    url: "YOUR_SUBSTORE_MIHOМO_URL"
+    path: ./providers/proxy/substore.yaml
+    interval: 86400
+    proxy: DIRECT
+    health-check:
+      enable: true
+      url: https://cp.cloudflare.com
+      interval: 600
+      timeout: 5000
+      lazy: true
+      expected-status: 204
+    override:
+      udp: true
+
+# -------------------- 规则集 --------------------
+rule-providers:
+  去广告:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/Cats-Team/AdRules@main/adrules-mihomo.mrs"
+    path: ./ruleset/adrules-mihomo.mrs
+    interval: 86400
+    proxy: DIRECT
+  谷歌域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs"
+    path: ./ruleset/google_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+  电报域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/telegram.mrs"
+    path: ./ruleset/telegram_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+  电报IP:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs"
+    path: ./ruleset/telegram_ip.mrs
+    interval: 86400
+    proxy: DIRECT
+  国内域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs"
+    path: ./ruleset/cn_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+  国内IP:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs"
+    path: ./ruleset/cn_ip.mrs
+    interval: 86400
+    proxy: DIRECT
+  苹果中国:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple@cn.mrs"
+    path: ./ruleset/apple_cn.mrs
+    interval: 86400
+    proxy: DIRECT
+  GFW列表:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/gfw.mrs"
+    path: ./ruleset/gfw_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+  私有域名:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs"
+    path: ./ruleset/private_domain.mrs
+    interval: 86400
+    proxy: DIRECT
+
+# -------------------- DNS --------------------
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "*.home.arpa"
+    - localhost.ptlogin2.qq.com
+    - dns.msftncsi.com
+    - www.msftncsi.com
+    - www.msftconnecttest.com
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - time.*.com
+    - time.*.gov
+    - time.*.edu.cn
+    - time.*.apple.com
+    - time-ios.apple.com
+    - "*.ntp.org.cn"
+    - "*.pool.ntp.org"
+    - ntp.*.com
+    - "*.stun.*"
+    - stun.*.*
+    - stun.*.*.*
+    - lens.l.google.com
+    - "geosite:cn"
+    - "geosite:private"
+    - "geosite:apple-cn"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - tls://8.8.4.4
+    - tls://1.1.1.1
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  direct-nameserver:
+    - system
+    - 223.5.5.5
+  direct-nameserver-follow-policy: false
+  nameserver-policy:
+    "geosite:cn,private,apple-cn":
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+    "geosite:category-ads-all": rcode://success
+    "geosite:geolocation-!cn,gfw":
+      - https://dns.google/dns-query
+      - https://cloudflare-dns.com/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    geosite:
+      - gfw
+    ipcidr:
+      - 240.0.0.0/4
+      - 0.0.0.0/32
+      - 127.0.0.1/32
+      - 100.64.0.0/10
+    domain:
+      - "+.google.com"
+      - "+.facebook.com"
+      - "+.youtube.com"
+  respect-rules: false
+  use-hosts: true
+  use-system-hosts: true
+  cache-algorithm: arc
+  prefer-h3: false
+
+# -------------------- 策略组 --------------------
+proxy-groups:
+  - name: 手动选择
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Static.png
+    use: [substore]
+    proxies: [自动选择, DIRECT]
+  - name: 自动选择
+    type: url-test
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Auto.png
+    use: [substore]
+    url: https://cp.cloudflare.com
+    interval: 600
+    tolerance: 50
+    lazy: true
+    expected-status: 204
+    timeout: 5000
+  - name: 去广告
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Advertising.png
+    proxies: [REJECT, DIRECT]
+  - name: 国内
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/China_Map.png
+    proxies: [DIRECT, 手动选择, 自动选择]
+  - name: 谷歌
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Google_Search.png
+    proxies: [手动选择, 自动选择, DIRECT]
+  - name: 电报
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png
+    proxies: [手动选择, 自动选择, DIRECT]
+  - name: 兜底
+    type: select
+    icon: https://testingcf.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Final.png
+    proxies: [手动选择, 自动选择, DIRECT]
+
+# -------------------- 分流规则 --------------------
+rules:
+  - RULE-SET,私有域名,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+  - RULE-SET,去广告,去广告
+  - RULE-SET,苹果中国,国内
+  - RULE-SET,谷歌域名,谷歌
+  - RULE-SET,电报域名,电报
+  - RULE-SET,国内域名,国内
+  - RULE-SET,GFW列表,手动选择
+  - RULE-SET,电报IP,电报,no-resolve
+  - RULE-SET,国内IP,国内,no-resolve
+  - GEOIP,CN,国内,no-resolve
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+  - MATCH,兜底
