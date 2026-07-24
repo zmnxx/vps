@@ -2,7 +2,7 @@
 # ============================================================================
 # vps-toolkit.sh — Debian/Ubuntu VPS 一键运维工具箱
 # ----------------------------------------------------------------------------
-# 版本   : 5.1.0
+# 版本   : 5.0.1
 # 适用   : Debian 10+ / Ubuntu 18.04+
 # 功能   : Docker Compose 管理 / Nginx 反向代理 / HTTPS 证书 /
 #          sing-box (VLESS+Reality) / SNI 分流 / 一条龙安装 / 健康检查
@@ -27,13 +27,16 @@ CYAN='\033[1;36m';   BOLD='\033[1m'
 NC='\033[0m'
 
 VERSION="v5.1.0"
-STATE_DIR="/var/lib/vps-toolkit"
-STATE_FILE="$STATE_DIR/state"
-STATE_VERSION="1"
-LOCK_FILE="/run/vps-toolkit.lock"
-RECOVERY_FILE="$STATE_DIR/recovery.tar"
+CONF_DIR="/root/.vps-toolkit"
+CONF_FILE="$CONF_DIR/config"
+# A single overwrite-style recovery archive for the current config transaction.
+RECOVERY_FILE="/run/vps-toolkit-recovery.tar"
 DEFAULT_BASE="/docker"
 LAST_BASE="$DEFAULT_BASE"
+
+# Fixed names prevent duplicate background jobs and make cleanup deterministic.
+CLEANUP_SERVICE="/etc/systemd/system/vps-docker-cleanup.service"
+CLEANUP_TIMER="/etc/systemd/system/vps-docker-cleanup.timer"
 
 # sing-box 默认端口（可自定义，存配置）
 SINGBOX_CONF="/etc/sing-box/config.json"
@@ -139,67 +142,91 @@ editor_cmd(){
 }
 edit_file(){ "$(editor_cmd)" "$1"; }
 
-declare -A OWNED=()
-state_encode(){ printf '%s' "$1" | base64 -w0; }
-state_decode(){ printf '%s' "$1" | base64 -d 2>/dev/null; }
-state_key(){ printf '%s\t%s' "$1" "$2"; }
-state_owns(){ [ "${OWNED[$(state_key "$1" "$2")]:-}" = "1" ]; }
-state_add(){ local key; key=$(state_key "$1" "$2"); OWNED["$key"]=1; save_state; }
-state_remove(){ local key; key=$(state_key "$1" "$2"); unset "OWNED[$key]"; save_state; }
-state_list(){ local type="$1" key; for key in "${!OWNED[@]}"; do [ "${key%%$'\t'*}" = "$type" ] && printf '%s\n' "${key#*$'\t'}"; done | sort; }
-load_state(){
-  local kind a b key
-  mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"
-  [ -f "$STATE_FILE" ] || return 0
-  while IFS=$'\t' read -r kind a b; do
-    case "$kind" in
-      META) : ;;
-      CONFIG) b=$(state_decode "$b") || continue; case "$a" in LAST_BASE) LAST_BASE="$b" ;; SINGBOX_PORT) SINGBOX_PORT="$b" ;; NGINX_HTTPS_PORT) NGINX_HTTPS_PORT="$b" ;; ACME_EMAIL_DOMAIN) ACME_EMAIL_DOMAIN="$b" ;; esac ;;
-      RESOURCE) a=$(state_decode "$a") || continue; b=$(state_decode "$b") || continue; key=$(state_key "$a" "$b"); OWNED["$key"]=1 ;;
-    esac
-  done < "$STATE_FILE"
-}
-save_state(){
-  local tmp key type id
-  mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"; tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
-  { printf 'META\tversion\t%s\n' "$STATE_VERSION"
-    printf 'CONFIG\tLAST_BASE\t%s\n' "$(state_encode "$LAST_BASE")"
-    printf 'CONFIG\tSINGBOX_PORT\t%s\n' "$(state_encode "${SINGBOX_PORT:-$SINGBOX_DEFAULT_PORT}")"
-    printf 'CONFIG\tNGINX_HTTPS_PORT\t%s\n' "$(state_encode "${NGINX_HTTPS_PORT:-}")"
-    printf 'CONFIG\tACME_EMAIL_DOMAIN\t%s\n' "$(state_encode "${ACME_EMAIL_DOMAIN:-}")"
-    for key in "${!OWNED[@]}"; do type=${key%%$'\t'*}; id=${key#*$'\t'}; printf 'RESOURCE\t%s\t%s\n' "$(state_encode "$type")" "$(state_encode "$id")"; done | sort
-  } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
-}
-save_conf(){ save_state; }
 acquire_lock(){
-  cmd_exists flock || { err "缺少 flock（util-linux），无法保证单实例执行"; exit 1; }
-  exec 8>"$LOCK_FILE" || { err "无法创建运行锁: $LOCK_FILE"; exit 1; }
-  flock -n 8 || { err "本机已有另一个 VPS Toolkit 实例正在运行"; exit 1; }
+  if cmd_exists flock; then
+    exec 9>/run/vps-toolkit.lock
+    flock -n 9 || { err "已有另一个实例正在运行"; exit 1; }
+  else
+    local lock_dir=/run/vps-toolkit.lock.d
+    mkdir "$lock_dir" 2>/dev/null || { err "已有另一个实例正在运行"; exit 1; }
+    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+  fi
 }
-recovery_create(){
-  local paths=() absent=() p meta="$STATE_DIR/.recovery-absent"
-  mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"; rm -f "$RECOVERY_FILE" "$meta"
-  for p in "$@"; do
-    if [ -e "$p" ] || [ -L "$p" ]; then paths+=("${p#/}"); else absent+=("$p"); fi
+
+valid_base_path(){
+  case "$1" in
+    /*) [[ "$1" != *[[:space:]]* ]] && [[ "$1" != *..* ]] && [ "$1" != "/" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+load_conf(){
+  mkdir -p "$CONF_DIR" || { err "无法创建状态目录: $CONF_DIR"; return 1; }
+  local key value
+  if [ -f "$CONF_FILE" ]; then
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+      case "$key" in
+        LAST_BASE) valid_base_path "$value" && LAST_BASE="$value" ;;
+        SINGBOX_PORT) valid_port "$value" && SINGBOX_PORT="$value" ;;
+        NGINX_HTTPS_PORT) valid_port "$value" && NGINX_HTTPS_PORT="$value" ;;
+        ACME_EMAIL_DOMAIN) valid_domain "$value" && ACME_EMAIL_DOMAIN="$value" ;;
+      esac
+    done < "$CONF_FILE"
+  fi
+  : "${LAST_BASE:=$DEFAULT_BASE}"
+  : "${SINGBOX_PORT:=$SINGBOX_DEFAULT_PORT}"
+  valid_base_path "$LAST_BASE" || LAST_BASE="$DEFAULT_BASE"
+  valid_port "$SINGBOX_PORT" || SINGBOX_PORT="$SINGBOX_DEFAULT_PORT"
+}
+save_conf(){
+  local tmp
+  mkdir -p "$CONF_DIR" || return 1
+  valid_base_path "$LAST_BASE" || { err "项目根目录无效"; return 1; }
+  valid_port "$SINGBOX_PORT" || { err "sing-box 端口无效"; return 1; }
+  tmp=$(mktemp "$CONF_DIR/.config.XXXXXX") || return 1
+  printf 'LAST_BASE=%s\nSINGBOX_PORT=%s\nNGINX_HTTPS_PORT=%s\nACME_EMAIL_DOMAIN=%s\n' \
+    "$LAST_BASE" "$SINGBOX_PORT" "${NGINX_HTTPS_PORT:-}" "${ACME_EMAIL_DOMAIN:-}" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$CONF_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+recovery_begin(){
+  local path stage manifest existing=()
+  rm -f "$RECOVERY_FILE"
+  stage=$(mktemp -d) || return 1
+  manifest="$stage/vps-toolkit-recovery.manifest"
+  for path in "$@"; do
+    case "$path" in /*) ;; *) rm -rf "$stage"; return 1 ;; esac
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      printf 'E:%s\n' "${path#/}" >> "$manifest"
+      existing+=("${path#/}")
+    else
+      printf 'A:%s\n' "${path#/}" >> "$manifest"
+    fi
   done
-  printf '%s\n' "${absent[@]}" > "$meta"
-  paths+=("${meta#/}")
-  tar -C / -cpf "$RECOVERY_FILE" "${paths[@]}" 2>/dev/null \
-    || { rm -f "$RECOVERY_FILE" "$meta"; err "创建恢复点失败"; return 1; }
-  rm -f "$meta"; chmod 0600 "$RECOVERY_FILE"
+  tar -cf "$RECOVERY_FILE" -C "$stage" vps-toolkit-recovery.manifest 2>/dev/null || { rm -rf "$stage"; return 1; }
+  if [ ${#existing[@]} -gt 0 ]; then
+    tar -rf "$RECOVERY_FILE" -C / "${existing[@]}" 2>/dev/null || { rm -rf "$stage" "$RECOVERY_FILE"; return 1; }
+  fi
+  rm -rf "$stage"
 }
 recovery_restore(){
-  local p meta="$STATE_DIR/.recovery-absent" member="${STATE_DIR#/}/.recovery-absent" list
-  [ -f "$RECOVERY_FILE" ] || { err "恢复文件不存在"; return 1; }
-  list=$(mktemp "$STATE_DIR/.absent.XXXXXX") || return 1
-  tar -xOf "$RECOVERY_FILE" "$member" > "$list" 2>/dev/null || true
-  while IFS= read -r p; do [ -n "$p" ] && rm -rf -- "$p"; done < "$list"
-  rm -f "$list"
-  tar -C / -xpf "$RECOVERY_FILE" 2>/dev/null \
-    || { err "恢复文件应用失败，已保留 $RECOVERY_FILE"; return 1; }
-  rm -f "$meta" "$RECOVERY_FILE"
+  local manifest path state
+  if [ -f "$RECOVERY_FILE" ]; then
+    manifest=$(mktemp)
+    tar -xOf "$RECOVERY_FILE" vps-toolkit-recovery.manifest > "$manifest" 2>/dev/null || true
+    while IFS=: read -r state path; do
+      [ -n "$path" ] || continue
+      case "$path" in /*|*..*|'') continue ;; esac
+      rm -rf -- "/${path:?}"
+    done < "$manifest"
+    tar -xf "$RECOVERY_FILE" -C / --exclude=vps-toolkit-recovery.manifest 2>/dev/null || true
+    rm -f "$manifest"
+  fi
+  rm -f "$RECOVERY_FILE"
 }
 recovery_commit(){ rm -f "$RECOVERY_FILE"; }
+
 ask_yn(){
   local q="$1" d="${2:-}" a prompt
   if [ "$d" = "y" ]; then prompt="(y/n 默认 y)"
@@ -208,7 +235,7 @@ ask_yn(){
   while true; do
     read -rp "  $q $prompt: " a
     [ -z "$a" ] && [ -n "$d" ] && a="$d"
-    case "$a" in y|Y) return 0 ;; n|N) return 1 ;;
+    case "$a" in y|Y|yes) return 0 ;; n|N|no) return 1 ;;
       *) echo "    请输入 y 或 n" ;; esac
   done
 }
@@ -255,8 +282,10 @@ service_state(){
 }
 
 collect_compose_files(){
-  local dirs="$LAST_BASE /docker /opt/docker-apps /opt/compose /app"
-  { for d in $dirs; do [ -d "$d" ] && find "$d" \( -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "compose.yml" -o -name "compose.yaml" \) -type f 2>/dev/null; done; } | sort -u
+  local dirs=("$LAST_BASE" /docker /opt/docker-apps /opt/compose /app) d
+  for d in "${dirs[@]}"; do
+    [ -d "$d" ] && find "$d" -type f \( -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "compose.yml" -o -name "compose.yaml" \) -print 2>/dev/null
+  done | sort -u
 }
 
 extract_first_host_port(){
@@ -311,37 +340,92 @@ show_cert_summary_line(){
 
 # ─── 定时清理 ──────────────────────────────────────────────
 
-has_auto_cleanup(){ crontab -l 2>/dev/null | grep -Fq '# vps-toolkit:docker-cleanup'; }
+has_auto_cleanup(){ crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"; }
 
-remove_cleanup_cron(){
-  local tmp; tmp=$(mktemp)
-  crontab -l 2>/dev/null | grep -v -F '# vps-toolkit:docker-cleanup' > "$tmp" || true
-  if ! crontab "$tmp" 2>/dev/null; then
-    rm -f "$tmp"; err "定时任务更新失败，原 crontab 未改动"; return 1
-  fi
-  rm -f "$tmp"
+has_auto_cleanup(){
+  systemctl is-enabled --quiet "$(basename "$CLEANUP_TIMER")" 2>/dev/null && return 0
+  systemctl is-active --quiet "$(basename "$CLEANUP_TIMER")" 2>/dev/null
 }
 
-cleanup_cron_marker="# vps-toolkit:docker-cleanup"
-cleanup_cron_command(){ printf '%s %s' 'flock -n /run/vps-toolkit-docker-cleanup.lock sh -c '\''rc=0; timeout 30m docker container prune -f || rc=1; timeout 30m docker image prune -f || rc=1; timeout 30m docker builder prune -f || rc=1; exit $rc'\'' >/dev/null 2>&1' "$cleanup_cron_marker"; }
-run_docker_cleanup(){
-  local rc=0
-  timeout 30m docker container prune -f || rc=1
-  timeout 30m docker image prune -f || rc=1
-  timeout 30m docker builder prune -f || rc=1
-  [ "$rc" -eq 0 ] || { err "Docker 清理至少有一项执行失败"; return 1; }
-  ok "Docker 清理命令全部执行完成"
+legacy_cleanup_exists(){
+  crontab -l 2>/dev/null | grep -q 'docker-cleanup\.sh' || \
+    [ -e /usr/local/bin/docker-cleanup.sh ] || [ -e /etc/logrotate.d/docker-cleanup ] || \
+    [ -e /var/log/docker-cleanup.log ]
+}
+
+remove_legacy_cleanup(){
+  local tmp
+  if crontab -l 2>/dev/null | grep -q 'docker-cleanup\.sh'; then
+    tmp=$(mktemp) || return 1
+    crontab -l 2>/dev/null | grep -v 'docker-cleanup\.sh' > "$tmp" || true
+    if ! crontab "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      err "旧版清理 cron 删除失败，未修改现有 crontab"
+      return 1
+    fi
+    rm -f "$tmp"
+  fi
+  rm -f /usr/local/bin/docker-cleanup.sh /etc/logrotate.d/docker-cleanup /var/log/docker-cleanup.log || return 1
+  [ ! -e /usr/local/bin/docker-cleanup.sh ] && [ ! -e /etc/logrotate.d/docker-cleanup ] && [ ! -e /var/log/docker-cleanup.log ]
+}
+
+write_cleanup_units(){
+  local service_tmp timer_tmp
+  service_tmp=$(mktemp) || return 1
+  timer_tmp=$(mktemp) || { rm -f "$service_tmp"; return 1; }
+  cat > "$service_tmp" <<'UNIT'
+[Unit]
+Description=Prune Docker stopped containers and unused build data
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker container prune -f
+ExecStart=/usr/bin/docker image prune -f
+ExecStart=/usr/bin/docker builder prune -f
+TimeoutStartSec=30min
+UNIT
+  cat > "$timer_tmp" <<'UNIT'
+[Unit]
+Description=Schedule Docker cleanup
+
+[Timer]
+OnCalendar=Mon *-*-* 03:00:00
+Persistent=false
+Unit=vps-docker-cleanup.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+  install -m 0644 "$service_tmp" "$CLEANUP_SERVICE" && install -m 0644 "$timer_tmp" "$CLEANUP_TIMER"
+  local ret=$?
+  rm -f "$service_tmp" "$timer_tmp"
+  [ "$ret" -eq 0 ] || { err "systemd timer 配置写入失败"; return 1; }
+  systemctl daemon-reload || { err "systemd daemon-reload 失败"; return 1; }
+}
+
+cleanup_units_active(){
+  local unit
+  unit=$(basename "$CLEANUP_TIMER")
+  systemctl is-enabled --quiet "$unit" && systemctl is-active --quiet "$unit"
+}
+
+remove_cleanup_timer(){
+  local timer
+  timer=$(basename "$CLEANUP_TIMER")
+  systemctl disable --now "$timer" >/dev/null 2>&1 || {
+    systemctl is-active --quiet "$timer" && { err "停止清理 timer 失败"; return 1; }
+  }
+  rm -f "$CLEANUP_TIMER" "$CLEANUP_SERVICE" || return 1
+  systemctl daemon-reload || return 1
+  [ ! -e "$CLEANUP_TIMER" ] && [ ! -e "$CLEANUP_SERVICE" ] || return 1
 }
 
 setup_auto_cleanup(){
   ui_header "定时维护"
-  local cron_time choice job
-  job=$(crontab -l 2>/dev/null | grep -F "$cleanup_cron_marker" || true)
-  if [ -n "$job" ]; then
-    ok "定时清理已存在，跳过重复配置"
-    echo "    $job"
-    ask_yn "是否重新设置时间？" "n" || { pause; return 0; }
-  fi
+  local choice schedule timer
+  timer=$(basename "$CLEANUP_TIMER")
   echo "  [1] 每天凌晨 3 点"
   echo "  [2] 每周一凌晨 3 点"
   echo "  [3] 每月 1 号凌晨 3 点"
@@ -352,19 +436,32 @@ setup_auto_cleanup(){
   read -rp "  请选择 [2]: " choice
   [ -z "$choice" ] && choice="2"
   case "$choice" in
-    4) [ -z "$job" ] && warn "未设置" || ok "$job"; pause; return 0 ;;
-    5) ask_yn "删除定时清理任务？" "y" || return 0; remove_cleanup_cron && ! has_auto_cleanup && { state_remove cron docker-cleanup; ok "已删除"; } || err "删除后仍检测到任务"; pause; return 0 ;;
-    6) run_docker_cleanup; pause; return 0 ;;
+    4)
+      systemctl list-timers "$timer" --no-pager 2>/dev/null || warn "未设置"
+      pause; return 0 ;;
+    5)
+      ask_yn "删除 Docker 定时清理？" "y" || return 0
+      remove_cleanup_timer && remove_legacy_cleanup && ok "定时清理已删除" || err "定时清理删除未完成"
+      pause; return 0 ;;
+    6)
+      ask_yn "立即执行 Docker 清理（会永久删除停止容器）？" "y" || return 0
+      need_docker || return 1
+      docker container prune -f && docker image prune -f && docker builder prune -f || { err "Docker 清理失败"; pause; return 1; }
+      ok "Docker 清理已执行"; pause; return 0 ;;
     0) return 0 ;;
-    1) cron_time="0 3 * * *" ;;
-    2) cron_time="0 3 * * 1" ;;
-    3) cron_time="0 3 1 * *" ;;
-    *) echo "  输入 1-6"; return 1 ;;
+    1) schedule="*-*-* 03:00:00" ;;
+    2) schedule="Mon *-*-* 03:00:00" ;;
+    3) schedule="*-*-01 03:00:00" ;;
+    *) err "请输入 1-6"; return 1 ;;
   esac
-  remove_cleanup_cron || return 1
-  if (crontab -l 2>/dev/null; printf '%s %s\n' "$cron_time" "$(cleanup_cron_command)") | crontab - && has_auto_cleanup; then
-    state_add cron docker-cleanup; ok "已设置"
-  else err "定时任务写入或验证失败"; return 1; fi
+  ask_yn "设置 Docker 定时清理（会永久删除停止容器）？" "y" || return 0
+  write_cleanup_units || { pause; return 1; }
+  sed -i "s#^OnCalendar=.*#OnCalendar=$schedule#" "$CLEANUP_TIMER" || { err "timer 时间更新失败"; pause; return 1; }
+  systemctl daemon-reload || { err "systemd daemon-reload 失败"; pause; return 1; }
+  remove_legacy_cleanup || { pause; return 1; }
+  systemctl enable --now "$timer" >/dev/null 2>&1 || { err "timer 启用失败"; pause; return 1; }
+  cleanup_units_active || { err "timer 启用后状态检查失败"; pause; return 1; }
+  ok "Docker 定时清理已设置"
   pause
 }
 
@@ -396,20 +493,22 @@ config_docker_log_rotation(){
     tmp=$(mktemp)
     printf '{"log-driver":"json-file","log-opts":{"max-size":"%s","max-file":"%s"}}\n' "$max_size" "$max_file" > "$tmp"
   fi
-  recovery_create "$daemon_json" || { rm -f "$tmp"; return 1; }
-  if ! install -m 0644 "$tmp" "$daemon_json"; then rm -f "$tmp"; recovery_restore || true; err "daemon.json 写入失败"; return 1; fi
-  rm -f "$tmp"
-  if cmd_exists dockerd && ! dockerd --validate --config-file "$daemon_json" >/dev/null 2>&1; then
-    err "Docker 配置验证失败，正在恢复"; recovery_restore || true; return 1
+  recovery_begin "$daemon_json" || { rm -f "$tmp"; err "无法创建 Docker 配置恢复文件"; return 1; }
+  if ! install -m 0644 "$tmp" "$daemon_json" || ! jq empty "$daemon_json" >/dev/null 2>&1; then
+    rm -f "$tmp"; recovery_restore; err "daemon.json 写入或校验失败"; return 1
   fi
-  if systemctl is-active --quiet docker 2>/dev/null && { [ "$auto_mode" = "auto" ] || ask_yn "立即重启 Docker？" "y"; }; then
-    if ! systemctl restart docker || ! docker_ready; then
-      err "Docker 重启或状态验证失败，正在恢复"
-      recovery_restore || true; systemctl restart docker 2>/dev/null || true; return 1
+  rm -f "$tmp"
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    if [ "$auto_mode" = "auto" ]; then
+      systemctl restart docker || { err "Docker 重启失败，恢复原 daemon.json"; recovery_restore; systemctl restart docker >/dev/null 2>&1 || true; return 1; }
+      docker_ready || { err "Docker 重启后状态异常，恢复原 daemon.json"; recovery_restore; systemctl restart docker >/dev/null 2>&1 || true; return 1; }
+      ok "Docker 已重启，日志轮转已生效"
+    elif ask_yn "立即重启 Docker？" "y"; then
+      if systemctl restart docker && docker_ready; then ok "Docker 已重启"; else err "Docker 重启失败，恢复原 daemon.json"; recovery_restore; systemctl restart docker >/dev/null 2>&1 || true; pause; return 1; fi
     fi
   fi
-  recovery_commit; state_add docker_config "$daemon_json"
-  ok "daemon.json 已配置并验证（只对新建容器生效）"
+  recovery_commit
+  ok "daemon.json 已配置（只对新建容器生效）"
   [ "$auto_mode" = "auto" ] || pause
 }
 
@@ -419,68 +518,63 @@ config_docker_log_rotation(){
 install_acme(){
   if [ -x "$ACME_BIN" ]; then ok "acme.sh 已安装"; return 0; fi
   info "安装 acme.sh..."
-  apt-get install -y -qq curl socat >/dev/null 2>&1 || true
-  # 安装时不注册账户（用 .local 这类非公开 TLD 会被 LE 拒绝）
-  # 账户在实际签发第一张证书时按证书主域名生成有效邮箱注册（acme_issue 传 -m）
-  curl -fsSL https://get.acme.sh | sh -s --nocron >/dev/null 2>&1 \
-    || { err "acme.sh 安装失败"; return 1; }
-  [ -x "$ACME_BIN" ] && "$ACME_BIN" --version >/dev/null 2>&1 || { err "acme.sh 安装后验证失败"; return 1; }
-  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" >/dev/null 2>&1 || { err "acme.sh 默认 CA 设置失败"; return 1; }
-  state_add software acme.sh
-  ok "acme.sh 安装完成并验证（账户将在首次签发证书时注册）"
+  apt-get install -y -qq curl socat >/dev/null 2>&1 || { err "acme.sh 依赖安装失败"; return 1; }
+  curl -fsSL https://get.acme.sh | sh -s --nocron >/dev/null 2>&1 || { err "acme.sh 安装失败"; return 1; }
+  [ -x "$ACME_BIN" ] || { err "acme.sh 安装后未找到可执行文件"; return 1; }
+  "$ACME_BIN" --set-default-ca --server "$ACME_DEFAULT_CA" >/dev/null 2>&1 || { err "acme.sh 默认 CA 配置失败"; return 1; }
+  ok "acme.sh 安装完成（账户将在首次签发证书时注册）"
 }
 
 
 install_docker(){
   if docker_ready; then
-    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl enable docker >/dev/null 2>&1 || { err "Docker 开机自启配置失败"; return 1; }
+    systemctl is-enabled --quiet docker || { err "Docker 开机自启状态校验失败"; return 1; }
     ok "Docker 已安装、运行且已设置开机自启"
     return 0
   fi
   info "安装 Docker..."
   apt-get update -qq || { err "apt update 失败"; return 1; }
-  apt-get install -y -qq ca-certificates curl gnupg
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/$ID/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
+  apt-get install -y -qq ca-certificates curl gnupg || { err "Docker 依赖安装失败"; return 1; }
+  install -m 0755 -d /etc/apt/keyrings || { err "Docker keyring 目录创建失败"; return 1; }
+  curl -fsSL "https://download.docker.com/linux/$ID/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || { err "Docker GPG key 安装失败"; return 1; }
+  chmod a+r /etc/apt/keyrings/docker.gpg || return 1
   local codename; codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$ID $codename stable" > /etc/apt/sources.list.d/docker.list
-  apt-get update -qq
+  [ -n "$codename" ] || { err "无法识别发行版代号"; return 1; }
+  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' "$(dpkg --print-architecture)" "$ID" "$codename" > /etc/apt/sources.list.d/docker.list || return 1
+  apt-get update -qq || { err "Docker 仓库更新失败"; return 1; }
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || { err "Docker 安装失败"; return 1; }
   systemctl enable --now docker || { err "Docker 服务启动失败"; return 1; }
-  docker_ready && docker compose version >/dev/null 2>&1 || { err "Docker 或 Compose 安装后验证失败"; return 1; }
-  state_add software docker
-  ok "Docker 安装完成并通过运行验证"
+  docker_ready || { err "Docker 启动后不可用"; return 1; }
+  systemctl is-enabled --quiet docker || { err "Docker 开机自启校验失败"; return 1; }
+  ok "Docker 安装完成并已设置开机自启"
 }
 
 install_nginx(){
   if cmd_exists nginx; then
-    # 已安装时保留发行版模块文件，只检查 stream 是否可用。
     if ! ensure_stream_module 2>/dev/null; then
       warn "Nginx 缺 stream 模块，升级并安装相关依赖..."
-      apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
+      apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || { err "stream 模块安装失败"; return 1; }
     fi
+    nginx -t >/dev/null 2>&1 || { err "现有 Nginx 配置测试失败"; return 1; }
     ok "Nginx 已安装"
     return 0
   fi
   info "安装 Nginx（nginx-full + libnginx-mod-stream）..."
   apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx || { err "Nginx 安装失败"; return 1; }
-  systemctl enable --now nginx 2>/dev/null || { err "Nginx 服务启动失败"; return 1; }
-  nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx || { err "Nginx 安装后验证失败"; return 1; }
-  state_add software nginx
-  if ensure_stream_module 2>/dev/null; then
-    ok "Nginx 安装完成（stream 就绪）"
-  else
-    warn "Nginx 已安装并运行，但 stream 模块不可用"
-  fi
+  systemctl enable --now nginx >/dev/null 2>&1 || { err "Nginx 启动失败"; return 1; }
+  systemctl is-active --quiet nginx || { err "Nginx 启动后状态异常"; return 1; }
+  ensure_stream_module || { err "stream 模块不可用"; return 1; }
+  nginx -t >/dev/null 2>&1 || { err "Nginx 配置测试失败"; return 1; }
+  ok "Nginx 安装完成（stream 就绪）"
 }
 
 install_base_env(){
   ui_header "安装基础环境"
-  install_docker || { err "基础环境安装中止"; pause; return 1; }
-  install_nginx || { err "基础环境安装中止"; pause; return 1; }
-  install_acme || { err "基础环境安装中止"; pause; return 1; }
-  ok "基础环境安装完成并验证"
+  install_docker || { pause; return 1; }
+  install_nginx || { pause; return 1; }
+  install_acme || { pause; return 1; }
+  ok "基础环境安装完成"
   pause
 }
 
@@ -497,17 +591,15 @@ create_docker_project(){
   local base="${LAST_BASE%/}"
   read -rp "  项目根目录（默认 $base）: " input
   [ -n "$input" ] && base="${input%/}"
-  if [ -e "$base/$name" ]; then
-    err "目标已存在，拒绝覆盖: $base/$name"; return 1
-  fi
+  valid_base_path "$base" || { err "项目根目录无效"; return 1; }
   mkdir -p "$base/$name" || { err "项目目录创建失败"; return 1; }
-  LAST_BASE="$base"; PREV_DIR="$base/$name"; save_conf
-  : > "$base/$name/docker-compose.yml" || { rmdir "$base/$name" 2>/dev/null; err "Compose 文件创建失败"; return 1; }
-  state_add compose "$base/$name"
-  ok "已创建: $base/$name/docker-compose.yml"
-  edit_file "$base/$name/docker-compose.yml"
+  LAST_BASE="$base"; PREV_DIR="$base/$name"; PREV_FILE="$base/$name/docker-compose.yml"
+  save_conf || { err "状态保存失败"; return 1; }
+  : > "$PREV_FILE" || { err "Compose 文件创建失败"; return 1; }
+  ok "已创建: $PREV_FILE"
+  edit_file "$PREV_FILE"
   local detected_port
-  detected_port=$(extract_first_host_port "$base/$name/docker-compose.yml" || true)
+  detected_port=$(extract_first_host_port "$PREV_FILE" || true)
   if [ -n "$detected_port" ]; then
     read -rp "  反代端口（默认 $detected_port）: " input
     [ -z "$input" ] && input="$detected_port"
@@ -521,63 +613,34 @@ create_docker_project(){
 }
 
 select_compose_dir(){
-  local dirs items=() item
-  dirs=$(collect_compose_files)
-  if [ -z "$dirs" ]; then
-    warn "未找到 docker-compose.yml"
-    ask_yn "创建新项目？" "y" && { create_docker_project; dirs=$(collect_compose_files); }
-    [ -z "$dirs" ] && return 1
+  local -a files items
+  local item
+  mapfile -t files < <(collect_compose_files)
+  if [ ${#files[@]} -eq 0 ]; then
+    warn "未找到 Compose 文件"
+    if ask_yn "创建新项目？" "y"; then
+      create_docker_project || return 1
+      mapfile -t files < <(collect_compose_files)
+    fi
+    [ ${#files[@]} -eq 0 ] && return 1
   fi
-  for item in $dirs; do items+=("$(dirname "$item")"); done
-  select_from_list "选择项目目录" "${items[@]}" || return 1
-  SELECTED_DIR="$SELECTED_ITEM"
-  SELECTED_FILE=""
-  for item in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
-    [ -f "$SELECTED_DIR/$item" ] && { SELECTED_FILE="$SELECTED_DIR/$item"; break; }
-  done
-  [ -n "$SELECTED_FILE" ] || { err "项目配置文件已不存在"; return 1; }
+  for item in "${files[@]}"; do items+=("$item"); done
+  select_from_list "选择 Compose 文件" "${items[@]}" || return 1
+  SELECTED_FILE="$SELECTED_ITEM"
+  SELECTED_DIR="$(dirname "$SELECTED_FILE")"
   return 0
-}
-
-compose_verify_started(){
-  local file="$1" ids id state health exit_code pending
-  ids=$(docker compose -f "$file" ps -aq 2>/dev/null) || return 1
-  [ -n "$ids" ] || { err "Compose 未创建任何容器"; return 1; }
-  for _ in {1..30}; do
-    pending=0
-    for id in $ids; do
-      state=$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null) || return 1
-      health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" 2>/dev/null || true)
-      exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$id" 2>/dev/null || echo 1)
-      case "$state:$health:$exit_code" in
-        running::*) : ;; running:healthy:*) : ;; running:starting:*) pending=1 ;;
-        exited::0) : ;; *) err "容器 $id 状态异常: $state ${health:-} exit=$exit_code"; return 1 ;;
-      esac
-    done
-    [ "$pending" -eq 0 ] && return 0
-    sleep 1
-  done
-  err "容器健康检查 30 秒内未就绪"; return 1
-}
-
-compose_up_checked(){
-  local file="$1" label="$2"
-  docker compose -f "$file" config -q || { err "$label Compose 配置无效"; return 1; }
-  docker compose -f "$file" up -d || { err "$label 启动命令失败"; return 1; }
-  compose_verify_started "$file" || { err "$label 启动后验证失败"; return 1; }
-  ok "$label 已启动并通过状态验证"
 }
 
 list_projects(){
   need_docker || return 1
-  local dirs dir
-  dirs=$(collect_compose_files)
-  [ -z "$dirs" ] && { warn "未找到 docker-compose.yml"; return 0; }
+  local -a files
+  local file name status port
+  mapfile -t files < <(collect_compose_files)
+  [ ${#files[@]} -eq 0 ] && { warn "未找到 Compose 文件"; return 0; }
   echo "  项目                 端口       状态"
   echo "  ─────────────────────────────────────────"
-  for dir in $dirs; do
-    local name status file port
-    file="$dir"; name=$(basename "$(dirname "$file")")
+  for file in "${files[@]}"; do
+    name=$(basename "$(dirname "$file")")
     status=$(docker compose -f "$file" ps --format '{{.Name}} {{.State}}' 2>/dev/null | head -1 || true)
     [ -z "$status" ] && status="未启动"
     port=$(extract_first_host_port "$file" || true)
@@ -589,7 +652,7 @@ list_projects(){
 restart_project(){
   need_docker || return 1; select_compose_dir || return 1
   local name; name=$(basename "$SELECTED_DIR")
-  compose_up_checked "$SELECTED_FILE" "$name"
+  docker compose -f "$SELECTED_FILE" up -d && ok "$name 已启动 / 应用配置" || err "$name 启动失败"
   pause
 }
 
@@ -597,9 +660,7 @@ stop_project(){
   need_docker || return 1; select_compose_dir || return 1
   local name; name=$(basename "$SELECTED_DIR")
   ask_yn "停止 $name？" "y" || return 0
-  if docker compose -f "$SELECTED_FILE" down && [ -z "$(docker compose -f "$SELECTED_FILE" ps -aq 2>/dev/null)" ]; then
-    ok "$name 已停止并验证"
-  else err "$name 停止或验证失败"; fi
+  docker compose -f "$SELECTED_FILE" down && ok "$name 已停止" || err "$name 停止失败"
   pause
 }
 
@@ -609,29 +670,17 @@ project_logs(){
   ui_header "$name 日志"
   echo "  [1] 最近 200 行  [2] 实时跟踪"
   read -rp "  请选择 [1/2]: " c
-  if [ "$c" = "2" ]; then warn "按 Ctrl+C 返回"; docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200 -f
-  else docker compose -f "$SELECTED_DIR/docker-compose.yml" logs --tail=200; pause; fi
+  if [ "$c" = "2" ]; then warn "按 Ctrl+C 返回"; docker compose -f "$SELECTED_FILE" logs --tail=200 -f
+  else docker compose -f "$SELECTED_FILE" logs --tail=200; pause; fi
 }
 
-edit_project(){
-  select_compose_dir || return 1
-  recovery_create "$SELECTED_FILE" || return 1
-  edit_file "$SELECTED_FILE"
-  if ! docker compose -f "$SELECTED_FILE" config -q; then
-    err "Compose 配置无效，正在恢复"; recovery_restore || true; pause; return 1
-  fi
-  if ask_yn "应用配置 (up -d) 使修改生效？" "y"; then
-    if compose_up_checked "$SELECTED_FILE" "$(basename "$SELECTED_DIR")"; then recovery_commit
-    else err "应用失败，正在恢复旧配置"; recovery_restore || true; docker compose -f "$SELECTED_FILE" up -d 2>/dev/null || true; pause; return 1; fi
-  else recovery_commit; warn "配置语法正确但尚未应用"; fi
-  pause
-}
+edit_project(){ select_compose_dir || return 1; edit_file "$SELECTED_FILE"; ask_yn "应用配置 (up -d) 使修改生效？" "y" && docker compose -f "$SELECTED_FILE" up -d && ok "已应用" || warn "未应用，记得稍后手动启动"; pause; }
 
 update_project(){
   need_docker || return 1; select_compose_dir || return 1
   local dir="$SELECTED_DIR" name; name=$(basename "$dir")
   ask_yn "拉取 $name 最新镜像并重启？" "y" || return 0
-  docker compose -f "$SELECTED_FILE" pull && compose_up_checked "$SELECTED_FILE" "$name" || err "$name 更新失败"
+  docker compose -f "$SELECTED_FILE" pull && docker compose -f "$SELECTED_FILE" up -d && ok "$name 已更新" || err "$name 更新失败"
   pause
 }
 
@@ -661,7 +710,7 @@ project_ps(){
 project_restart_only(){
   need_docker || return 1; select_compose_dir || return 1
   local name; name=$(basename "$SELECTED_DIR")
-  docker compose -f "$SELECTED_FILE" restart && compose_verify_started "$SELECTED_FILE" && ok "$name 已重启并验证" || err "重启或状态验证失败"
+  docker compose -f "$SELECTED_FILE" restart && ok "$name 已重启" || err "重启失败"
   pause
 }
 
@@ -683,38 +732,30 @@ clear_project_logs(){
     lp=$(docker inspect --format '{{.LogPath}}' "$id" 2>/dev/null || true)
     [ -n "$lp" ] && [ -f "$lp" ] && truncate -s 0 "$lp" 2>/dev/null && count=$((count+1))
   done
-  if [ "$count" -eq 0 ]; then
-    warn "容器存在，但未发现可截断的 json-file 日志；可能使用了其他日志驱动"
-  else ok "已清理 $count 个容器日志"; fi
+  local remaining=0
+  for id in $ids; do
+    lp=$(docker inspect --format '{{.LogPath}}' "$id" 2>/dev/null || true)
+    [ -n "$lp" ] && [ -f "$lp" ] && [ "$(stat -c %s "$lp" 2>/dev/null || echo 1)" -gt 0 ] && remaining=$((remaining+1))
+  done
+  [ "$remaining" -eq 0 ] && ok "已清理 $count 个容器日志" || err "仍有 $remaining 个容器日志未清空"
   pause
 }
 
 delete_project_config(){
-  need_docker || return 1
-  if [ -n "${1:-}" ]; then
-    SELECTED_DIR="$1"; SELECTED_FILE=""
-    local candidate; for candidate in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do [ -f "$SELECTED_DIR/$candidate" ] && { SELECTED_FILE="$SELECTED_DIR/$candidate"; break; }; done
-    [ -n "$SELECTED_FILE" ] || { err "项目配置不存在: $SELECTED_DIR"; return 1; }
-  else select_compose_dir || return 1; fi
-  local dir="$SELECTED_DIR" file="$SELECTED_FILE" name ids id remove_volumes="n" residual=""
-  name=$(basename "$dir")
+  select_compose_dir || return 1
+  local dir="$SELECTED_DIR" name; name=$(basename "$dir")
   ask_yn "删除项目 $name？" "y" || return 0
-  ask_yn "同时删除容器和数据卷？" "y" && remove_volumes="y"
-  ids=$(docker compose -f "$file" ps -aq 2>/dev/null || true)
-  if [ "$remove_volumes" = "y" ]; then docker compose -f "$file" down -v --remove-orphans 2>/dev/null || true
-  else docker compose -f "$file" down --remove-orphans 2>/dev/null || true; fi
-  for id in $ids; do
-    docker inspect "$id" >/dev/null 2>&1 || continue
-    docker rm -f "$id" >/dev/null 2>&1 || true
-    docker inspect "$id" >/dev/null 2>&1 && residual="$residual $id"
-  done
-  if [ -n "$residual" ]; then
-    err "仍有项目容器无法删除:$residual"
-    err "已保留项目目录，避免失去后续清理依据"; pause; return 1
+  if ask_yn "同时删除容器和数据卷？" "y"; then
+    docker compose -f "$SELECTED_FILE" down -v || { err "容器或卷删除失败，未删除项目目录"; pause; return 1; }
+  else
+    docker compose -f "$SELECTED_FILE" down || { err "容器删除失败，未删除项目目录"; pause; return 1; }
   fi
   if rm -rf -- "$dir" && [ ! -e "$dir" ]; then
-    state_remove compose "$dir"; ok "$name 已删除并通过残留验证"
-  else err "$name 目录删除失败"; pause; return 1; fi
+    ok "$name 已删除"
+  else
+    err "$name 目录删除失败，请手动检查"
+    pause; return 1
+  fi
   pause
 }
 
@@ -723,15 +764,14 @@ clear_all_logs(){
   ui_header "清理所有容器日志 (truncate)"
   ask_yn "确定清理所有容器日志？" "y" || return 0
   # 动态读取 Docker Root Dir（用户可能自定义了存储路径）
-  local docker_root count=0 log
+  local docker_root count=0 failures=0 log
   docker_root=$(docker info 2>/dev/null | awk '/Docker Root Dir/{print $NF}')
-  [ -n "$docker_root" ] && [ -d "$docker_root/containers" ] || { err "Docker 容器日志目录不存在或无法识别: ${docker_root:-未知}"; pause; return 1; }
+  [ -z "$docker_root" ] && docker_root="/var/lib/docker"
   for log in "$docker_root"/containers/*/*-json.log; do
     [ -f "$log" ] || continue
-    truncate -s 0 "$log" 2>/dev/null && count=$((count+1))
+    if truncate -s 0 "$log" 2>/dev/null; then count=$((count+1)); else failures=$((failures+1)); fi
   done
-  if [ "$count" -eq 0 ]; then warn "未发现 json-file 日志；容器可能没有日志或使用其他日志驱动"
-  else ok "已清理 $count 个日志文件 (root: $docker_root)"; fi
+  if [ "$failures" -eq 0 ]; then ok "已清理 $count 个日志文件 (root: $docker_root)"; else err "$failures 个日志文件清理失败 (root: $docker_root)"; fi
   pause
 }
 
@@ -777,68 +817,60 @@ docker_menu(){
 # ─── WebSocket map ────────────────────────────────────────
 
 ensure_connection_upgrade_map(){
-  local conf="/etc/nginx/nginx.conf"
+  local conf="/etc/nginx/nginx.conf" tmp line inserted=0
   [ -f "$conf" ] || { err "未找到 $conf"; return 1; }
-  # 已有 map 就不重复加
-  if grep -q 'map[[:space:]]\+\$http_upgrade[[:space:]]\+\$connection_upgrade' "$conf" 2>/dev/null; then
-    return 0
-  fi
-  # 在 http { 后面插入 map 块
-  recovery_create "$conf" || return 1
-  local tmp; tmp=$(mktemp)
-  local inserted=0
-  local line
+  grep -q 'map[[:space:]]\+\$http_upgrade[[:space:]]\+\$connection_upgrade' "$conf" 2>/dev/null && return 0
+  recovery_begin "$conf" || { err "无法创建 Nginx 恢复文件"; return 1; }
+  tmp=$(mktemp) || { recovery_commit; return 1; }
   while IFS= read -r line || [ -n "$line" ]; do
-    printf '%s\n' "$line" >> "$tmp"
-    if [ "$inserted" -eq 0 ] && echo "$line" | grep -q '^[[:space:]]*http[[:space:]]*{'; then
-      printf '    map $http_upgrade $connection_upgrade {\n' >> "$tmp"
-      printf '        default upgrade;\n' >> "$tmp"
-      printf "        '' close;\n" >> "$tmp"
-      printf '    }\n\n' >> "$tmp"
+    printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; recovery_restore; return 1; }
+    if [ "$inserted" -eq 0 ] && printf '%s\n' "$line" | grep -q '^[[:space:]]*http[[:space:]]*{'; then
+      printf '    map $http_upgrade $connection_upgrade {\n        default upgrade;\n        '\''\'' close;\n    }\n\n' >> "$tmp" || { rm -f "$tmp"; recovery_restore; return 1; }
       inserted=1
     fi
   done < "$conf"
-  if [ "$inserted" -ne 1 ]; then
-    rm -f "$tmp"; err "未找到 http 块"; return 1
+  if [ "$inserted" -ne 1 ] || ! install -m 0644 "$tmp" "$conf"; then
+    rm -f "$tmp"; err "无法更新 Nginx http map"; recovery_restore; return 1
   fi
-  # 用实际 nginx 配置测试（不是独立测试文件）
-  cp "$tmp" "$conf"
-  if ! nginx -t 2>/dev/null; then
-    err "nginx -t 失败，恢复配置"
-    nginx -t 2>&1 | head -3 | sed 's/^/  /'
-    rm -f "$tmp"; recovery_restore || true
-    return 1
+  rm -f "$tmp"
+  if ! nginx -t >/dev/null 2>&1; then
+    err "nginx -t 失败，恢复 Nginx 配置"; nginx -t 2>&1 | head -5 | sed 's/^/  /'
+    recovery_restore; return 1
   fi
-  rm -f "$tmp"; recovery_commit
-  state_add nginx_map connection_upgrade
-  return 0
+  recovery_commit
 }
 
 # ─── Nginx 反代模板 ──────────────────────────────────────
 
 # 唯一 HTTPS 反代模板（通用 + SNI 分流共用）
-# - 443 由 Nginx SNI stream 分流模块接管，转发到本机 8443
-# - 站点固定 listen 8443 ssl，HTTP(80) 跳转至公网标准 HTTPS 443
-# - 上传上限 20G（兼顾 openList 网盘 / komari 探针等取中间值）
+# - 443 由 Nginx SNI stream 分流模块接管，转发到本机 127.0.0.1:8443
+# - Web 与 sing-box 共用同一 SNI stream 入口；两类上游均接收 PROXY protocol
+# - HTTP(80) 全部 301 跳转标准 HTTPS 443
+# - 上传上限 20G（全局基础默认值，可按站点自行覆盖）
 # - 不含 Cloudflare 真实 IP 段（按需不需要）
 # - HTTPS 安全第一：TLS1.2/1.3 + 现代 cipher + 安全头 + WebSocket
 write_nginx_https_template(){
-  local conf="$1" domain="$2" port="$3"
+  local conf="$1" domain="$2" port="$3" listen80=""
   local cert_path="$ACME_SSL_DIR/$domain"
+  ensure_connection_upgrade_map || return 1
+  valid_port "$port" || { err "上游端口无效"; return 1; }
+  if [ -e /proc/net/if_inet6 ]; then
+    listen80='    listen [::]:80;'
+  fi
   cat > "$conf" <<NGINX
-# ${domain} — HTTPS 反代 (上游 127.0.0.1:${port})
-# 443 由 Nginx SNI 分流模块接管 → stream 转发至 8443
+# ${domain} - HTTPS reverse proxy (upstream 127.0.0.1:${port})
+# Public 443 is handled by Nginx stream and forwarded to local 8443.
 server {
     listen 80;
-    listen [::]:80;
+${listen80}
     server_name ${domain};
-    # 浏览器仍访问公网 443，再由 stream 转发至内部 8443
     return 301 https://\$host\$request_uri;
 }
 server {
-    listen 8443 ssl http2;
-    listen [::]:8443 ssl http2;
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name ${domain};
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
 
     ssl_certificate     ${cert_path}/fullchain.pem;
     ssl_certificate_key ${cert_path}/privkey.pem;
@@ -858,13 +890,15 @@ server {
         proxy_pass http://127.0.0.1:${port};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
+        # real_ip_header proxy_protocol 已恢复客户端地址。
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
-        # 通用上传上限 20G（兼顾 openList 网盘 / komari 探针等）
+        # 通用上传上限 20G（全局基础默认值，可按站点覆盖）
         client_max_body_size 20G;
+        proxy_request_buffering off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -895,9 +929,6 @@ create_nginx_proxy(){
   done
 
   conf="/etc/nginx/sites-available/$name"
-  if [ -e "$conf" ] || [ -L "/etc/nginx/sites-enabled/$name" ] || [ -e "/etc/nginx/sites-enabled/$name" ]; then
-    err "同名站点已存在，拒绝覆盖: $name"; pause; return 1
-  fi
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
   # 检查证书是否已存在：没有证书先申请，再写 HTTPS 模板
@@ -909,28 +940,19 @@ create_nginx_proxy(){
     ok "证书已存在: $domain，直接生成 HTTPS 配置"
   fi
 
-  # 先独立准备全局 WebSocket map，避免与站点恢复事务嵌套
-  ensure_connection_upgrade_map || { err "WebSocket map 配置失败"; pause; return 1; }
-  # 写 HTTPS 模板（固定监听 8443，由 SNI stream 分流 443→8443）
-  recovery_create "$conf" "/etc/nginx/sites-enabled/$name" || return 1
-  if ! write_nginx_https_template "$conf" "$domain" "$port" || ! ln -sf "$conf" "/etc/nginx/sites-enabled/$name"; then
-    rm -f "$conf" "/etc/nginx/sites-enabled/$name"; recovery_restore || true
-    err "站点配置写入失败"; pause; return 1
-  fi
+  recovery_begin "$conf" "/etc/nginx/sites-enabled/$name" || { err "无法创建站点恢复文件"; pause; return 1; }
+  write_nginx_https_template "$conf" "$domain" "$port" || { recovery_restore; pause; return 1; }
+  ln -sfn "$conf" "/etc/nginx/sites-enabled/$name" || { recovery_restore; err "站点链接创建失败"; pause; return 1; }
   if ask_yn "编辑配置？" "n"; then edit_file "$conf"; fi
-
-  if nginx -t 2>/dev/null && systemctl reload nginx && systemctl is-active --quiet nginx; then
-    recovery_commit; state_add nginx_site "$name"
-    LAST_DOMAIN="$domain"; LAST_SITE="$name"; PREV_PORT="$port"
-    ok "HTTPS 反代已创建并加载: $domain → 127.0.0.1:$port"
-  else
-    err "Nginx 测试或重载失败，正在恢复"
+  if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx; then
+    err "Nginx 配置测试或重载失败，恢复站点配置"
     nginx -t 2>&1 | head -5 | sed 's/^/  /'
-    rm -f "$conf" "/etc/nginx/sites-enabled/$name"
-    recovery_restore || true
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    recovery_restore; systemctl reload nginx >/dev/null 2>&1 || true
     pause; return 1
   fi
+  recovery_commit
+  LAST_DOMAIN="$domain"; LAST_SITE="$name"; PREV_PORT="$port"
+  ok "HTTPS 反代已生成并生效: $domain → 127.0.0.1:$port (本机 8443)"
   pause
 }
 
@@ -960,25 +982,21 @@ list_nginx_sites(){
 delete_nginx_site(){
   ui_header "删除 Nginx 站点"
   local sites=() f
-  if [ -n "${1:-}" ]; then SELECTED_ITEM="$1"
-  else
-    for f in /etc/nginx/sites-enabled/*; do [ -L "$f" ] || [ -f "$f" ] || continue; sites+=("$(basename "$f")"); done
-    [ ${#sites[@]} -eq 0 ] && { warn "没有站点"; pause; return 1; }
-    select_from_list "选择要删除的站点" "${sites[@]}" || return 1
-  fi
+  for f in /etc/nginx/sites-enabled/*; do [ -L "$f" ] || [ -f "$f" ] || continue; sites+=("$(basename "$f")"); done
+  [ ${#sites[@]} -eq 0 ] && { warn "没有站点"; pause; return 1; }
+  select_from_list "选择要删除的站点" "${sites[@]}" || return 1
   local name="$SELECTED_ITEM"
   ask_yn "删除站点 $name？" "y" || return 1
-  recovery_create "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name" || return 1
-  rm -f "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name"
-  if nginx -t 2>/dev/null && systemctl reload nginx && systemctl is-active --quiet nginx \
-     && [ ! -e "/etc/nginx/sites-available/$name" ] && [ ! -e "/etc/nginx/sites-enabled/$name" ]; then
-    recovery_commit; state_remove nginx_site "$name"; ok "已删除 $name，Nginx 已重载并验证"
-  else
-    err "删除测试、重载或残留验证失败，正在恢复站点"
-    recovery_restore || true
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+  recovery_begin "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name" || { err "无法创建站点恢复文件"; pause; return 1; }
+  rm -f "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name" || { recovery_restore; err "站点删除失败"; pause; return 1; }
+  if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx; then
+    err "删除后 Nginx 校验或重载失败，恢复站点"
+    nginx -t 2>&1 | head -5 | sed 's/^/  /'
+    recovery_restore; systemctl reload nginx >/dev/null 2>&1 || true
     pause; return 1
   fi
+  recovery_commit
+  ok "已删除 $name，Nginx 已重载"
   pause
 }
 
@@ -988,6 +1006,7 @@ nginx_show_template(){
   local tmp; tmp=$(mktemp)
   # 用临时 conf 生成模板预览（domain/port/上游 用占位值）
   ACME_SSL_DIR="/etc/nginx/ssl"
+  ensure_connection_upgrade_map >/dev/null 2>&1
   write_nginx_https_template "$tmp" "example.com" "5244"
   # 替换占位使其更易读
   sed -i 's#example.com#<你的域名>#g; s#/etc/nginx/ssl/<你的域名>#/etc/nginx/ssl/<域名>#g; s#5244#<上游端口>#g; s#127.0.0.1:<上游端口>#127.0.0.1:<上游端口>#g' "$tmp"
@@ -1014,10 +1033,9 @@ nginx_menu(){
       1) create_nginx_proxy ;; 2) list_nginx_sites ;;
       3) local sites=() f; for f in /etc/nginx/sites-enabled/*; do [ -L "$f" ] || [ -f "$f" ] || continue; sites+=("$(basename "$f")"); done
          select_from_list "选择要编辑的站点" "${sites[@]}" || continue
-         recovery_create "/etc/nginx/sites-available/$SELECTED_ITEM" || continue
          edit_file "/etc/nginx/sites-available/$SELECTED_ITEM"
-         if nginx -t 2>/dev/null && systemctl reload nginx && systemctl is-active --quiet nginx; then recovery_commit; ok "配置已重载并验证"
-         else err "配置或重载失败，正在恢复"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; recovery_restore || true; nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true; fi
+         if nginx -t 2>/dev/null && systemctl reload nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx; then ok "已重载"
+         else err "配置测试或重载失败"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; fi
          pause ;;
       4) delete_nginx_site ;;
       5) nginx -t 2>/dev/null && ok "配置正确" || { err "配置错误"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; }; pause ;;
@@ -1034,7 +1052,9 @@ nginx_menu(){
 
 gen_random_email(){
   # <8位随机>@<公开邮箱域名> —— 公开 TLD，LE 接受
-  local prefix domain=""
+  # 优先用用户已配置的真实邮箱域名（QQ/163/Gmail 等），其次回退主机域名
+  local prefix domain
+  domain=""
   prefix=$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c8)
   [ -z "$prefix" ] && prefix="cert$(date +%s | tail -c3)"
   if [ -n "$ACME_EMAIL_DOMAIN" ]; then : "${domain:=$ACME_EMAIL_DOMAIN}"
@@ -1069,8 +1089,9 @@ acme_set_cf_token(){
 # 导出 CF_Token 环境变量供 acme.sh dns_cf 使用
 acme_export_token(){
   [ -f "$ACME_CF_TOKEN_FILE" ] || return 1
-  export CF_Token
-  CF_Token=$(cat "$ACME_CF_TOKEN_FILE") || return 1
+  local token
+  token=$(cat "$ACME_CF_TOKEN_FILE") || return 1
+  export CF_Token="$token"
   # acme.sh dns_cf 需要 CF_Account_ID 吗？API Token 模式不需要，仅需 CF_Token
 }
 
@@ -1105,8 +1126,7 @@ acme_issue(){
   # 首次签发让用户配置一个真实公开邮箱域名（QQ/163/Gmail），后续复用
   acme_set_email_domain || return 1
   local certdir; certdir=$(acme_cert_dir "$domain")
-  recovery_create "$certdir" || return 1
-  mkdir -p "$certdir" || { recovery_commit; err "证书目录创建失败"; return 1; }
+  mkdir -p "$certdir"
 
   # 账户邮箱: 默认 <8随机>@<已配置公开邮箱域名>，支持手动输入测试
   # acme.sh 首次签发据此注册账户，已有账户则复用
@@ -1122,23 +1142,26 @@ acme_issue(){
   if "$ACME_BIN" --issue -d "$domain" --dns dns_cf --dnssleep 30 -m "$acct_email" --nocron \
        --key-file "$certdir/privkey.pem" \
        --fullchain-file "$certdir/fullchain.pem" \
-       --reloadcmd "nginx -t >/dev/null 2>&1 && systemctl reload nginx || true"; then
-    if [ -s "$certdir/fullchain.pem" ] && [ -s "$certdir/privkey.pem" ] \
-       && openssl x509 -in "$certdir/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1; then
-      recovery_commit; state_add certificate "$domain"
-      ok "证书已签发、安装并验证: $certdir"; CERT_DOMAIN="$domain"
-      if ! acme_cron_active; then
-        "$ACME_BIN" --install-cronjob >/dev/null 2>&1 && acme_cron_active || warn "证书成功，但自动续期任务安装失败"
-      fi
-      return 0
+       --reloadcmd "nginx -t >/dev/null 2>&1 && systemctl reload nginx"; then
+    if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx; then
+      err "证书已安装，但 Nginx reload 失败"
+      return 1
     fi
-    err "证书文件验证失败，正在恢复"
+    ok "证书已签发并安装: $certdir"
+    CERT_DOMAIN="$domain"
+    # 首次签发后确保续期 cron 已安装（若尚未开启）。
+    if ! acme_cron_active; then
+      "$ACME_BIN" --install-cronjob >/dev/null 2>&1 || { err "证书已签发，但续期 cron 安装失败"; return 1; }
+      acme_cron_active || { err "证书已签发，但续期 cron 状态异常"; return 1; }
+    fi
+    return 0
   else
-    err "证书申请失败，正在恢复"
+    err "证书申请失败"
+    # 失败时清理半成品目录，不留残留
+    rm -rf "$certdir" 2>/dev/null
+    CERT_DOMAIN=""
+    pause; return 1
   fi
-  rm -rf "$certdir" 2>/dev/null
-  recovery_restore || true
-  CERT_DOMAIN=""; pause; return 1
 }
 
 # 列出已签发证书（基于安装目录）
@@ -1148,7 +1171,7 @@ acme_list(){
     [ -f "${d}fullchain.pem" ] && certs+=("$(basename "$d")")
   done
   [ ${#certs[@]} -eq 0 ] && { warn "没有证书"; return 1; }
-  printf '%s\n' "${certs[@]}"
+  echo "${certs[*]}"
 }
 
 # 证书详情
@@ -1166,15 +1189,20 @@ acme_show(){
   pause
 }
 
-# 删除证书（acme.sh --remove + 清理安装目录，彻底无残留）
+# 删除证书（acme.sh 记录、安装文件和站点引用均检查）
 acme_remove(){
-  local c="$1"
+  local c="$1" certdir
+  certdir=$(acme_cert_dir "$c") || return 1
   ask_yn "删除证书 $c？" "y" || return 1
-  "$ACME_BIN" --remove -d "$c" >/dev/null 2>&1 || true
-  rm -rf "$(acme_cert_dir "$c")" 2>/dev/null
-  if [ ! -e "$(acme_cert_dir "$c")" ] && ! "$ACME_BIN" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "$c"; then
-    state_remove certificate "$c"; ok "已删除 $c 并通过残留验证"
-  else err "证书文件或 acme.sh 记录仍存在: $c"; return 1; fi
+  if rg -l --fixed-strings "$certdir" /etc/nginx/sites-available /etc/nginx/sites-enabled >/dev/null 2>&1; then
+    err "证书仍被 Nginx 站点引用，请先删除或修改站点"
+    return 1
+  fi
+  [ -x "$ACME_BIN" ] || { err "acme.sh 不可用，未删除证书"; return 1; }
+  "$ACME_BIN" --remove -d "$c" >/dev/null 2>&1 || { err "acme.sh 证书记录删除失败"; return 1; }
+  rm -rf "$certdir" || { err "证书安装目录删除失败"; return 1; }
+  [ ! -e "$certdir" ] || { err "证书安装目录仍存在"; return 1; }
+  ok "已删除 $c"
 }
 
 # 测试续期
@@ -1193,13 +1221,16 @@ acme_toggle_cron(){
   ui_header "自动续期 (acme.sh cron)"
   if acme_cron_active; then
     ok "已开启"
-    if ask_yn "关闭？" "y"; then
-      "$ACME_BIN" --uninstall-cronjob >/dev/null 2>&1 || true
-      if acme_cron_active; then err "关闭后仍检测到续期任务"; else ok "已关闭并验证"; fi
+    if ask_yn "关闭？" "n"; then
+      "$ACME_BIN" --uninstall-cronjob >/dev/null 2>&1 || { err "续期 cron 删除失败"; pause; return 1; }
+      acme_cron_active && { err "续期 cron 删除后仍存在"; pause; return 1; }
+      ok "已关闭"
     fi
   else
     warn "未开启"
-    ask_yn "开启？" "y" && { "$ACME_BIN" --install-cronjob >/dev/null 2>&1 && ok "已开启" || err "安装失败"; }
+    if ask_yn "开启？" "y"; then
+      "$ACME_BIN" --install-cronjob >/dev/null 2>&1 && acme_cron_active && ok "已开启" || err "安装或状态校验失败"
+    fi
   fi
   pause
 }
@@ -1232,11 +1263,13 @@ acme_menu(){
     menu_prompt 7; c="$REPLY"
     case "$c" in
       1) acme_issue "" ;;
-      2) mapfile -t certs < <(acme_list) || { pause; continue; }; select_from_list "选择证书" "${certs[@]}" || continue; acme_show "$SELECTED_ITEM" ;;
-      3) mapfile -t certs < <(acme_list) || { pause; continue; }; select_from_list "选择要删除的证书" "${certs[@]}" || continue; acme_remove "$SELECTED_ITEM"; pause ;;
-      4) mapfile -t certs < <(acme_list) || { pause; continue; }; select_from_list "测试续期" "${certs[@]}" || continue; acme_renew_test "$SELECTED_ITEM"; pause ;;
-      5) mapfile -t certs < <(acme_list) || { pause; continue; }; select_from_list "实际续期" "${certs[@]}" || continue
-         "$ACME_BIN" --renew -d "$SELECTED_ITEM" --dnssleep 30 >/dev/null 2>&1 && ok "续期完成" || err "续期失败"; systemctl reload nginx 2>/dev/null || true; pause ;;
+      2) local -a cert_items; mapfile -t cert_items < <(acme_list) || { pause; continue; }; select_from_list "选择证书" "${cert_items[@]}" || continue; acme_show "$SELECTED_ITEM" ;;
+      3) local -a cert_items; mapfile -t cert_items < <(acme_list) || { pause; continue; }; select_from_list "选择要删除的证书" "${cert_items[@]}" || continue; acme_remove "$SELECTED_ITEM"; pause ;;
+      4) local -a cert_items; mapfile -t cert_items < <(acme_list) || { pause; continue; }; select_from_list "测试续期" "${cert_items[@]}" || continue; sed 's/^/  /' <(acme_renew_test "$SELECTED_ITEM"); pause ;;
+      5) local -a cert_items; mapfile -t cert_items < <(acme_list) || { pause; continue; }; select_from_list "实际续期" "${cert_items[@]}" || continue
+         if "$ACME_BIN" --renew -d "$SELECTED_ITEM" --dnssleep 30 >/dev/null 2>&1; then
+           if nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx; then ok "续期完成，Nginx 已加载新证书"; else err "证书续期完成但 Nginx reload 失败"; fi
+         else err "续期失败"; fi; pause ;;
       6) acme_toggle_cron ;;
       7) acme_reset_account ;;
       0) return ;;
@@ -1249,13 +1282,12 @@ acme_menu(){
 # ─── sing-box 管理 ───────────────────────────────────────
 
 install_singbox(){
-  if cmd_exists sing-box; then ok "sing-box 已安装: $(sing-box version 2>/dev/null | head -1)"; return 0; fi
+  if cmd_exists sing-box; then sing-box version >/dev/null 2>&1 || { err "sing-box 命令不可用"; return 1; }; ok "sing-box 已安装: $(sing-box version 2>/dev/null | head -1)"; return 0; fi
   info "安装 sing-box（官方脚本）..."
   apt-get install -y -qq curl wget openssl ca-certificates || { err "sing-box 依赖安装失败"; return 1; }
-  curl -fsSL https://sing-box.app/install.sh | sh || { err "sing-box 官方安装脚本失败"; return 1; }
-  cmd_exists sing-box && sing-box version >/dev/null 2>&1 || { err "sing-box 安装后验证失败"; return 1; }
-  state_add software sing-box
-  ok "sing-box 安装完成并验证"; sing-box version 2>&1 | head -1
+  curl -fsSL https://sing-box.app/install.sh | sh || { err "sing-box 安装脚本失败"; return 1; }
+  cmd_exists sing-box && sing-box version >/dev/null 2>&1 || { err "sing-box 安装后不可用"; return 1; }
+  ok "sing-box 安装完成"
 }
 
 generate_singbox_config(){
@@ -1322,6 +1354,7 @@ generate_singbox_config(){
       "tag": "vless-reality-in",
       "listen": "${listen_ip}",
       "listen_port": ${sb_port},
+      "proxy_protocol": true,
       "users": [
         { "name": "user1", "uuid": "${uuid}", "flow": "xtls-rprx-vision" }
       ],
@@ -1373,7 +1406,7 @@ EOF
 
 create_singbox_service(){
   local sb_path; sb_path=$(which sing-box 2>/dev/null || echo "/usr/local/bin/sing-box")
-  cat > "$SINGBOX_SERVICE" <<EOF
+  install -m 0644 /dev/stdin "$SINGBOX_SERVICE" <<EOF
 [Unit]
 Description=sing-box service
 After=network-online.target nss-lookup.target
@@ -1389,7 +1422,8 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
+  systemctl daemon-reload || { err "systemd daemon-reload 失败"; return 1; }
+  systemctl cat sing-box >/dev/null 2>&1 || { err "sing-box systemd 服务未创建"; return 1; }
   ok "systemd 服务已创建"
 }
 
@@ -1397,11 +1431,10 @@ setup_singbox(){
   local force_sni="${1:-}"
   ui_header "sing-box 安装（VLESS + Reality + Vision）"
   install_singbox || return 1
-  recovery_create "$SINGBOX_CONF" "$SINGBOX_SECRETS" "$SINGBOX_SERVICE" || return 1
-  generate_singbox_config "$force_sni" || { recovery_restore || true; return 1; }
-  create_singbox_service || { recovery_restore || true; systemctl daemon-reload; return 1; }
-  if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then info "配置语法正确"
-  else err "配置错误，正在恢复"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; recovery_restore || true; systemctl daemon-reload; return 1; fi
+  generate_singbox_config "$force_sni"
+  create_singbox_service
+  if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then ok "配置正确"
+  else err "配置错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; return 1; fi
   
   # 读取配置文件确定是否使用了 Nginx 分流
   local use_sni="y"
@@ -1413,23 +1446,17 @@ setup_singbox(){
     # 防火墙由用户自行管理，脚本只提示需要开放端口。
     info "请自行在防火墙中开放 TCP ${SINGBOX_PORT} 端口"
   else
-    # 分流模式：确保 Nginx 正在运行
-    if ! systemctl is-active --quiet nginx; then 
-      warn "检测到选择了 Nginx 分流模式，但 Nginx 未运行，尝试启动..."
-      systemctl start nginx 2>/dev/null || true
-    fi
+    info "分流模式需要 Nginx 运行，后续将检查并启动。"
   fi
 
-  if systemctl enable --now sing-box && systemctl is-active --quiet sing-box \
-     && ss -H -ltn "sport = :${SINGBOX_PORT}" 2>/dev/null | grep -q .; then
-    recovery_commit; state_add singbox config
-    ok "sing-box 已启动，服务和监听端口验证通过"
-  else
-    err "sing-box 启动或监听验证失败，正在恢复旧配置"
-    systemctl stop sing-box 2>/dev/null || true; recovery_restore || true; systemctl daemon-reload
-    [ -f "$SINGBOX_CONF" ] && systemctl restart sing-box 2>/dev/null || true
-    return 1
+  if [ "$use_sni" = "y" ] && ! systemctl is-active --quiet nginx; then
+    systemctl start nginx >/dev/null 2>&1 || { err "Nginx 启动失败，未启动 sing-box"; return 1; }
+    systemctl is-active --quiet nginx || { err "Nginx 启动后状态异常"; return 1; }
   fi
+  systemctl enable --now sing-box >/dev/null 2>&1 || { err "sing-box 启动失败"; return 1; }
+  systemctl is-active --quiet sing-box || { err "sing-box 启动后状态异常"; return 1; }
+  systemctl is-enabled --quiet sing-box || { err "sing-box 开机自启状态校验失败"; return 1; }
+  ok "sing-box 已启动"
   if [ "$use_sni" = "y" ]; then
     info "模式: Nginx SNI 共用 443 分流模式 (内部监听 ${SINGBOX_PORT})"
   else
@@ -1469,14 +1496,13 @@ singbox_logs(){
 }
 
 singbox_edit(){
-  recovery_create "$SINGBOX_CONF" || return 1
   edit_file "$SINGBOX_CONF"
   if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then
+    ok "语法正确"
     if ask_yn "重启？" "y"; then
-      if systemctl restart sing-box && systemctl is-active --quiet sing-box && ss -H -ltn "sport = :${SINGBOX_PORT}" 2>/dev/null | grep -q .; then recovery_commit; ok "已重启并验证"
-      else err "重启或监听验证失败，正在恢复"; recovery_restore || true; systemctl restart sing-box 2>/dev/null || true; fi
-    else recovery_commit; warn "配置语法正确但尚未应用"; fi
-  else err "语法错误，正在恢复"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; recovery_restore || true; fi
+      systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box && ok "已重启" || err "重启失败或服务未运行"
+    fi
+  else err "语法错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; fi
   pause
 }
 
@@ -1648,23 +1674,23 @@ PYEOF
   pause
 }
 
-singbox_restart(){ systemctl restart sing-box && systemctl is-active --quiet sing-box && ss -H -ltn "sport = :${SINGBOX_PORT}" 2>/dev/null | grep -q . && ok "已重启并验证" || err "重启或监听验证失败"; pause; }
+singbox_restart(){ systemctl restart sing-box && ok "已重启" || err "重启失败"; pause; }
 
 singbox_delete(){
   ask_yn "确定卸载 sing-box？" "y" || return 0
-  local remove_binary="n"; state_owns software sing-box && remove_binary="y"
-  systemctl disable --now sing-box 2>/dev/null || true
-  rm -f "$SINGBOX_SERVICE"; systemctl daemon-reload
-  rm -rf /etc/sing-box; rm -f "$SINGBOX_SECRETS" /root/sing-box-config-*.json /root/singbox-secrets-*.txt
-  if [ "$remove_binary" = "y" ]; then
-    if dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'ok installed'; then apt-get purge -y sing-box >/dev/null 2>&1 || true; fi
-    rm -f /usr/local/bin/sing-box /usr/bin/sing-box
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    systemctl stop sing-box >/dev/null 2>&1 || { err "sing-box 停止失败，未卸载"; pause; return 1; }
+    systemctl is-active --quiet sing-box && { err "sing-box 停止后仍在运行"; pause; return 1; }
   fi
-  if [ ! -e "$SINGBOX_SERVICE" ] && [ ! -e /etc/sing-box ] && [ ! -e "$SINGBOX_SECRETS" ] \
-     && { [ "$remove_binary" = "n" ] || ! cmd_exists sing-box; }; then
-    state_remove singbox config; [ "$remove_binary" = "y" ] && state_remove software sing-box
-    [ "$remove_binary" = "y" ] && ok "本工具安装的 sing-box 与配置已清除并验证" || ok "本工具配置已清除；预装 sing-box 二进制已保留"
-  else err "sing-box 清理后仍有残留"; return 1; fi
+  systemctl disable sing-box >/dev/null 2>&1 || { systemctl is-enabled --quiet sing-box && { err "sing-box 禁用失败"; pause; return 1; }; }
+  rm -f "$SINGBOX_SERVICE" /root/sing-box-config-*.json /root/singbox-secrets-*.txt /usr/local/bin/sing-box /usr/bin/sing-box || { err "sing-box 文件清理失败"; pause; return 1; }
+  rm -rf /etc/sing-box || { err "sing-box 配置目录清理失败"; pause; return 1; }
+  rm -f "$SINGBOX_SECRETS" || { err "sing-box 密钥文件清理失败"; pause; return 1; }
+  systemctl daemon-reload || { err "systemd daemon-reload 失败"; pause; return 1; }
+  if cmd_exists sing-box || [ -e "$SINGBOX_SERVICE" ] || [ -e "$SINGBOX_CONF" ]; then
+    err "sing-box 卸载后仍有文件或命令残留"; pause; return 1
+  fi
+  ok "sing-box 二进制文件、配置、密钥、服务已清除"
   pause
 }
 
@@ -1695,9 +1721,8 @@ singbox_menu(){
 
 # 检测并加载 stream 模块（绝不创建额外的 conf 文件，避免重复加载）
 ensure_stream_module(){
-  # 不删除现有 modules-enabled 文件；它可能由发行版或管理员维护
-
   # 检查 nginx.conf 是否已手动 load_module stream
+
   if grep -q 'ngx_stream_module' /etc/nginx/nginx.conf 2>/dev/null; then
     return 0
   fi
@@ -1716,8 +1741,8 @@ ensure_stream_module(){
 
   if [ -z "$mod_so" ]; then
     info "安装 nginx-full 和 libnginx-mod-stream 模块..."
-    apt-get update -qq 2>/dev/null
-    apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || true
+    apt-get update -qq 2>/dev/null || return 1
+    apt-get install -y -qq nginx-full libnginx-mod-stream 2>/dev/null || apt-get install -y -qq nginx-extras 2>/dev/null || return 1
   fi
 
   # 重新找一次 .so 文件
@@ -1726,15 +1751,18 @@ ensure_stream_module(){
     [ -f "$p" ] && mod_so="$p" && break
   done
 
-  # 如果存在模块动态链接库，直接强行在 nginx.conf 的首行插入 load_module 声明
+  # 如果存在模块动态链接库，使用唯一恢复文件事务插入 load_module。
   if [ -n "$mod_so" ]; then
-    local ng_conf="/etc/nginx/nginx.conf"
+    local ng_conf="/etc/nginx/nginx.conf" tmp
     if ! grep -q 'ngx_stream_module.so' "$ng_conf" 2>/dev/null; then
-      recovery_create "$ng_conf" || return 1
-      (printf 'load_module %s;\n' "$mod_so"; cat "$ng_conf") > "${ng_conf}.tmp" || { recovery_restore || true; return 1; }
-      mv -f "${ng_conf}.tmp" "$ng_conf"
-      if nginx -t >/dev/null 2>&1; then recovery_commit; state_add nginx_module "$mod_so"; ok "已在 nginx.conf 顶部显式加载 stream 模块并验证"
-      else err "stream 模块加载验证失败，正在恢复"; recovery_restore || true; return 1; fi
+      recovery_begin "$ng_conf" || return 1
+      tmp=$(mktemp) || { recovery_restore; return 1; }
+      { printf 'load_module %s;\n' "$mod_so"; cat "$ng_conf"; } > "$tmp" || { rm -f "$tmp"; recovery_restore; return 1; }
+      install -m 0644 "$tmp" "$ng_conf" || { rm -f "$tmp"; recovery_restore; return 1; }
+      rm -f "$tmp"
+      nginx -t >/dev/null 2>&1 || { err "stream 模块配置测试失败"; recovery_restore; return 1; }
+      recovery_commit
+      ok "已在 nginx.conf 顶部显式加载 stream 模块"
     fi
     return 0
   fi
@@ -1751,109 +1779,80 @@ ensure_stream_module(){
 
 setup_sni_split(){
   ui_header "SNI 分流配置"
-  if ! ensure_stream_module; then
-    err "stream 模块不可用，无法配置 SNI 分流"
-    pause; return 1
-  fi
-  local ng_conf="/etc/nginx/nginx.conf"
-
-  local web_domains
-  web_domains=$(grep -E '^[[:space:]]*server_name' /etc/nginx/sites-enabled/* 2>/dev/null \
-    | sed 's/.*server_name\s*//;s/;.*//' | awk '{print $1}' | grep -v '^_$' | sort -u | tr '\n' ' ' | xargs)
-
+  ensure_stream_module || { err "stream 模块不可用，无法配置 SNI 分流"; pause; return 1; }
+  local ng_conf="/etc/nginx/nginx.conf" stream_conf="/etc/nginx/stream.conf" web_domains extra_domains domain listen_v6=""
+  [ -e /proc/net/if_inet6 ] && listen_v6='        listen [::]:443;'
+  web_domains=$(grep -E '^[[:space:]]*server_name' /etc/nginx/sites-enabled/* 2>/dev/null | sed 's/.*server_name[[:space:]]*//;s/;.*//' | awk '{print $1}' | grep -v '^_$' | sort -u | tr '\n' ' ' | xargs)
   echo
   if [ -n "$web_domains" ]; then
     info "自动扫描到反代域名: ${web_domains}"
-    info "（扫描出的域名会自动加入分流，无需重复输入）"
     read -rp "  补充其他域名（空格分隔，无则回车跳过）: " extra_domains
-    if [ -n "$extra_domains" ]; then
-      web_domains=$(echo "$web_domains $extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
-    fi
+    [ -n "$extra_domains" ] && web_domains=$(printf '%s %s\n' "$web_domains" "$extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
   else
-    read -rp "  输入 Web 域名（空格分隔，如 a.xxx.com b.xxx.com）: " extra_domains
-    web_domains=$(echo "$extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+    read -rp "  输入 Web 域名（空格分隔）: " extra_domains
+    web_domains=$(printf '%s\n' "$extra_domains" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
   fi
-
-  local https_port="8443"
-  echo
-  info "Web 端口: ${https_port}（固定）  |  sing-box: ${SINGBOX_PORT}"
-
-  recovery_create "$ng_conf" /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf || return 1
-  sed -i '/^stream {/,/^}/d' "$ng_conf"
-  if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null; then
-    echo "include /etc/nginx/stream.conf;" >> "$ng_conf"
-  fi
-
-  cat > /etc/nginx/stream.conf <<SNIEOF
+  [ -n "$web_domains" ] || { err "至少需要一个 Web 域名，已取消"; pause; return 1; }
+  for domain in $web_domains; do valid_domain "$domain" || { err "Web 域名无效: $domain"; pause; return 1; }; done
+  valid_port "$SINGBOX_PORT" || { err "sing-box 端口无效"; pause; return 1; }
+  recovery_begin "$ng_conf" "$stream_conf" || { err "无法创建 SNI 恢复文件"; pause; return 1; }
+  local tmp_ng tmp_stream
+  tmp_ng=$(mktemp) && tmp_stream=$(mktemp) || { rm -f "$tmp_ng" "$tmp_stream"; recovery_restore; pause; return 1; }
+  sed '/^[[:space:]]*include \/etc\/nginx\/stream\.conf;/d' "$ng_conf" > "$tmp_ng" || { rm -f "$tmp_ng" "$tmp_stream"; recovery_restore; return 1; }
+  printf '\ninclude /etc/nginx/stream.conf;\n' >> "$tmp_ng"
+  cat > "$tmp_stream" <<SNIEOF
 stream {
     map \$ssl_preread_server_name \$upstream {
 SNIEOF
-  for domain in $web_domains; do
-    [ -z "$domain" ] && continue
-    echo "        $domain    web;" >> /etc/nginx/stream.conf
-  done
-  cat >> /etc/nginx/stream.conf <<SNIEOF
+  for domain in $web_domains; do printf '        %s    web;\n' "$domain" >> "$tmp_stream"; done
+  cat >> "$tmp_stream" <<SNIEOF
         default         singbox;
     }
     upstream web {
-        server 127.0.0.1:${https_port};
+        server 127.0.0.1:8443;
     }
     upstream singbox {
         server 127.0.0.1:${SINGBOX_PORT};
     }
     server {
         listen 443;
-        listen [::]:443;
+${listen_v6}
         ssl_preread on;
+        proxy_protocol on;
         proxy_pass \$upstream;
     }
 }
 SNIEOF
-
-  if nginx -t 2>/dev/null; then
-    systemctl stop sing-box 2>/dev/null || true
-    if systemctl restart nginx && systemctl is-active --quiet nginx \
-       && ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .; then
-      systemctl start sing-box 2>/dev/null || true
-      recovery_commit; state_add sni /etc/nginx/stream.conf
-      ok "SNI 分流已写入、重启并验证"
-      info "443 → ${https_port}(Web) + ${SINGBOX_PORT}(sing-box)"
-      info "Web 域名: $web_domains"
-    else
-      err "Nginx 重启或 443 监听验证失败，正在恢复"
-      recovery_restore || true; systemctl restart nginx 2>/dev/null || true; systemctl start sing-box 2>/dev/null || true
-      pause; return 1
-    fi
-  else
-    err "nginx -t 失败，正在恢复原 SNI 配置"
-    nginx -t 2>&1 | head -5 | sed 's/^/  /'
-    recovery_restore || true; nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
-    pause; return 1
+  install -m 0644 "$tmp_ng" "$ng_conf" && install -m 0644 "$tmp_stream" "$stream_conf" || { rm -f "$tmp_ng" "$tmp_stream"; recovery_restore; err "SNI 配置写入失败"; pause; return 1; }
+  rm -f "$tmp_ng" "$tmp_stream"
+  nginx -t >/dev/null 2>&1 || { err "nginx -t 失败，恢复 SNI 配置"; nginx -t 2>&1 | head -5 | sed 's/^/  /'; recovery_restore; pause; return 1; }
+  if ! systemctl reload nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx; then
+    err "Nginx reload 失败，恢复 SNI 配置"; recovery_restore; systemctl reload nginx >/dev/null 2>&1 || true; pause; return 1
   fi
+  recovery_commit
+  ok "SNI 分流已配置：443 → 8443(Web) + ${SINGBOX_PORT}(sing-box)"
+  ok "Web 域名: ${web_domains}"
   pause
 }
 
 # SNI 分流 — 删除（彻底清理，无残留）
 sni_remove(){
   ui_header "删除 SNI 分流"
-  local ng_conf="/etc/nginx/nginx.conf"
-  if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null && [ ! -f /etc/nginx/stream.conf ]; then
+  local ng_conf="/etc/nginx/nginx.conf" stream_conf="/etc/nginx/stream.conf"
+  if ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null && [ ! -f "$stream_conf" ]; then
     warn "未配置 SNI 分流"; pause; return 0
   fi
   ask_yn "删除 SNI 分流配置？" "y" || return 0
-  recovery_create "$ng_conf" /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf || return 1
-  sed -i '/include \/etc\/nginx\/stream.conf;/d' "$ng_conf"
-  sed -i '/include \/etc\/nginx\/conf.d\/stream.conf;/d' "$ng_conf"
-  rm -f /etc/nginx/stream.conf /etc/nginx/conf.d/stream.conf
-  if nginx -t 2>/dev/null && systemctl reload nginx && systemctl is-active --quiet nginx \
-     && ! grep -q 'stream.conf' "$ng_conf" 2>/dev/null \
-     && [ ! -e /etc/nginx/stream.conf ] && [ ! -e /etc/nginx/conf.d/stream.conf ]; then
-    recovery_commit; state_remove sni /etc/nginx/stream.conf; ok "已删除 SNI 分流并通过残留验证"
-  else
-    err "SNI 删除测试、重载或残留验证失败，正在恢复"
-    recovery_restore || true; nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
-    pause; return 1
+  recovery_begin "$ng_conf" "$stream_conf" /etc/nginx/conf.d/stream.conf || { err "无法创建恢复文件"; pause; return 1; }
+  local tmp_ng
+  tmp_ng=$(mktemp) || { recovery_restore; pause; return 1; }
+  sed -e '/include \/etc\/nginx\/stream\.conf;/d' -e '/include \/etc\/nginx\/conf\.d\/stream\.conf;/d' "$ng_conf" > "$tmp_ng" || { rm -f "$tmp_ng"; recovery_restore; pause; return 1; }
+  install -m 0644 "$tmp_ng" "$ng_conf" && rm -f "$tmp_ng" "$stream_conf" /etc/nginx/conf.d/stream.conf || { rm -f "$tmp_ng"; recovery_restore; err "SNI 配置删除失败"; pause; return 1; }
+  if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx; then
+    err "删除后 Nginx 校验或重载失败，恢复配置"; recovery_restore; systemctl reload nginx >/dev/null 2>&1 || true; pause; return 1
   fi
+  recovery_commit
+  ok "SNI 分流已删除，Nginx 已重载"
   pause
 }
 
@@ -1907,9 +1906,8 @@ sni_menu(){
       2) sni_status ;;
       3) sni_remove ;;
       4) if [ -f /etc/nginx/stream.conf ]; then
-           recovery_create /etc/nginx/stream.conf || continue; edit_file /etc/nginx/stream.conf
-           if nginx -t 2>/dev/null && systemctl reload nginx && systemctl is-active --quiet nginx; then recovery_commit; ok "分流配置已加载并验证"
-           else err "配置或重载失败，正在恢复"; recovery_restore || true; nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true; fi; pause
+           edit_file /etc/nginx/stream.conf
+           if nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx; then ok "stream 配置已重载"; else err "stream 配置测试或重载失败"; fi
          else warn "未配置分流"; pause; fi ;;
       0) return ;;
       *) warn "请输入 0-4"; pause ;;
@@ -1924,17 +1922,24 @@ install_all(){
   local i_dp="" i_port="" i_site="" i_dom="" i_cert="未申请" i_sb="未安装"
 
   ui_header "[1/6] 基础环境"
-  install_docker || return 1; install_nginx || return 1; install_acme || return 1
-  ok "基础环境完成并验证"
+  install_docker || return 1
+  install_nginx || return 1
+  install_acme || return 1
+  ok "基础环境完成"
 
   ui_header "[2/6] sing-box"
   if cmd_exists sing-box; then ok "已安装"; i_sb="已安装"
-  elif ask_yn "安装 sing-box？" "y"; then setup_singbox "force_sni" || { err "一键安装中止：sing-box 失败"; return 1; }; i_sb="已安装"; fi
+  elif ask_yn "安装 sing-box？" "y"; then
+    setup_singbox "force_sni" || { err "sing-box 配置失败，一键安装中止"; return 1; }
+    i_sb="已安装"
+  fi
 
   ui_header "[3/6] SNI 分流"
   if cmd_exists sing-box; then
     if [ -f /etc/nginx/stream.conf ] && grep -Fq 'include /etc/nginx/stream.conf;' /etc/nginx/nginx.conf 2>/dev/null; then ok "已配置"
-    elif ask_yn "配置 SNI 分流？" "y"; then setup_sni_split || { err "一键安装中止：SNI 分流失败"; return 1; }; fi
+    elif ask_yn "配置 SNI 分流？" "y"; then
+      setup_sni_split || { err "SNI 分流配置失败，一键安装中止"; return 1; }
+    fi
   else warn "sing-box 未安装，跳过"; fi
 
   ui_header "[4/6] 日志与维护"
@@ -1945,23 +1950,25 @@ install_all(){
     ok "Docker 日志轮转已存在，跳过重复配置"
   fi
   if has_auto_cleanup; then
+    cleanup_units_active || { err "已有定时维护但状态异常"; return 1; }
     ok "定时维护已存在，跳过重复配置"
-  elif ask_yn "设置定时清理？" "y"; then setup_auto_cleanup || { err "一键安装中止：定时维护失败"; return 1; }; fi
+  elif ask_yn "设置定时清理？" "y"; then setup_auto_cleanup || return 1; fi
 
   ui_header "[5/6] Docker 服务"
   if ask_yn "创建 Docker 项目？" "y"; then
-    create_docker_project || { warn "未创建项目"; PREV_DIR=""; }
-    i_dp="${PREV_NAME:-}"; i_port="${PREV_PORT:-}"
+    create_docker_project || { warn "项目创建已取消或失败"; return 1; }
+    i_dp="$PREV_NAME"; i_port="$PREV_PORT"
     if [ -n "$PREV_DIR" ] && ask_yn "启动项目？" "y"; then
-      compose_up_checked "$PREV_DIR/docker-compose.yml" "$(basename "$PREV_DIR")" || { err "一键安装中止：项目启动失败"; return 1; }
+      docker compose -f "$PREV_FILE" up -d || { err "项目启动失败"; return 1; }
+      ok "项目已启动"
     fi
   fi
 
   ui_header "[6/6] 反代 + 证书"
   if ask_yn "创建 Nginx 反代？" "y"; then
-    create_nginx_proxy "${PREV_NAME:-}" "${PREV_PORT:-}" || { err "一键安装中止：反代或证书创建失败"; return 1; }
-    i_site="${LAST_SITE:-}"; i_dom="${LAST_DOMAIN:-}"
-    [ -n "${CERT_DOMAIN:-}" ] && i_cert="$CERT_DOMAIN"
+    create_nginx_proxy "${PREV_NAME:-}" "${PREV_PORT:-}" || { err "反代创建失败"; return 1; }
+    i_site="$LAST_SITE"; i_dom="$LAST_DOMAIN"
+    [ -n "$CERT_DOMAIN" ] && i_cert="$CERT_DOMAIN"
   fi
 
   ui_header "安装摘要"
@@ -1972,6 +1979,10 @@ install_all(){
   echo "  Nginx 站点: ${i_site:-未创建}"
   echo "  域名:       ${i_dom:-─}"
   echo "  证书:       ${i_cert:-未申请}"
+  if ! docker_ready || ! systemctl is-active --quiet nginx || { [ "$i_sb" = "已安装" ] && ! systemctl is-active --quiet sing-box; }; then
+    err "安装摘要状态检查失败，不能报告安装完成"
+    pause; return 1
+  fi
   ok "一键安装完成"
   pause
 }
@@ -1979,32 +1990,87 @@ install_all(){
 # ─── 一键删除 ────────────────────────────────────────────
 
 delete_all_data(){
-  ui_header "一键删除（仅本工具已登记资源）"
-  local item deleted=0
-  info "未登记的系统资源不会被一键删除；可在对应菜单单独管理。"
-  while IFS= read -r item; do
-    [ -n "$item" ] || continue
-    if ask_yn "删除本工具项目 $(basename "$item")？" "y"; then
-      delete_project_config "$item" && deleted=1 || warn "项目删除未完成: $item"
+  ui_header "一键删除"
+  local deleted=0 item name dir file
+
+  if ask_yn "删除 Docker 项目？" "y"; then
+    local -a files items
+    mapfile -t files < <(collect_compose_files)
+    if [ ${#files[@]} -eq 0 ]; then warn "没有 Docker 项目"; else
+      for file in "${files[@]}"; do items+=("$file"); done
+      if select_from_list "选择要删除的 Compose 文件" "${items[@]}"; then
+        file="$SELECTED_ITEM"; dir=$(dirname "$file"); name=$(basename "$dir")
+        if ask_yn "同时删除容器和卷？" "y"; then
+          docker compose -f "$file" down -v || { err "容器或卷删除失败，未删除项目目录"; pause; return 1; }
+        else
+          docker compose -f "$file" down || { err "容器删除失败，未删除项目目录"; pause; return 1; }
+        fi
+        rm -rf -- "$dir" && [ ! -e "$dir" ] && { ok "$name 已删除"; deleted=1; } || { err "$name 目录删除失败"; pause; return 1; }
+      fi
     fi
-  done < <(state_list compose)
-  while IFS= read -r item; do
-    [ -n "$item" ] || continue
-    if ask_yn "删除本工具 Nginx 站点 $item？" "y"; then
-      delete_nginx_site "$item" && deleted=1
+  fi
+
+  if ask_yn "删除 Nginx 站点？" "y"; then
+    local -a sites
+    local f conf
+    for f in /etc/nginx/sites-enabled/*; do
+      [ -L "$f" ] || [ -f "$f" ] || continue
+      conf=$(readlink -f "$f" 2>/dev/null || echo "$f")
+      sites+=("$(basename "$f")")
+    done
+    if [ ${#sites[@]} -eq 0 ]; then warn "没有站点"; elif select_from_list "选择站点" "${sites[@]}"; then
+      name="$SELECTED_ITEM"
+      if ask_yn "删除站点 $name？" "y"; then
+        recovery_begin "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/$name" || { err "无法创建恢复文件"; pause; return 1; }
+        rm -f "/etc/nginx/sites-enabled/$name" "/etc/nginx/sites-available/$name" || { recovery_restore; err "站点删除失败"; pause; return 1; }
+        if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx >/dev/null 2>&1 || ! systemctl is-active --quiet nginx; then
+          err "站点删除后 Nginx 校验失败，恢复站点"; recovery_restore; systemctl reload nginx >/dev/null 2>&1 || true; pause; return 1
+        fi
+        recovery_commit; ok "站点 $name 已删除"; deleted=1
+      fi
     fi
-  done < <(state_list nginx_site)
-  while IFS= read -r item; do
-    [ -n "$item" ] || continue
-    ask_yn "删除本工具证书 $item？" "y" && acme_remove "$item" && deleted=1
-  done < <(state_list certificate)
-  if state_owns sni /etc/nginx/stream.conf && ask_yn "删除本工具 SNI 分流？" "y"; then sni_remove && deleted=1; fi
-  if state_owns singbox config && ask_yn "卸载本工具 sing-box？" "y"; then singbox_delete && deleted=1; fi
-  if state_owns cron docker-cleanup && ask_yn "删除本工具定时清理？" "y"; then remove_cleanup_cron && state_remove cron docker-cleanup && deleted=1; fi
-  if [ -f "$ACME_CF_TOKEN_FILE" ] && ask_yn "删除本工具 CF Token？" "y"; then rm -f "$ACME_CF_TOKEN_FILE" && [ ! -e "$ACME_CF_TOKEN_FILE" ] && { ok "CF Token 已删除"; deleted=1; } || err "CF Token 删除失败"; fi
-  ask_yn "彻底卸载本工具安装的 acme.sh？" "y" && state_owns software acme.sh && { "$ACME_BIN" --uninstall-cronjob >/dev/null 2>&1 || true; rm -rf "$ACME_HOME"; ! [ -e "$ACME_HOME" ] && { state_remove software acme.sh; ok "acme.sh 已删除"; deleted=1; } || err "acme.sh 删除失败"; }
-  unset CF_Token 2>/dev/null
-  [ "$deleted" -eq 0 ] && warn "没有已删除的本工具资源" || ok "已完成已选资源的删除与验证"
+  fi
+
+  if ask_yn "删除证书？" "y"; then
+    local -a certs=() cert
+    for cert in "$ACME_SSL_DIR"/*/; do [ -f "${cert}fullchain.pem" ] && certs+=("$(basename "$cert")"); done
+    if [ ${#certs[@]} -eq 0 ]; then warn "没有证书"; elif select_from_list "选择证书" "${certs[@]}"; then
+      acme_remove "$SELECTED_ITEM" && deleted=1
+    fi
+  fi
+
+  if ask_yn "删除 CF Token？" "y"; then
+    if [ -f "$ACME_CF_TOKEN_FILE" ]; then rm -f "$ACME_CF_TOKEN_FILE" && [ ! -e "$ACME_CF_TOKEN_FILE" ] && { ok "CF Token 已删除"; deleted=1; } || err "CF Token 删除失败"; else warn "无 CF Token"; fi
+  fi
+
+  if ask_yn "卸载 sing-box？" "y"; then
+    singbox_delete >/dev/null || { err "sing-box 卸载失败"; pause; return 1; }
+    deleted=1
+  fi
+
+  if ask_yn "清除 SNI 分流配置？" "y"; then
+    if grep -q 'stream.conf' /etc/nginx/nginx.conf 2>/dev/null || [ -f /etc/nginx/stream.conf ]; then
+      sni_remove >/dev/null || { err "SNI 分流清除失败"; pause; return 1; }
+      deleted=1
+    else warn "无 SNI 配置"; fi
+  fi
+
+  if ask_yn "清理定时维护、旧版清理残留和工具状态？" "y"; then
+    remove_cleanup_timer || { err "systemd timer 清理失败"; pause; return 1; }
+    remove_legacy_cleanup || { err "旧版清理残留删除失败"; pause; return 1; }
+    rm -f /etc/docker/daemon.json.bak /etc/nginx/nginx.conf.bak "${CONF_DIR}/config.bak"
+    rm -f "$CONF_FILE" && rmdir "$CONF_DIR" 2>/dev/null || true
+    rm -f "$RECOVERY_FILE"
+    unset CF_Token
+    ok "工具状态和旧版残留已清理"
+  fi
+
+  if ask_yn "彻底卸载 acme.sh（含账户、证书安装目录和续期 cron）？" "y"; then
+    [ -x "$ACME_BIN" ] && "$ACME_BIN" --uninstall-cronjob >/dev/null 2>&1 || true
+    rm -rf "$ACME_HOME" "$ACME_SSL_DIR"
+    if [ -e "$ACME_HOME" ] || [ -e "$ACME_SSL_DIR" ]; then err "acme.sh 清理未完成"; else ok "acme.sh 已卸载"; fi
+  fi
+  [ "$deleted" -eq 0 ] && warn "本次没有删除业务对象" || ok "删除流程完成"
   pause
 }
 
@@ -2159,12 +2225,9 @@ HELP
 
 main(){
   need_root
-  acquire_lock
   case "${1:-}" in --help|-h|help) dispatch_cli "$1"; exit 0 ;; esac
   detect_os
-  load_state
-  : "${LAST_BASE:=$DEFAULT_BASE}"
-  : "${SINGBOX_PORT:=$SINGBOX_DEFAULT_PORT}"
+  load_conf
   dispatch_cli "$@"
   local ret=$?
   [ "$ret" -ne 99 ] && exit $ret
