@@ -34,6 +34,7 @@ state_save(){
 	[ -n "${TOOL_OLD_QDISC:-}" ] && printf 'TOOL_OLD_QDISC=%q\n' "$TOOL_OLD_QDISC" >> "$tmp"
 	[ -n "${TOOL_OLD_SWAPPINESS:-}" ] && printf 'TOOL_OLD_SWAPPINESS=%q\n' "$TOOL_OLD_SWAPPINESS" >> "$tmp"
 	[ -n "${TOOL_JOURNALD_LIMIT:-}" ] && printf 'TOOL_JOURNALD_LIMIT=%q\n' "$TOOL_JOURNALD_LIMIT" >> "$tmp"
+	[ -n "${TOOL_JOURNALD_LIMIT_VALUE:-}" ] && printf 'TOOL_JOURNALD_LIMIT_VALUE=%q\n' "$TOOL_JOURNALD_LIMIT_VALUE" >> "$tmp"
 	mv -f "$tmp" "$STATE_FILE"
 }
 state_set_bbr(){ TOOL_SYSCTL_BBR=1; state_save; }
@@ -49,47 +50,52 @@ SWAP_SYSCTL_FILE="$SYSCTL_DIR/99-vps-mgmt-swap.conf"
 # journald 使用独立 drop-in，避免覆盖用户原有配置
 JOURNALD_DIR="/etc/systemd/journald.conf.d"
 JOURNALD_LIMIT_FILE="$JOURNALD_DIR/99-vps-mgmt-limit.conf"
-journald_effective_ok(){
-	local cfg system_value runtime_value
+journald_effective_value(){
+	local key="$1" cfg value
 	has_cmd systemd-analyze || return 1
 	cfg=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null) || return 1
-	system_value=$(printf '%s\n' "$cfg" | awk '
-		/^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-		/^[[:space:]]*SystemMaxUse[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,"",$0); v=$0}
+	value=$(printf '%s\n' "$cfg" | awk -v key="$key" '
+		$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {sub(/^[^=]*=[[:space:]]*/,"",$0); v=$0}
 		END {gsub(/[[:space:]]/,"",v); print v}')
-	runtime_value=$(printf '%s\n' "$cfg" | awk '
-		/^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-		/^[[:space:]]*RuntimeMaxUse[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,"",$0); v=$0}
-		END {gsub(/[[:space:]]/,"",v); print v}')
-	[ "$system_value" = "100M" ] && [ "$runtime_value" = "100M" ]
+	[ -n "$value" ] && printf '%s\n' "$value"
+}
+journald_status(){
+	local value
+	if [ ! -e "$JOURNALD_LIMIT_FILE" ]; then
+		echo -e "${X}未设置${N}"
+		return
+	fi
+	value=$(journald_effective_value SystemMaxUse 2>/dev/null || true)
+	if [ -n "$value" ]; then
+		echo -e "${G}已设置${N} (SystemMaxUse=$value)"
+	else
+		echo -e "${R}配置异常${N}"
+	fi
+}
+journald_effective_ok(){
+	local expected="$1" system_value runtime_value
+	system_value=$(journald_effective_value SystemMaxUse 2>/dev/null) || return 1
+	runtime_value=$(journald_effective_value RuntimeMaxUse 2>/dev/null) || return 1
+	[ "$system_value" = "$expected" ] && [ "$runtime_value" = "$expected" ]
 }
 configure_journald_limit(){
+	local limit="$1" tmp
+	limit=$(printf '%s' "$limit" | tr '[:lower:]' '[:upper:]')
+	[[ "$limit" =~ ^[1-9][0-9]{0,5}[KMGT]$ ]] || return 1
 	mkdir -p "$JOURNALD_DIR" || return 1
-	local tmp
 	tmp=$(mktemp "${JOURNALD_LIMIT_FILE}.XXXXXX") || return 1
-	if ! cat > "$tmp" <<'EOF'
-[Journal]
-SystemMaxUse=100M
-RuntimeMaxUse=100M
-EOF
-	then
-		rm -f "$tmp"
-		return 1
-	fi
-	chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
-	mv -f "$tmp" "$JOURNALD_LIMIT_FILE" || { rm -f "$tmp"; return 1; }
-	grep -qFx 'SystemMaxUse=100M' "$JOURNALD_LIMIT_FILE" || return 1
-	grep -qFx 'RuntimeMaxUse=100M' "$JOURNALD_LIMIT_FILE" || return 1
-
+	printf '[Journal]\nSystemMaxUse=%s\nRuntimeMaxUse=%s\n' "$limit" "$limit" > "$tmp" || { rm -f "$tmp"; return 1; }
+	chmod 0644 "$tmp" && mv -f "$tmp" "$JOURNALD_LIMIT_FILE" || { rm -f "$tmp"; return 1; }
+	grep -qFx "SystemMaxUse=$limit" "$JOURNALD_LIMIT_FILE" || return 1
+	grep -qFx "RuntimeMaxUse=$limit" "$JOURNALD_LIMIT_FILE" || return 1
 	if ! systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald.log 2>&1; then
 		systemctl restart systemd-journald >/tmp/vps-mgmt-journald.log 2>&1 || return 1
 	fi
 	systemctl is-active --quiet systemd-journald || return 1
-	journald_effective_ok || return 1
-
+	journald_effective_ok "$limit" || return 1
 	TOOL_JOURNALD_LIMIT=1
+	TOOL_JOURNALD_LIMIT_VALUE="$limit"
 	state_save || return 1
-	return 0
 }
 
 # ---------- 通用函数 ----------
@@ -208,13 +214,12 @@ ensure_ufw_installed(){
 	else
 		echo -e "${R}端口无效，未配置放行规则，不启用防火墙${N}"
 	fi
-	local ufw_ok=false journald_ok=false
+	local ufw_ok=false
 	if [ "$rules_ok" -eq 1 ] && printf 'y\n' | ufw enable && ufw logging off && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then ufw_ok=true; fi
-	configure_journald_limit && journald_ok=true
-	if $ufw_ok && $journald_ok; then
-		echo -e "${G}UFW 已确认启用，日志已关闭；journald 上限 100M${N}"
+	if $ufw_ok; then
+		echo -e "${G}UFW 已确认启用，日志已关闭${N}"
 	else
-		echo -e "${R}UFW 或 journald 初始化失败，未显示为成功${N}"
+		echo -e "${R}UFW 初始化失败，未显示为成功${N}"
 	fi
 	pause
 }
@@ -224,7 +229,7 @@ manage_ufw(){
 	ensure_ufw_installed || { pause; return; }
 	while true; do
 		clear; echo -e "${P}=== UFW 防火墙管理 ===${N}"; echo -e "状态: $(ufw_st) | IPv6: ${C}$(awk -F= '/^IPV6=/{print tolower($2)}' /etc/default/ufw 2>/dev/null)${N}\n"
-		echo -e "  ${Y}1.${N} 查看规则列表"; echo -e "  ${Y}2.${N} 批量添加端口"; echo -e "  ${Y}3.${N} 批量删除规则"; echo -e "  ${Y}4.${N} 防火墙开关/重载"; echo -e "  ${Y}5.${N} IPv6 开关"; echo -e "  ${Y}6.${N} 日志级别设置"; echo -e "  ${X}0. 返回主菜单${N}"
+		echo -e "  ${Y}1.${N} 查看规则"; echo -e "  ${Y}2.${N} 添加端口"; echo -e "  ${Y}3.${N} 删除规则"; echo -e "  ${Y}4.${N} 防火墙开关"; echo -e "  ${Y}5.${N} IPv6 开关"; echo -e "  ${Y}6.${N} 日志级别"; echo -e "  ${Y}7.${N} journald 限制"; echo -e "  ${X}0.${N} 返回"
 		read -r -p "请选择: " c
 		case $c in
 			1) echo -e "\n${C}--- UFW 规则列表 ---${N}"; ufw status numbered 2>/dev/null || ufw status verbose 2>/dev/null || echo "无规则"; pause ;;
@@ -321,6 +326,22 @@ manage_ufw(){
 					echo -e "${R}设置结果无法验证${N}"
 				fi
 				pause ;;
+			7) clear
+				echo -e "${P}=== journald 限制 ===${N}"
+				echo -e "当前状态: $(journald_status)"
+				echo -e "1. 设置上限"
+				echo -e "2. 查看配置"
+				echo -e "3. 删除限制"
+				echo -e "0. 返回"
+				read -r -p "请选择: " jo
+				case "$jo" in
+					1) read -r -p "设置上限 (如 100M): " jl
+						if configure_journald_limit "$jl"; then echo -e "${G}已确认生效: $jl${N}"; else echo -e "${R}设置失败或验证失败${N}"; fi; pause ;;
+					2) systemd-analyze cat-config systemd/journald.conf 2>/dev/null || echo -e "${R}无法读取最终配置${N}"; pause ;;
+					3) confirm "确认删除 journald 限制？" && { if cleanup_journald; then echo -e "${G}已删除${N}"; else echo -e "${R}删除失败${N}"; fi; pause; } ;;
+					0) ;;
+					*) echo -e "${R}无效${N}"; pause ;;
+				esac ;;
 			0) break ;;
 			*) echo -e "${R}无效选项${N}"; sleep 1 ;;
 		esac
@@ -600,7 +621,6 @@ uninstall_ufw(){
         fi
     fi
     has_cmd ufw && failed=1
-    cleanup_journald || failed=1
     return "$failed"
 }
 uninstall(){
