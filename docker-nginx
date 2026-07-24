@@ -340,9 +340,8 @@ show_cert_summary_line(){
 
 # ─── 定时清理 ──────────────────────────────────────────────
 
-has_auto_cleanup(){ crontab -l 2>/dev/null | grep -q "docker-cleanup.sh"; }
-
 has_auto_cleanup(){
+
   systemctl is-enabled --quiet "$(basename "$CLEANUP_TIMER")" 2>/dev/null && return 0
   systemctl is-active --quiet "$(basename "$CLEANUP_TIMER")" 2>/dev/null
 }
@@ -422,8 +421,17 @@ remove_cleanup_timer(){
   [ ! -e "$CLEANUP_TIMER" ] && [ ! -e "$CLEANUP_SERVICE" ] || return 1
 }
 
+remove_obsolete_cleanup_on_start(){
+  local timer
+  timer=$(basename "$CLEANUP_TIMER")
+  if systemctl is-enabled --quiet "$timer" 2>/dev/null || systemctl is-active --quiet "$timer" 2>/dev/null || [ -e "$CLEANUP_TIMER" ] || [ -e "$CLEANUP_SERVICE" ] || legacy_cleanup_exists; then
+    ask_yn "发现旧版 Docker 定时资源清理，删除该后台任务及旧残留？" "y" || return 0
+    remove_cleanup_timer && remove_legacy_cleanup && ok "旧版 Docker 定时资源清理已删除" || err "旧版 Docker 定时资源清理删除未完成"
+  fi
+}
+
 setup_auto_cleanup(){
-  ui_header "定时维护"
+  ui_header "定时维护（已停用）"
   local choice schedule timer
   timer=$(basename "$CLEANUP_TIMER")
   echo "  [1] 每天凌晨 3 点"
@@ -836,17 +844,17 @@ docker_menu(){
     ui_item2 7  "拉取更新镜像" 8  "容器状态"
     ui_item2 9  "重启项目"    10  "项目空间"
     ui_item2 11 "删除项目"    12 "项目日志清理"
-    ui_section "日志与维护"
-    ui_item2 13 "清空全部日志" 14 "日志轮转"
-    ui_item2 15 "定时空间清理" 16 "系统状态"
+    ui_section "日志管理"
+    ui_item2 13 "清空全部日志" 14 "日志轮转（新容器）"
+    ui_item 15 "系统状态"; printf '\n'
     ui_return
-    menu_prompt 16; c="$REPLY"
+    menu_prompt 15; c="$REPLY"
     case "$c" in
       0) return ;; 1) list_projects; pause ;; 2) create_docker_project ;; 3) restart_project ;;
       4) stop_project ;; 5) project_logs ;; 6) edit_project ;; 7) update_project ;; 8) project_ps ;;
       9) project_restart_only ;; 10) project_size ;; 11) delete_project_config ;; 12) clear_project_logs ;;
-      13) clear_all_logs ;; 14) config_docker_log_rotation ;; 15) setup_auto_cleanup ;; 16) docker_system_status ;;
-      *) warn "请输入 0-16"; pause ;;
+      13) clear_all_logs ;; 14) config_docker_log_rotation ;; 15) docker_system_status ;;
+      *) warn "请输入 0-15"; pause ;;
     esac
   done
 }
@@ -895,7 +903,7 @@ MAPEOF
 
 # 唯一 HTTPS 反代模板（通用 + SNI 分流共用）
 # - 443 由 Nginx SNI stream 分流模块接管，转发到本机 127.0.0.1:8443
-# - Web 与 sing-box 共用同一 SNI stream 入口；两类上游均接收 PROXY protocol
+# - Web 与 sing-box 共用同一 SNI stream 入口；不使用已废弃的 PROXY protocol
 # - HTTP(80) 全部 301 跳转标准 HTTPS 443
 # - 上传上限 20G（全局基础默认值，可按站点自行覆盖）
 # - 不含 Cloudflare 真实 IP 段（按需不需要）
@@ -918,10 +926,8 @@ ${listen80}
     return 301 https://\$host\$request_uri;
 }
 server {
-    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+    listen 127.0.0.1:8443 ssl http2;
     server_name ${domain};
-    set_real_ip_from 127.0.0.1;
-    real_ip_header proxy_protocol;
 
     ssl_certificate     ${cert_path}/fullchain.pem;
     ssl_certificate_key ${cert_path}/privkey.pem;
@@ -941,7 +947,7 @@ server {
         proxy_pass http://127.0.0.1:${port};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        # real_ip_header proxy_protocol 已恢复客户端地址。
+        # 经过本机 SNI stream 后，HTTP 层看到的是本机转发地址。
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
@@ -1406,7 +1412,6 @@ generate_singbox_config(){
       "tag": "vless-reality-in",
       "listen": "${listen_ip}",
       "listen_port": ${sb_port},
-      "proxy_protocol": true,
       "users": [
         { "name": "user1", "uuid": "${uuid}", "flow": "xtls-rprx-vision" }
       ],
@@ -1483,10 +1488,10 @@ setup_singbox(){
   local force_sni="${1:-}"
   ui_header "sing-box 安装（VLESS + Reality + Vision）"
   install_singbox || return 1
-  generate_singbox_config "$force_sni"
-  create_singbox_service
+  generate_singbox_config "$force_sni" || return 1
+  create_singbox_service || return 1
   if sing-box check -c "$SINGBOX_CONF" 2>/dev/null; then ok "配置正确"
-  else err "配置错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -5 | sed 's/^/  /'; return 1; fi
+  else err "配置错误"; sing-box check -c "$SINGBOX_CONF" 2>&1 | head -8 | sed 's/^/  /'; return 1; fi
   
   # 读取配置文件确定是否使用了 Nginx 分流
   local use_sni="y"
@@ -1505,9 +1510,22 @@ setup_singbox(){
     systemctl start nginx >/dev/null 2>&1 || { err "Nginx 启动失败，未启动 sing-box"; return 1; }
     systemctl is-active --quiet nginx || { err "Nginx 启动后状态异常"; return 1; }
   fi
-  systemctl enable --now sing-box >/dev/null 2>&1 || { err "sing-box 启动失败"; return 1; }
-  systemctl is-active --quiet sing-box || { err "sing-box 启动后状态异常"; return 1; }
-  systemctl is-enabled --quiet sing-box || { err "sing-box 开机自启状态校验失败"; return 1; }
+  if ! systemctl enable --now sing-box >/dev/null 2>&1; then
+    err "sing-box 启动命令失败"
+    diagnose_singbox
+    return 1
+  fi
+  local i
+  for i in 1 2 3 4 5; do
+    systemctl is-active --quiet sing-box && break
+    sleep 1
+  done
+  if ! systemctl is-active --quiet sing-box; then
+    err "sing-box 未进入 active 状态"
+    diagnose_singbox
+    return 1
+  fi
+  systemctl is-enabled --quiet sing-box || { err "sing-box 开机自启状态校验失败"; diagnose_singbox; return 1; }
   ok "sing-box 已启动"
   if [ "$use_sni" = "y" ]; then
     info "模式: Nginx SNI 共用 443 分流模式 (内部监听 ${SINGBOX_PORT})"
@@ -1522,7 +1540,14 @@ singbox_status(){
   ui_header "sing-box 状态"
   if ! cmd_exists sing-box; then warn "未安装"; pause; return; fi
   echo "  版本: $(sing-box version 2>/dev/null | head -1)"
-  echo "  状态: $(systemctl is-active sing-box 2>/dev/null || echo '未运行')"
+  local sb_state
+  sb_state=$(systemctl is-active sing-box 2>/dev/null || true)
+  case "$sb_state" in
+    active) echo "  状态: 运行中" ;;
+    activating) echo "  状态: 启动中（activating）" ;;
+    failed) echo "  状态: 启动失败（failed）" ;;
+    *) echo "  状态: ${sb_state:-未运行}" ;;
+  esac
   
   local use_sni="y"
   if [ -f "$SINGBOX_SECRETS" ]; then
@@ -1534,6 +1559,7 @@ singbox_status(){
   else
     echo "  模式: 独立直连模式 (直接公开暴露 ${SINGBOX_PORT})"
   fi
+  if [ "$sb_state" != "active" ]; then diagnose_singbox; fi
   echo
   ss -tlnp | grep -E "443|${SINGBOX_PORT}" 2>/dev/null || echo "  未检测到本地端口运行"
   pause
@@ -1727,7 +1753,24 @@ PYEOF
   pause
 }
 
-singbox_restart(){ systemctl restart sing-box && ok "已重启" || err "重启失败"; pause; }
+diagnose_singbox(){
+  echo "  -- sing-box 配置检查 --"
+  sing-box check -c "$SINGBOX_CONF" 2>&1 | head -12 | sed 's/^/  /' || true
+  echo "  -- systemd 状态 --"
+  systemctl status sing-box --no-pager -l 2>&1 | head -25 | sed 's/^/  /' || true
+  echo "  -- 最近日志 --"
+  journalctl -u sing-box -n 30 --no-pager 2>&1 | tail -30 | sed 's/^/  /' || true
+}
+
+singbox_restart(){
+  if systemctl restart sing-box >/dev/null 2>&1; then
+    local i; for i in 1 2 3 4 5; do systemctl is-active --quiet sing-box && break; sleep 1; done
+    systemctl is-active --quiet sing-box && ok "已重启" || { err "重启后未进入 active 状态"; diagnose_singbox; }
+  else
+    err "重启命令失败"; diagnose_singbox
+  fi
+  pause
+}
 
 singbox_delete(){
   ask_yn "确定卸载 sing-box？" "y" || return 0
@@ -1871,7 +1914,6 @@ SNIEOF
         listen 443;
 ${listen_v6}
         ssl_preread on;
-        proxy_protocol on;
         proxy_pass \$upstream;
     }
 }
@@ -1995,18 +2037,13 @@ install_all(){
     fi
   else warn "sing-box 未安装，跳过"; fi
 
-  ui_header "[4/6] 日志与维护"
+  ui_header "[4/6] 日志配置"
   if [ ! -f /etc/docker/daemon.json ] || ! grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null || ! grep -q '"max-file"' /etc/docker/daemon.json 2>/dev/null; then
-    info "首次安装：自动配置 Docker 日志轮转"
-    config_docker_log_rotation auto || warn "Docker 日志轮转配置失败，请在 Docker 菜单中处理"
+    info "首次安装：自动配置 Docker 日志轮转（仅影响新建或重建容器）"
+    config_docker_log_rotation auto || { err "Docker 日志轮转配置失败，一键安装中止"; return 1; }
   else
     ok "Docker 日志轮转已存在，跳过重复配置"
   fi
-  if has_auto_cleanup; then
-    cleanup_units_active || { err "已有定时维护但状态异常"; return 1; }
-    ok "定时维护已存在，跳过重复配置"
-  elif ask_yn "设置定时清理？" "y"; then setup_auto_cleanup || return 1; fi
-
   ui_header "[5/6] Docker 服务"
   if ask_yn "创建 Docker 项目？" "y"; then
     create_docker_project || { warn "项目创建已取消或失败"; return 1; }
@@ -2152,8 +2189,8 @@ health_check(){
     ok "acme.sh 续期 cron 已开启"
   else warn "未开启"; fi
   echo
-  echo "  ── 定时清理 ──"
-  has_auto_cleanup && ok "已设置" || warn "未设置"
+  echo "  ── Docker 资源自动清理 ──"
+  warn "未启用（停止容器、dangling 镜像和 BuildKit 缓存保留手动管理）"
   echo
   echo "  ── sing-box ──"
   if cmd_exists sing-box; then
@@ -2280,7 +2317,8 @@ main(){
   need_root
   case "${1:-}" in --help|-h|help) dispatch_cli "$1"; exit 0 ;; esac
   detect_os
-  load_conf
+  load_conf || exit 1
+  remove_obsolete_cleanup_on_start
   dispatch_cli "$@"
   local ret=$?
   [ "$ret" -ne 99 ] && exit $ret
