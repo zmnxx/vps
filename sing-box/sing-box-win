@@ -67,7 +67,11 @@
         "server": "dns-fakeip"
       },
       {
-        "query_type": ["AAAA", "HTTPS", "SVCB"],
+        "query_type": [
+          "AAAA",
+          "HTTPS",
+          "SVCB"
+        ],
         "action": "reject",
         "method": "default",
         "no_drop": true
@@ -111,7 +115,9 @@
         "server": "dns-fakeip"
       },
       {
-        "domain_suffix": ["pcloud.com"],
+        "domain_suffix": [
+          "pcloud.com"
+        ],
         "action": "route",
         "server": "dns-fakeip"
       },
@@ -133,7 +139,9 @@
         "server": "dns-国内"
       },
       {
-        "query_type": ["A"],
+        "query_type": [
+          "A"
+        ],
         "action": "route",
         "server": "dns-fakeip",
         "rewrite_ttl": 1
@@ -160,11 +168,14 @@
     {
       "type": "tun",
       "tag": "tun-in",
-      "address": ["172.19.0.1/30"],
+      "address": [
+        "172.19.0.1/30"
+      ],
       "mtu": 1500,
       "auto_route": true,
       "strict_route": true,
-      "stack": "system"
+      "stack": "system",
+      "dns_mode": "hijack"
     },
     {
       "type": "mixed",
@@ -177,14 +188,19 @@
     {
       "type": "selector",
       "tag": "手动选择",
-      "outbounds": ["自动选择", "DIRECT"],
+      "outbounds": [
+        "自动选择",
+        "DIRECT"
+      ],
       "default": "自动选择",
       "interrupt_exist_connections": true
     },
     {
       "type": "urltest",
       "tag": "自动选择",
-      "outbounds": ["COMPATIBLE"],
+      "outbounds": [
+        "COMPATIBLE"
+      ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "5m",
       "tolerance": 50,
@@ -194,25 +210,41 @@
     {
       "type": "selector",
       "tag": "国内",
-      "outbounds": ["DIRECT", "手动选择", "自动选择"],
+      "outbounds": [
+        "DIRECT",
+        "手动选择",
+        "自动选择"
+      ],
       "default": "DIRECT"
     },
     {
       "type": "selector",
       "tag": "谷歌",
-      "outbounds": ["手动选择", "自动选择", "DIRECT"],
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
       "default": "手动选择"
     },
     {
       "type": "selector",
       "tag": "电报",
-      "outbounds": ["手动选择", "自动选择", "DIRECT"],
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
       "default": "手动选择"
     },
     {
       "type": "selector",
       "tag": "兜底",
-      "outbounds": ["手动选择", "自动选择", "DIRECT"],
+      "outbounds": [
+        "手动选择",
+        "自动选择",
+        "DIRECT"
+      ],
       "default": "手动选择"
     },
     {
@@ -315,15 +347,8 @@
         "action": "route",
         "outbound": "手动选择"
       },
-      { "action": "sniff" },
       {
-        "type": "logical",
-        "mode": "or",
-        "rules": [
-          { "protocol": "dns" },
-          { "port": 53 }
-        ],
-        "action": "hijack-dns"
+        "action": "sniff"
       },
       {
         "domain_suffix": [
@@ -336,7 +361,9 @@
         "outbound": "国内"
       },
       {
-        "ip_cidr": ["101.36.166.16/32"],
+        "ip_cidr": [
+          "101.36.166.16/32"
+        ],
         "action": "route",
         "outbound": "国内"
       },
@@ -350,7 +377,9 @@
         "outbound": "谷歌"
       },
       {
-        "ip_cidr": ["142.250.0.0/15"],
+        "ip_cidr": [
+          "142.250.0.0/15"
+        ],
         "action": "route",
         "outbound": "谷歌"
       },
@@ -368,12 +397,16 @@
         "outbound": "兜底"
       },
       {
-        "domain_suffix": ["pcloud.com"],
+        "domain_suffix": [
+          "pcloud.com"
+        ],
         "action": "route",
         "outbound": "兜底"
       },
       {
-        "ip_cidr": ["192.168.100.111/32"],
+        "ip_cidr": [
+          "192.168.100.111/32"
+        ],
         "action": "reject",
         "method": "default",
         "no_drop": true
@@ -431,9 +464,16 @@
         "type": "logical",
         "mode": "or",
         "rules": [
-          { "port": 853 },
-          { "network": "udp", "port": 443 },
-          { "protocol": "stun" }
+          {
+            "port": 853
+          },
+          {
+            "network": "udp",
+            "port": 443
+          },
+          {
+            "protocol": "stun"
+          }
         ],
         "action": "reject"
       },
@@ -450,6 +490,11 @@
         "rule_set": "规则-国内IP",
         "action": "route",
         "outbound": "国内"
+      },
+      {
+        "clash_mode": "rule",
+        "action": "route",
+        "outbound": "兜底"
       }
     ]
   }
