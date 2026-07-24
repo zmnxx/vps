@@ -53,19 +53,14 @@ journald_effective_ok(){
 	local cfg system_value runtime_value
 	has_cmd systemd-analyze || return 1
 	cfg=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null) || return 1
-	# 读取最终生效值；后出现的 drop-in 覆盖先出现的配置
 	system_value=$(printf '%s\n' "$cfg" | awk '
 		/^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-		/^\[Journal\][[:space:]]*$/ {in_j=1; next}
-		/^\[/ {in_j=0}
-		in_j && /^[[:space:]]*SystemMaxUse=/ {sub(/^[^=]*=/,"",$0); v=$0}
-		END {print v}')
+		/^[[:space:]]*SystemMaxUse[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,"",$0); v=$0}
+		END {gsub(/[[:space:]]/,"",v); print v}')
 	runtime_value=$(printf '%s\n' "$cfg" | awk '
 		/^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-		/^\[Journal\][[:space:]]*$/ {in_j=1; next}
-		/^\[/ {in_j=0}
-		in_j && /^[[:space:]]*RuntimeMaxUse=/ {sub(/^[^=]*=/,"",$0); v=$0}
-		END {print v}')
+		/^[[:space:]]*RuntimeMaxUse[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,"",$0); v=$0}
+		END {gsub(/[[:space:]]/,"",v); print v}')
 	[ "$system_value" = "100M" ] && [ "$runtime_value" = "100M" ]
 }
 configure_journald_limit(){
@@ -131,16 +126,15 @@ sysctl_set_verify(){
 # 检查编号规则是否为指定 SSH 端口，避免 22 误匹配 222
 ufw_rule_exists(){
 	local port="$1" proto="$2" target="$port/$proto"
-	# UFW 尚未 enable 时，ufw status 不一定显示已添加规则；
-	# 先检查规则数据库，再检查最终 status，避免误判导致防火墙无法启用。
-	ufw show added 2>/dev/null | awk -v target="$target" '
-		$1 == "ufw" && $2 == "allow" {
-			for (i=3; i<=NF; i++) if ($i == target) found=1
-		}
-		END { exit(found ? 0 : 1) }' && return 0
-	ufw status 2>/dev/null | awk -v target="$target" '
-		$1 == target { found=1 }
-		END { exit(found ? 0 : 1) }'
+	local added
+	added=$(ufw show added 2>/dev/null || true)
+	printf '%s\n' "$added" | grep -Fq -- "allow $target" && return 0
+	printf '%s\n' "$added" | grep -Fq -- "$target" && return 0
+	ufw status numbered 2>/dev/null | grep -Fq -- "$target"
+}
+ufw_rules_verify(){
+	local port="$1"
+	ufw_rule_exists "$port" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp
 }
 ufw_number_is_ssh(){
 	local id="$1" port="$2"
@@ -205,7 +199,7 @@ ensure_ufw_installed(){
 	read -r -p "放行 SSH 端口 [默认: ${dp}]: " sp; sp=${sp:-$dp}
 	local rules_ok=0
 	if [[ "$sp" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$sp" -le 65535 ]; then
-		if ufw default deny incoming && ufw default allow outgoing && ufw allow "$sp/tcp" && ufw allow 80/tcp && ufw allow 443/tcp && ufw_rule_exists "$sp" tcp && ufw_rule_exists 80 tcp && ufw_rule_exists 443 tcp; then
+		if ufw default deny incoming && ufw default allow outgoing && ufw allow "$sp/tcp" && ufw allow 80/tcp && ufw allow 443/tcp && ufw_rules_verify "$sp"; then
 			rules_ok=1
 			echo -e "${G}已确认放行 SSH/$sp、80、443${N}"
 		else
@@ -587,7 +581,7 @@ cleanup_journald(){
     fi
     [ ! -e "$JOURNALD_LIMIT_FILE" ] || failed=1
     if has_cmd systemctl; then
-        systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald-clean.log 2>&1 || failed=1
+        systemctl reload-or-restart systemd-journald >/tmp/vps-mgmt-journald-clean.log 2>&1 || systemctl restart systemd-journald >/tmp/vps-mgmt-journald-clean.log 2>&1 || failed=1
         systemctl is-active --quiet systemd-journald || failed=1
     fi
     if [ "$failed" -eq 0 ]; then
