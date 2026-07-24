@@ -12,7 +12,7 @@ keep-alive-interval: 15
 keep-alive-idle: 15
 
 external-controller: 127.0.0.1:9090
-secret: "CHANGE_ME"
+secret: ""
 
 profile:
   store-selected: true
