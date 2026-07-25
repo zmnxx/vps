@@ -112,16 +112,16 @@ case "$cert_choice" in
     ;;
   2)
     # 自签证书
-    HY2_DOMAIN="hy2.self-signed"
+    HY2_DOMAIN="www.bing.com"
     SELF_SIGN_DIR="/etc/sing-box/hy2-certs"
     mkdir -p "$SELF_SIGN_DIR"
-    info "生成自签证书..."
+    info "生成自签证书（CN=${HY2_DOMAIN}）..."
     openssl ecparam -genkey -name prime256v1 -out "$SELF_SIGN_DIR/key.pem" 2>/dev/null
     openssl req -new -x509 -days 3650 -key "$SELF_SIGN_DIR/key.pem" \
-      -out "$SELF_SIGN_DIR/cert.pem" -subj "/CN=bing.com" 2>/dev/null
+      -out "$SELF_SIGN_DIR/cert.pem" -subj "/CN=${HY2_DOMAIN}" 2>/dev/null
     CERT_PATH="$SELF_SIGN_DIR/cert.pem"
     CERT_KEY_PATH="$SELF_SIGN_DIR/key.pem"
-    ok "自签证书已生成（客户端需配置 sni=bing.com + allow_insecure=true）"
+    ok "自签证书已生成（CN=${HY2_DOMAIN}，客户端 sni=${HY2_DOMAIN} + allow_insecure=true）"
     ;;
   3)
     # 从 secrets 读取
