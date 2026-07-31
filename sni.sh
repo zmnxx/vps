@@ -21,6 +21,9 @@ DOMAINS=(
   "www.apple.com"
   "itunes.apple.com"
   "www.samsung.com"
+  "www.xilinx.com"
+  "www.aws.com"
+  "www.samsung.com"
 )
 
 ROUNDS=3
