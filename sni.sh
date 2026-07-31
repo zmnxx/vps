@@ -23,7 +23,9 @@ DOMAINS=(
   "www.samsung.com"
   "www.xilinx.com"
   "www.aws.com"
-  "www.samsung.com"
+  "www.xilinx.com"
+  "www.xbox.com"
+  "www.nvidia.com"
 )
 
 ROUNDS=3
